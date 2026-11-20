@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="268" viewBox="0 0 1120 268" role="img" aria-labelledby="title desc">
+  <title id="title">Next MC Launcher — Pick a world.</title>
+  <desc id="desc">An isometric green block above a grid, on a dark pine background.</desc>
+  <defs>
+    <linearGradient id="pine" x2="100%" y2="75%">
+      <stop stop-color="#132b21"/>
+      <stop offset="1" stop-color="#214334"/>
+    </linearGradient>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M24 0H0v24" fill="none" stroke="#83bb99" stroke-opacity=".18"/>
+    </pattern>
+    <clipPath id="bounds"><rect width="1120" height="268" rx="20"/></clipPath>
+  </defs>
+  <g clip-path="url(#bounds)">
+    <path fill="url(#pine)" d="M0 0h1120v268H0z"/>
+    <path fill="url(#grid)" d="M656 0h464v268H656z"/>
+    <path fill="none" stroke="#83bb99" stroke-opacity=".5" d="M42 44h26m-26 0v26m1036-26h-26m26 0v26M42 224h26m-26 0v-26m1036 26h-26m26 0v-26M656 25v218"/>
+    <g font-family="Segoe UI, Arial, sans-serif">
+      <text x="78" y="77" font-size="15" font-weight="700" letter-spacing="3" fill="#b4dbb4">NEXT MC / WINDOWS BETA</text>
+      <text x="74" y="151" font-size="67" font-weight="750" letter-spacing="-2.6" fill="#f4f7e8">Pick a world.</text>
+      <text x="78" y="198" font-size="22" fill="#d2e8d6">Minecraft Java 26.3, powered by Horizon.</text>
+    </g>
+    <g fill="none" stroke="#9bcaab" stroke-opacity=".55" stroke-linejoin="round">
+      <path d="m860 119 142 71-142 71-142-71zM752 207l142-71m-107 89 142-71m-107 89 142-71m-142-36 142 71m-178-53 142 71m-178-53 142 71"/>
+      <circle cx="1002" cy="190" r="3" fill="#c9e8aa"/>
+      <circle cx="718" cy="190" r="3" fill="#c9e8aa"/>
+    </g>
+    <path fill="#0d2219" opacity=".7" d="m860 152 76 38-76 38-76-38z"/>
+    <g stroke="#122d21" stroke-width="2" stroke-linejoin="round">
+      <path fill="#b9db9d" d="m860 28 78 39-78 39-78-39z"/>
+      <path fill="#85b78d" d="m782 67 78 39v91l-78-39z"/>
+      <path fill="#598f70" d="m860 106 78-39v91l-78 39z"/>
+      <path fill="#d7e8aa" stroke="none" d="m860 28 39 19.5L860 67l-39-19.5z"/>
+      <path fill="#a8cd92" stroke="none" d="m782 67 39 19.5V132l-39-19.5z"/>
+      <path fill="none" stroke-width="1.5" opacity=".55" d="m821 47.5 78 39v91m0-130-78 39v91m-39-65 78 39 78-39"/>
+    </g>
+  </g>
+</svg>
