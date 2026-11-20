@@ -1,5 +1,8 @@
 /target/
+/ui/node_modules/
+/ui/dist/
 /.cargo/config.toml
 /.env
 mc-login.json
 session*.json
+__pycache__/

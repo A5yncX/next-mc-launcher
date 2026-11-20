@@ -1,0 +1,186 @@
+diff --git a/crates/horizon-client-input/src/window.rs b/crates/horizon-client-input/src/window.rs
+index 71da85e..eee539e 100644
+--- a/crates/horizon-client-input/src/window.rs
++++ b/crates/horizon-client-input/src/window.rs
+@@ -678,7 +678,8 @@ pub fn icon() -> Option<winit::window::Icon> {
+     decode_icon(icon_png()?)
+ }
+ 
+-fn decode_icon(png: &[u8]) -> Option<winit::window::Icon> {
++/// Decode an RGBA PNG before installing it as a window icon.
++pub fn decode_icon(png: &[u8]) -> Option<winit::window::Icon> {
+     let mut decoder = png::Decoder::new(std::io::Cursor::new(png));
+     decoder.ignore_checksums(true);
+     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+diff --git a/crates/horizon-client/src/entry.rs b/crates/horizon-client/src/entry.rs
+index 9a597f2..2970887 100644
+--- a/crates/horizon-client/src/entry.rs
++++ b/crates/horizon-client/src/entry.rs
+@@ -1,6 +1,7 @@
+ //! Startup shared by the gameplay library and its executable.
+ #[path = "horizon_look.rs"]
+ mod horizon_look;
++pub(crate) use horizon_look::WINDOW_TITLE;
+ use crate::{crash, game, logging};
+ use horizon_mod_package::selection::{Argument, LaunchArguments};
+ pub(crate) mod dedicated_arguments;
+diff --git a/crates/horizon-client/src/game/runtime/loading_screen.rs b/crates/horizon-client/src/game/runtime/loading_screen.rs
+index 8489455..6d0ae2d 100644
+--- a/crates/horizon-client/src/game/runtime/loading_screen.rs
++++ b/crates/horizon-client/src/game/runtime/loading_screen.rs
+@@ -103,8 +103,9 @@ impl Loading {
+             .map_or([1280, 720], |o| o.window_size)
+             .map(f64::from);
+         self.fullscreen = horizon_client::window::FullscreenState::new(fullscreen);
+-        let attributes =
+-            horizon_client::window::with_icon(Window::default_attributes().with_title("Horizon"));
++        let attributes = horizon_client::window::with_icon(
++            Window::default_attributes().with_title(crate::entry::WINDOW_TITLE),
++        );
+         // Wayland names the window by its app id, which the horizon.desktop entry matches.
+         #[cfg(target_os = "linux")]
+         let attributes = winit::platform::wayland::WindowAttributesExtWayland::with_name(
+diff --git a/crates/horizon-client/src/game/runtime/no_resources.rs b/crates/horizon-client/src/game/runtime/no_resources.rs
+index 21bf36a..2486821 100644
+--- a/crates/horizon-client/src/game/runtime/no_resources.rs
++++ b/crates/horizon-client/src/game/runtime/no_resources.rs
+@@ -103,9 +103,10 @@ impl ApplicationHandler for Missing {
+         if self.window.is_some() {
+             return;
+         }
+-        let attributes =
+-            horizon_client::window::with_icon(Window::default_attributes().with_title("Horizon"))
+-                .with_inner_size(winit::dpi::LogicalSize::new(1040.0, 700.0));
++        let attributes = horizon_client::window::with_icon(
++            Window::default_attributes().with_title(crate::entry::WINDOW_TITLE),
++        )
++        .with_inner_size(winit::dpi::LogicalSize::new(1040.0, 700.0));
+         let made = event_loop
+             .create_window(attributes)
+             .map_err(Into::into)
+diff --git a/crates/horizon-client/src/game/runtime/split/windows.rs b/crates/horizon-client/src/game/runtime/split/windows.rs
+index cc44322..38fd4bf 100644
+--- a/crates/horizon-client/src/game/runtime/split/windows.rs
++++ b/crates/horizon-client/src/game/runtime/split/windows.rs
+@@ -1,6 +1,7 @@
+ //! Windows and monitors: which window each player plays in, opening and placing them (a
+ //! monitor's over its menu bar), closing them, the views' layout and the windows' titles.
+ use super::*;
++use crate::entry::WINDOW_TITLE;
+ use horizon_client::split_layout::Placement;
+ use winit::window::Window;
+ 
+@@ -465,9 +466,9 @@ impl<'a> Split<'a> {
+             n => format!(" - Window {n}"),
+         };
+         if self.players() > 1 && !who.is_empty() {
+-            format!("Horizon{name} · {}", who.join(", "))
++            format!("{WINDOW_TITLE}{name} · {}", who.join(", "))
+         } else {
+-            format!("Horizon{name}")
++            format!("{WINDOW_TITLE}{name}")
+         }
+     }
+ 
+@@ -534,7 +535,7 @@ impl<'a> Split<'a> {
+                 // Its own title for a moment: `above_menu_bar` finds it by it.
+                 Some((at, size)) => {
+                     let attributes = attributes
+-                        .with_title(format!("Horizon {key}"))
++                        .with_title(format!("{WINDOW_TITLE} {key}"))
+                         .with_decorations(false)
+                         .with_position(at)
+                         .with_inner_size(size);
+@@ -562,7 +563,7 @@ impl<'a> Split<'a> {
+                             }
+                         }
+                     }
+-                    .with_title("Horizon")
++                    .with_title(WINDOW_TITLE)
+                 }
+             };
+             let made = event_loop
+@@ -582,7 +583,7 @@ impl<'a> Split<'a> {
+                 let _ = window.request_inner_size(size);
+                 window.set_outer_position(at);
+                 #[cfg(target_os = "macos")]
+-                above_menu_bar(&format!("Horizon {key}"));
++                above_menu_bar(&format!("{WINDOW_TITLE} {key}"));
+             }
+             match made {
+                 Ok((window, compositor)) => {
+diff --git a/crates/horizon-client/src/game/runtime/window_handler.rs b/crates/horizon-client/src/game/runtime/window_handler.rs
+index 6a86a75..37195bd 100644
+--- a/crates/horizon-client/src/game/runtime/window_handler.rs
++++ b/crates/horizon-client/src/game/runtime/window_handler.rs
+@@ -369,8 +369,9 @@ impl ApplicationHandler for Game<'_> {
+         let fullscreen = self.settings.fullscreen || self.options.fullscreen;
+         let size = self.options.window_size.map(f64::from);
+         self.fullscreen = horizon_client::window::FullscreenState::new(fullscreen);
+-        let attributes =
+-            horizon_client::window::with_icon(Window::default_attributes().with_title("Horizon"));
++        let attributes = horizon_client::window::with_icon(
++            Window::default_attributes().with_title(crate::entry::WINDOW_TITLE),
++        );
+         // Wayland names the window by its app id, which the horizon.desktop entry matches.
+         #[cfg(target_os = "linux")]
+         let attributes = winit::platform::wayland::WindowAttributesExtWayland::with_name(
+diff --git a/crates/horizon-client/src/horizon_look.rs b/crates/horizon-client/src/horizon_look.rs
+index b78dda6..8734c31 100644
+--- a/crates/horizon-client/src/horizon_look.rs
++++ b/crates/horizon-client/src/horizon_look.rs
+@@ -7,6 +7,39 @@ use horizon_client::menu_style::{
+     Fonts, MenuStyle, OverlayColours, SettingsColours, Sizes, Surfaces,
+ };
+ use horizon_theme as theme;
++use std::io::Read;
++use std::sync::OnceLock;
++
++pub(crate) const WINDOW_TITLE: &str = match option_env!("NEXT_MC_WINDOW_TITLE") {
++    Some(title) => title,
++    None => "Horizon",
++};
++
++fn local_icon() -> Option<Vec<u8>> {
++    const ICON_26_3: &str = "assets/objects/af/af96f55a90eaf11b327f1b5f8834a051027dc506";
++    let read = |path: std::path::PathBuf| {
++        let file = std::fs::File::open(path).ok()?;
++        let mut png = Vec::new();
++        file.take(64 * 1024).read_to_end(&mut png).ok()?;
++        horizon_client::window::decode_icon(&png)?;
++        Some(png)
++    };
++    option_env!("NEXT_MC_WINDOW_ICON_FILE")
++        .and_then(|path| read(path.into()))
++        .or_else(|| {
++            option_env!("NEXT_MC_WINDOW_TITLE")?;
++            [
++                ("LOCALAPPDATA", "NextMC/minecraft"),
++                ("APPDATA", ".minecraft"),
++                ("APPDATA", "horizon-launcher/minecraft"),
++            ]
++            .into_iter()
++            .find_map(|(key, dir)| {
++                let root = std::env::var_os(key).filter(|p| !p.is_empty())?;
++                read(std::path::PathBuf::from(root).join(dir).join(ICON_26_3))
++            })
++        })
++}
+ 
+ /// The switch for the menus' look: `vanilla` gives them none, so the settings pages, the HUD
+ /// kit's tab strip and the overlays draw in the engine's `NEUTRAL` look, the settings pages on
+@@ -15,7 +48,13 @@ const STYLE_VAR: &str = "HORIZON_MENU_STYLE";
+ 
+ /// Give the engine Horizon's look; call it once, before the first window opens.
+ pub(crate) fn give() {
+-    horizon_client::window::set_icon_png(theme::ICON_PNG);
++    static LOCAL_ICON: OnceLock<Option<Vec<u8>>> = OnceLock::new();
++    horizon_client::window::set_icon_png(
++        LOCAL_ICON
++            .get_or_init(local_icon)
++            .as_deref()
++            .unwrap_or(theme::ICON_PNG),
++    );
+     if std::env::var(STYLE_VAR).is_ok_and(|v| v.eq_ignore_ascii_case("vanilla")) {
+         return;
+     }

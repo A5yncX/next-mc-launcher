@@ -2,13 +2,31 @@
 name = "mc-login"
 version = "0.1.0"
 edition = "2021"
-description = "Microsoft account sign-in for Minecraft, written against Horizon's launcher flow, without the launcher"
+description = "Offline launcher and Microsoft sign-in for a locally built Horizon client"
+default-run = "mc-login"
 license = "MIT"
 
 [dependencies]
 ureq = { version = "2", features = ["json", "tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[features]
+gui = ["dep:base64", "dep:png", "dep:sha1", "dep:sha2", "dep:tao", "dep:wry", "dep:windows-sys"]
+
+[[bin]]
+name = "next-mc-launcher"
+path = "src/gui/main.rs"
+required-features = ["gui"]
+
+[target.'cfg(windows)'.dependencies]
+base64 = { version = "0.22", optional = true }
+png = { version = "0.18", optional = true }
+sha1 = { version = "0.10", optional = true }
+sha2 = { version = "0.10", optional = true }
+tao = { version = "0.35.3", optional = true, default-features = false, features = ["rwh_06"] }
+wry = { version = "0.57.2", optional = true, default-features = false }
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Graphics_Gdi", "Win32_Security_Cryptography", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 lto = true
