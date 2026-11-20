@@ -1,111 +1,31 @@
 # Next MC Launcher
 
-A Windows desktop launcher for a locally built [Horizon](https://github.com/horizon-rust/horizon)
-client. The graphical interface uses [Astryx](https://github.com/meta/astryx).
+[简体中文](#简体中文) · [English](#english) · [GitHub Releases](https://github.com/A5yncX/next-mc-launcher/releases)
 
-## Desktop launcher (Windows x64)
+## 简体中文
 
-Get the setup EXE or portable ZIP from [GitHub Releases](https://github.com/A5yncX/next-mc-launcher/releases) and follow [安装说明](INSTALL.zh-CN.md). No Rust or Node.js is needed to play. The UI is bundled and requires Microsoft Edge WebView2 Runtime.
+Next MC 是 [Horizon](https://github.com/horizon-rust/horizon) 的非官方 Windows x64 启动器。使用 Rust 版 Minecraft Java 26.3 客户端，支持离线单机和可选的机械动力（Create）+ Atlas。
 
-- Select or create a profile under **实例**, then click **启动游戏** on the left.
-  The default profile keeps the old saves; new profiles have independent saves,
-  settings and logs. No sign-in is required.
-- If resources aren't ready, open **下载** and click **检查并准备本机文件**. It checks the regular Minecraft and
-  Horizon install directories; you can also enter a local Minecraft directory.
-- Click **下载缺失文件** to allow downloads from Mojang for the pinned 26.3 version.
-  The launcher shows file and byte progress, verifies the files, and keeps verified
-  files if you cancel or retry. It never writes into an existing Minecraft install.
-- Resource preparation requires JDK 25. Set `JAVA_HOME` if the launcher can't
-  find it through your installed Minecraft runtime or system configuration.
-- Click **Microsoft 正版登录** and use the device code in your browser. The approved
-  public app ID is built in; players do not enter it or a client secret. Use
-  **使用正版账号启动** after ownership is confirmed, or use **离线启动游戏** at any time.
-- Drag a window edge to resize. The normal window size is remembered and fitted to
-  the current display when you reopen it. In **设置**, pick **跟随系统**, **浅色**, or
-  **深色**. Animations respect the Windows reduced-motion preference.
-- The GUI displays your Minecraft skin head when available. It protects the refresh
-  token with Windows DPAPI for the current Windows user and restores the session
-  when reopened. **退出 Microsoft 登录** removes the saved login. The launcher does
-  not copy this login into the portable ZIP or use the CLI's plaintext cache.
+1. 在 [Releases](https://github.com/A5yncX/next-mc-launcher/releases) 下载 `NextMC-Setup-Windows-x64.exe` 安装，或解压 `NextMC-Windows-x64.zip`。运行 `next-mc-launcher.exe`，保留同级的 `NextMC/` 文件夹。
+2. 在 **下载 → 检查并准备本机文件** 复用已安装的游戏文件，或点 **下载缺失文件** 从 Mojang 获取。所需环境：[WebView2](https://developer.microsoft.com/microsoft-edge/webview2/)；首次准备资源用 [JDK 25](https://adoptium.net/temurin/releases/?version=25)。发行包不包含原版游戏文件。
+3. 资源就绪后点 **离线启动游戏**。在 **设置 → 界面语言** 切换简体中文和 English。只想玩单机不需要登录。
 
-From this checkout, build the desktop launcher with PowerShell:
+机械动力：在 **实例 → 可选模组** 安装并启用 Create，再去 **下载** 准备资源。Atlas 可按实例开启，游戏内按 **M** 打开地图。普通模式与机械动力各自存档。
 
-```powershell
-Push-Location ui
-npm ci
-npm run build
-Pop-Location
-cargo build --release --locked --features gui --bin next-mc-launcher
-```
+从 beta.1 升级：便携版请解压到新目录，安装版建议先卸载旧版。存档和设置留在 `%LOCALAPPDATA%\NextMC`。本测试版仅验证单机；未验证 Microsoft 登录或联机。
 
-### Optional Create + Atlas component
+[详细安装与排错](INSTALL.zh-CN.md) · [构建与打包](BUILD.md) · [许可](LICENSE)
 
-In **实例 → 可选模组**, click **安装 Create + Atlas** to fetch the pinned, prebuilt component. Then enable **机械动力（Create）** and prepare its Minecraft resources under **下载**. Both modes share the original download cache, but prepared resources and saves are separate. Create saves stay under `%LOCALAPPDATA%\NextMC\create-instances\<id>` even if you turn the switch off. This beta validates only singleplayer.
+## English
 
-**Atlas 小地图和世界地图** is off by default and is remembered per instance; press **M** in game. Create uses its bundled artwork by default. To use the original look, place the official [Create 6.0.10 NeoForge JAR](https://modrinth.com/mod/create/version/UjX6dr61) inside the Create instance's `horizon-mods/create-resources/` (use **打开实例目录**). It is read as data, not executed. No Mojang or original Create assets are redistributed.
+Next MC is an unofficial Windows x64 launcher for [Horizon](https://github.com/horizon-rust/horizon), a Rust client for Minecraft Java 26.3. It supports offline singleplayer and optional Create + Atlas.
 
-## Offline single-player (CLI)
+1. Get `NextMC-Setup-Windows-x64.exe` or extract `NextMC-Windows-x64.zip` from [Releases](https://github.com/A5yncX/next-mc-launcher/releases). Run `next-mc-launcher.exe` and keep the `NextMC/` folder beside it.
+2. In **Downloads → Check and prepare local files**, reuse your installed game files, or choose **Download missing files** to fetch them from Mojang. The launcher needs [WebView2](https://developer.microsoft.com/microsoft-edge/webview2/); initial resource preparation needs [JDK 25](https://adoptium.net/temurin/releases/?version=25). Original game files are not bundled.
+3. Once resources are ready, choose **Play offline**. Change the UI language under **Settings → Language**. Offline singleplayer needs no sign-in.
 
-Double-click `target\release\mc-login.exe` to skip the desktop interface, or run:
+For Create, install and enable it under **Instances → Optional mods**, then prepare its resources in **Downloads**. Enable Atlas per instance and press **M** in-game to open the map. Create and unmodded worlds are saved separately. If Create reports a missing `VCRUNTIME140` DLL, install the [Visual C++ x64 runtime](https://aka.ms/vs/17/release/vc_redist.x64.exe).
 
-```powershell
-.\target\release\mc-login.exe
-```
+Upgrading from beta.1: extract the ZIP to a new folder, or uninstall the old setup first. Saves and settings stay in `%LOCALAPPDATA%\NextMC`. This beta tests singleplayer only; Microsoft sign-in and multiplayer were not verified.
 
-The `play` subcommand also starts offline and accepts custom paths.
-
-No account, token cache, or network sign-in is used. LAN and multiplayer are
-unavailable in this mode. Saves and logs go under `%LOCALAPPDATA%\NextMC\offline-instance`.
-Your existing Minecraft and Horizon saves are not used.
-
-The default layout is sibling checkouts named `mc-login` and `horizon`, with the
-locally built `horizon-client.exe` and `horizon-prepare.exe` in Horizon's
-`target/plain/release`. Keep both checkouts in this layout when using the GUI.
-In the CLI, use `play --horizon-dir DIR` if the checkout is elsewhere.
-For this layout, build from the Horizon checkout with:
-
-```powershell
-cargo build --release --locked --target-dir target/plain -p horizon-game -p horizon-prepare --no-default-features --features horizon-game/audio,horizon-game/controllers
-```
-
-For a Horizon checkout with the local window branding patch, set
-`NEXT_MC_WINDOW_TITLE=next-mc-launcher` before building. The branded client reads
-an icon from local Minecraft assets at runtime; it does not bundle the official icon.
-
-For the Windows portable ZIP, see [BUILD.md](BUILD.md) and
-[INSTALL.zh-CN.md](INSTALL.zh-CN.md). Run `python tools/package_windows.py` after
-building both checkouts and preparing the Horizon exporters.
-
-`play` checks `%LOCALAPPDATA%\NextMC\resources` before starting. Use
-`play --resources DIR` to use a different prepared directory. If the check fails,
-follow the [Horizon preparation guide](https://github.com/horizon-rust/horizon/blob/main/docs/api/launch-guide.md)
-with the same build of `horizon-prepare` and set its `--output` to the directory
-above. Reuse the Minecraft files already installed for the version shown by
-`horizon-prepare --launch-api`; if you need files, use the official Minecraft
-launcher and the `downloads.server` URL in Mojang's version JSON, or use the
-GUI's manual download. No Minecraft game files are bundled.
-
-## Microsoft sign-in and session export
-
-The sign-in flow uses Microsoft device code, Xbox Live, XSTS, and Minecraft
-services to check ownership and read the Minecraft profile. It exports a
-[Horizon session](https://github.com/horizon-rust/horizon/blob/main/docs/api/launch.md).
-
-```
-mc-login login [--client-id ID] [--session-file PATH] [--print-session]
-```
-
-- The CLI uses the same default app ID. Developers can override it using
-  `--client-id ID` or `HORIZON_MSA_CLIENT_ID`. Existing commands with sign-in flags
-  still work without the `login` subcommand.
-- For a fork, register your own Azure app
-  (personal accounts, public client flows) and have Mojang approve it for
-  the Minecraft API: https://aka.ms/mce-reviewappid. Horizon's own
-  registration belongs to Horizon (docs/forking.md).
-- The CLI stores tokens in plaintext in `mc-login.json` in the current
-  working directory. Delete the file to clear the local sign-in cache.
-- `--session-file ./session.json` exports a token for `horizon-client --session-file`.
-  `--print-session` prints the token to stdout. Do not commit or share either output.
-
-Build with `cargo build --release`. On Windows, use the Rust MSVC toolchain
-and the Visual Studio C++ Build Tools with a Windows SDK.
+[Build and packaging](BUILD.md) · [License](LICENSE)

@@ -57,10 +57,11 @@ fn main() {
     if let Err(error) = desktop::run() {
         use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR};
         let title: Vec<_> = "Next MC Launcher\0".encode_utf16().collect();
-        let text: Vec<_> =
-            format!("无法打开启动器：{error}\n请确认已安装 Microsoft Edge WebView2 Runtime。\0")
-                .encode_utf16()
-                .collect();
+        let text: Vec<_> = format!(
+            "无法打开启动器 / Unable to open the launcher:\n{error}\n\n请确认已安装 Microsoft Edge WebView2 Runtime。\nMake sure Microsoft Edge WebView2 Runtime is installed.\0"
+        )
+        .encode_utf16()
+        .collect();
         // The two NUL-terminated buffers stay alive for the synchronous dialog.
         unsafe {
             MessageBoxW(

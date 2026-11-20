@@ -80,14 +80,16 @@ def make_release(args):
     if pin(args.output / COMPONENT) != json.loads(config.read_bytes())['archive']:
         raise ValueError('Component ZIP does not match create-component.json')
     env = os.environ | {'NEXT_MC_CREATE_COMPONENT': config.read_text(encoding='ascii')}
+    env.pop('NEXT_MC_LAUNCHER_ICON_RES', None)
     subprocess.run(['npm.cmd', '--prefix', 'ui', 'run', 'build'], cwd=portable.LAUNCHER, check=True)
-    subprocess.run(['cargo', 'build', '--release', '--locked', '--features', 'gui'], cwd=portable.LAUNCHER, env=env, check=True)
+    subprocess.run(['cargo', 'build', '--release', '--locked', '--features', 'gui', '--bin', 'next-mc-launcher'],
+                   cwd=portable.LAUNCHER, env=env, check=True)
     archive = args.output / 'NextMC-Windows-x64.zip'
     portable.package(archive, dxc=args.dxc, component_config=config)
     with TemporaryDirectory(prefix='nextmc-setup-') as payload:
         with ZipFile(archive) as z:
             z.extractall(payload)
-        subprocess.run([str(args.iscc), f'/DPayload={Path(payload) / "NextMC"}', f'/DOutput={args.output}',
+        subprocess.run([str(args.iscc), f'/DPayload={payload}', f'/DOutput={args.output}',
                         str(portable.LAUNCHER / 'tools/nextmc.iss')], check=True)
     checksum(args.output / 'NextMC-Setup-Windows-x64.exe')
 

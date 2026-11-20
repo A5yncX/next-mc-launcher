@@ -155,11 +155,15 @@ pub(super) fn install_component(data: &Path, emit: &dyn Fn(Report)) -> Result<St
     let extracted = stage.join("component");
     fs::create_dir_all(&extracted).map_err(|e| e.to_string())?;
     let result = (|| -> Result<(), String> {
-        let local_zip = std::env::current_exe()
-            .map_err(|e| e.to_string())?
-            .with_file_name(ASSET);
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let local_zip = [
+            exe.with_file_name("NextMC").join(ASSET),
+            exe.with_file_name(ASSET),
+        ]
+        .into_iter()
+        .find(|path| path.is_file());
         let downloaded = stage.join(ASSET);
-        let archive = if local_zip.is_file() {
+        let archive = if let Some(local_zip) = local_zip {
             let mut file = File::create_new(&downloaded).map_err(|e| e.to_string())?;
             io::copy(
                 &mut File::open(local_zip)

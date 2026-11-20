@@ -3,7 +3,7 @@
 在 [GitHub Releases](https://github.com/A5yncX/next-mc-launcher/releases) 二选一：
 
 - **`NextMC-Setup-Windows-x64.exe`**：当前用户安装，不需要管理员权限，可勾选创建桌面快捷方式。卸载不会删除存档。
-- **`NextMC-Windows-x64.zip`**：完整解压到自己可写的目录，再运行 `next-mc-launcher.exe`。请保留旁边的 `horizon` 文件夹。
+- **`NextMC-Windows-x64.zip`**：完整解压到自己可写的目录，再运行 `next-mc-launcher.exe`。请保留旁边的 `NextMC/` 文件夹，不要单独移动 EXE。
 
 发行文件未签名，Windows SmartScreen 可能提示。只从上述 GitHub 仓库下载；可用 `Get-FileHash <文件名> -Algorithm SHA256` 核对旁边的 `.sha256` 文件。不要下载 GitHub 自动生成的 **Source code** 来游玩。
 
@@ -15,13 +15,13 @@
 
 ## 可选：机械动力 + Atlas
 
-1. 打开 **实例 → 可选模组**，点 **安装 Create + Atlas**。也可以手动下载 `NextMC-Create-Atlas-Windows-x64.zip`，不解压，放到 `next-mc-launcher.exe` 同级，再点击同一按钮校验安装。
+1. 打开 **实例 → 可选模组**，点 **安装 Create + Atlas**。也可以手动下载 `NextMC-Create-Atlas-Windows-x64.zip`，不解压，放进启动器旁边的 `NextMC/` 文件夹，再点击同一按钮校验安装。
 2. 启用 **机械动力（Create）**，前往「下载」准备对应资源，回到启动按钮 **离线启动机械动力** 创建单人世界。它会复用原始下载缓存，但有自己的资源目录和存档。
 3. **Atlas 小地图和世界地图** 默认关闭，按实例开启。游戏内按 **M** 打开世界地图。
 4. Create 默认使用移植版自带素材。如果想用原版贴图，可在开启机械动力后点 **打开实例目录**，把 [Create 6.0.10 NeoForge 原版 JAR](https://modrinth.com/mod/create/version/UjX6dr61) 放到 `horizon-mods/create-resources/`。它只用作本地素材，不执行 Java 模组。
 
-升级或切换模组前先退出游戏。存档、配置和可选组件在 `%LOCALAPPDATA%\NextMC`，与安装目录分离。普通模式和机械动力模式的存档互不覆盖；关闭开关不会删档。建议备份整个数据目录。
+从 beta.1 升级时，便携版解压到新目录；安装版建议先卸载旧版。升级或切换模组前先退出游戏。存档、配置和可选组件在 `%LOCALAPPDATA%\NextMC`，与安装目录分离。普通模式和机械动力模式的存档互不覆盖；关闭开关不会删档。建议备份整个数据目录。
 
 排查问题可查看该目录下的 `prepare-gui.log`，或当前实例目录内的 `play-gui.log` 和 `logs`。
 
-本项目基于 Horizon，与 Mojang、Microsoft 无隶属关系。对应源码和许可位于发行包内的 `source`、`horizon`、`licenses`，可选组件的对应源码单独随 Release 提供。
+本项目基于 Horizon，与 Mojang、Microsoft 无隶属关系。对应源码和许可都在 `NextMC/` 内，可选组件的对应源码单独随 Release 提供。

@@ -15,12 +15,14 @@ impl Layout {
         let absolute = |path| std::path::absolute(path).map_err(|e| e.to_string());
         let root = match root {
             Some(path) => absolute(path)?,
-            None => env::current_exe()
-                .map_err(|e| format!("cannot locate launcher: {e}"))?
-                .ancestors()
-                .map(|dir| dir.join("horizon"))
-                .find(|dir| dir.join("research-lock.json").is_file())
-                .ok_or("Horizon checkout not found; pass --horizon-dir DIR.")?,
+            None => {
+                let exe = env::current_exe().map_err(|e| format!("cannot locate launcher: {e}"))?;
+                let support = exe.with_file_name("NextMC").join("horizon");
+                std::iter::once(support)
+                    .chain(exe.ancestors().skip(1).map(|dir| dir.join("horizon")))
+                    .find(|dir| dir.join("research-lock.json").is_file())
+                    .ok_or("Horizon checkout not found; pass --horizon-dir DIR.")?
+            }
         };
         let data = env::var_os("LOCALAPPDATA")
             .filter(|p| !p.is_empty())

@@ -101,8 +101,7 @@ def package(output, dxc=None, component_config=None):
             def text(name, content):
                 zip.writestr(f"NextMC/{name}", content)
 
-            for name in ("next-mc-launcher.exe", "mc-login.exe"):
-                add(LAUNCHER / "target/release" / name, name)
+            zip.write(LAUNCHER / "target/release/next-mc-launcher.exe", "next-mc-launcher.exe")
             for name in ("horizon-client.exe", "horizon-prepare.exe"):
                 add(HORIZON / "target/plain/release" / name, f"horizon/target/plain/release/{name}")
             if dxc is not None:
@@ -115,7 +114,7 @@ def package(output, dxc=None, component_config=None):
                 add(path, f"horizon/{path.relative_to(HORIZON).as_posix()}")
             for name in ["manifest.json", *classes]:
                 add(exporters / name, f"horizon/exporters/{name}")
-            for name in ("INSTALL.zh-CN.md", "BUILD.md", "LICENSE"):
+            for name in ("README.md", "INSTALL.zh-CN.md", "BUILD.md", "LICENSE"):
                 add(LAUNCHER / name, name)
             if component_config:
                 add(component_config, 'create-component.json')
@@ -124,8 +123,10 @@ def package(output, dxc=None, component_config=None):
                 if path.is_symlink():
                     raise ValueError(f"Unexpected source symlink: {name}")
                 add(path, f"source/horizon/{name}")
-            source = [".gitignore", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "BUILD.md", "INSTALL.zh-CN.md",
-                      "ui/index.html", "ui/src.jsx", "ui/app.css", "ui/vite.config.js", "ui/package.json", "ui/package-lock.json",
+            source = [".gitignore", "Cargo.toml", "Cargo.lock", "build.rs", "README.md", "LICENSE", "BUILD.md", "INSTALL.zh-CN.md",
+                      "assets/next-mc.ico", "assets/next-mc.res",
+                      "ui/index.html", "ui/src.jsx", "ui/i18n.mjs", "ui/i18n.test.mjs", "ui/app.css",
+                      "ui/vite.config.js", "ui/package.json", "ui/package-lock.json",
                       "tools/package_windows.py", "tools/local_minecraft_icon.py", "tools/release_windows.py",
                       "tools/nextmc.iss", "tools/horizon-local.patch"]
             source += [p.relative_to(LAUNCHER).as_posix() for d in ("src", "tests", "licenses")
