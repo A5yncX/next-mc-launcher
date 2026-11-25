@@ -1,0 +1,373 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_drill.rs b/crates/pumpkin-core/src/block/entities/create_drill.rs
+--- a/crates/pumpkin-core/src/block/entities/create_drill.rs
++++ b/crates/pumpkin-core/src/block/entities/create_drill.rs
+@@ -12,6 +12,8 @@
+ use pumpkin_util::math::position::BlockPos;
+ 
+ use crate::world::World;
++
++use super::create_saw_tree as saw;
+ 
+ pub(crate) const ID: &str = "create:mechanical_drill";
+ const NON_BREAKABLE_TAG: &str = "create:non_breakable";
+@@ -74,7 +76,8 @@
+             return false;
+         };
+         let source = Block::from_state_id(source_id);
+-        if source.name != ID {
++        let is_saw = source.name == saw::ID;
++        if source.name != ID && !is_saw {
+             self.remove(world);
+             return false;
+         }
+@@ -98,13 +101,18 @@
+             return false;
+         };
+         let [dx, dy, dz] = facing.vector();
++        if is_saw && dy != 0 {
++            self.clear_crack(world);
++            return false;
++        }
+         let target = BlockPos::new(position.0.x + dx, position.0.y + dy, position.0.z + dz);
+         let Some(target_id) = world.get_block_state_id_if_loaded(&target) else {
+             self.clear_crack(world);
+             return false;
+         };
+         let target_state = target_id.to_state();
+-        let breakable = breakable_target(world, &target, target_id);
++        let breakable =
++            breakable_target(world, &target, target_id) && (!is_saw || saw::is_sawable(target_id));
+ 
+         let (action, progress_changed, progress, old_crack) = {
+             let mut state = self
+@@ -162,9 +170,11 @@
+             Action::Clear => world.set_block_destroy_stage(self.breaker_id, target, -1),
+             Action::Break => {
+                 if world.get_block_state_id_if_loaded(&position) == Some(source_id)
+-                    && breakable_target(world, &target, target_id)
++                    && breakable
++                    && world.break_machine_target(&target, target_id).is_some()
++                    && is_saw
+                 {
+-                    world.break_machine_target(&target, target_id);
++                    saw::fell_tree_after_stationary_saw_break(world, target, target_id);
+                 }
+                 world.set_block_destroy_stage(self.breaker_id, target, -1);
+             }
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -18,7 +18,7 @@
+ 
+ use super::{
+     BlockEntity, create_drill as drill, create_fan_airflow as fan, create_millstone as millstone,
+-    create_press as press,
++    create_press as press, create_saw_tree as saw,
+ };
+ use crate::{
+     block::blocks::{
+@@ -52,6 +52,7 @@
+     press::ID,
+     pump::ID,
+     drill::ID,
++    saw::ID,
+     fan::ID,
+     millstone::ID,
+     pipe::VALVE,
+@@ -314,7 +315,7 @@
+             crank_until: AtomicI64::new(i64::MIN),
+             material: AtomicU16::new(Item::SPRUCE_PLANKS.id),
+             structure_ready: AtomicBool::new(false),
+-            drill: (id == drill::ID).then(|| Box::new(drill::Drill::new())),
++            drill: matches!(id, drill::ID | saw::ID).then(|| Box::new(drill::Drill::new())),
+         }
+     }
+ 
+@@ -408,7 +409,7 @@
+         if gauge
+             || matches!(
+                 id,
+-                MOTOR | CRANK | wheel::SMALL | press::ID | pump::ID | fan::ID | drill::ID
++                MOTOR | CRANK | wheel::SMALL | press::ID | pump::ID | fan::ID | drill::ID | saw::ID
+             )
+         {
+             "facing"
+@@ -416,7 +417,8 @@
+             "axis"
+         },
+     )?;
+-    let axis = if gauge {
++    let vertical_saw = id == saw::ID && matches!(value, "up" | "down");
++    let axis = if gauge || vertical_saw {
+         let facing = Direction::ALL.into_iter().find(|d| d.name() == value)?;
+         placement::gauge_axis(facing, get("axis_along_first")? == "true")
+     } else {
+@@ -460,13 +462,14 @@
+         GEARBOX => Kind::Gearbox,
+         press::ID => Kind::Press,
+         pump::ID => Kind::Pump,
+-        fan::ID | drill::ID => Kind::Consumer {
++        saw::ID if vertical_saw => Kind::LinearActuator,
++        fan::ID | drill::ID | saw::ID => Kind::Consumer {
+             facing: Direction::ALL
+                 .into_iter()
+                 .find(|d| d.name() == value)?
+                 .opposite()
+                 .vector(),
+-            impact: if id == drill::ID { 4.0 } else { 2.0 },
++            impact: if id == fan::ID { 2.0 } else { 4.0 },
+         },
+         wheel::SMALL | wheel::LARGE => Kind::WaterWheel {
+             rpm: 0.0,
+diff --git a/crates/pumpkin-core/src/block/entities/create_saw_tree.rs b/crates/pumpkin-core/src/block/entities/create_saw_tree.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_saw_tree.rs
+@@ -0,0 +1,177 @@
++use std::{collections::HashMap, sync::Arc};
++
++use create_engine::contraption::actors::saw::{Material, Target, TreeBlock, TreeStem, find_tree};
++use pumpkin_data::{Block, BlockStateId, tag::Taggable};
++use pumpkin_util::math::position::BlockPos;
++
++use crate::world::World;
++
++pub(super) const ID: &str = "create:mechanical_saw";
++const TREE_SEARCH_LIMIT: usize = 16_384;
++
++pub(super) fn is_sawable(id: BlockStateId) -> bool {
++    let block = Block::from_state_id(id);
++    if block.name.contains(':') && !block.name.starts_with("minecraft:") {
++        return false;
++    }
++    let material = if block == &Block::PUMPKIN || block == &Block::MELON {
++        Material::PumpkinOrMelon
++    } else if block == &Block::CHORUS_PLANT {
++        Material::ChorusPlant
++    } else if block.is_tagged_with("minecraft:leaves") == Some(true) {
++        Material::Leaves
++    } else {
++        match tree_block(id).stem {
++            TreeStem::Log | TreeStem::Root => Material::LogOrRoot,
++            TreeStem::VerticalPlant => Material::VerticalPlant,
++            _ => Material::Other,
++        }
++    };
++    Target {
++        material,
++        hardness: id.to_state().hardness,
++        excluded: block.is_tagged_with("minecraft:saplings") == Some(true)
++            || block.is_tagged_with("create:non_breakable") == Some(true),
++    }
++    .is_sawable()
++}
++
++/// Fell the Create tree plan after the caller has successfully broken its root.
++/// `broken_state` must be the root's state from immediately before that break.
++pub(crate) fn fell_tree_after_stationary_saw_break(
++    world: &Arc<World>,
++    root: BlockPos,
++    broken_state: BlockStateId,
++) {
++    let origin = [root.0.x, root.0.y, root.0.z];
++    let mut snapshots = HashMap::new();
++    let Ok(tree) = find_tree(
++        origin,
++        tree_block(broken_state),
++        u32::try_from(world.dimension.height).unwrap_or_default(),
++        TREE_SEARCH_LIMIT,
++        |cell| {
++            if !world.is_in_height_limit(cell[1]) {
++                return Some(TreeBlock::default());
++            }
++            let position = block_pos(cell);
++            let state = world.get_block_state_id_if_loaded(&position)?;
++            snapshots.insert(cell, state);
++            Some(tree_block(state))
++        },
++    ) else {
++        return;
++    };
++
++    // Keep only the exact states the planner assigned to this tree; guarded breaks
++    // then prevent a later replacement from being mistaken for a tree member.
++    let planned: Vec<_> = tree
++        .actions()
++        .filter_map(|(_, cell)| {
++            let expected = snapshots.get(&cell).copied()?;
++            let position = block_pos(cell);
++            if world.get_block_state_id_if_loaded(&position) != Some(expected)
++                || expected.to_state().block_entity_type != u16::MAX
++                || world.get_block_entity(&position).is_some()
++            {
++                return None;
++            }
++            Some((position, expected))
++        })
++        .collect();
++
++    for (position, expected) in planned {
++        world.break_machine_target(&position, expected);
++    }
++}
++
++fn tree_block(state: BlockStateId) -> TreeBlock {
++    let block = Block::from_state_id(state);
++    let name = match block.name.strip_prefix("minecraft:") {
++        Some(name) => name,
++        None if !block.name.contains(':') => block.name,
++        None => return TreeBlock::default(),
++    };
++
++    let stem = match name {
++        "mangrove_roots" => TreeStem::Root,
++        "mushroom_stem" => TreeStem::Log,
++        "bamboo" | "cactus" | "sugar_cane" | "kelp" | "kelp_plant" => TreeStem::VerticalPlant,
++        "chorus_plant" | "chorus_flower" => TreeStem::Chorus,
++        _ if block.is_tagged_with("minecraft:logs") == Some(true) => TreeStem::Log,
++        _ => TreeStem::None,
++    };
++    let attachment = matches!(
++        name,
++        "bee_nest" | "cocoa" | "mangrove_propagule" | "moss_carpet" | "shroomlight" | "vine"
++    ) || block.is_tagged_with("create:tree_attachments") == Some(true);
++    let nondecaying_leaf_radius = match name {
++        "red_mushroom_block" => Some(2),
++        "brown_mushroom_block" | "weeping_vines" | "weeping_vines_plant" => Some(3),
++        _ if block.is_tagged_with("minecraft:wart_blocks") == Some(true) => Some(3),
++        _ => None,
++    };
++    let leaf_distance = if name == "scaffolding" {
++        None
++    } else {
++        block.properties(state).and_then(|properties| {
++            properties.to_props().into_iter().find_map(|property| {
++                (property.key_str() == "distance")
++                    .then(|| property.value_str().parse().ok())
++                    .flatten()
++            })
++        })
++    };
++
++    TreeBlock {
++        stem,
++        leaf_distance,
++        nondecaying_leaf_radius,
++        attachment,
++    }
++}
++
++fn block_pos([x, y, z]: [i32; 3]) -> BlockPos {
++    BlockPos::new(x, y, z)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn maps_vanilla_tree_stems_attachments_and_special_leaves() {
++        assert_eq!(
++            tree_block(Block::OAK_LOG.default_state.id).stem,
++            TreeStem::Log
++        );
++        assert_eq!(
++            tree_block(Block::MUSHROOM_STEM.default_state.id).stem,
++            TreeStem::Log
++        );
++        assert_eq!(
++            tree_block(Block::BAMBOO.default_state.id).stem,
++            TreeStem::VerticalPlant
++        );
++        assert_eq!(
++            tree_block(Block::CHORUS_FLOWER.default_state.id).stem,
++            TreeStem::Chorus
++        );
++        assert!(tree_block(Block::COCOA.default_state.id).attachment);
++        assert!(is_sawable(Block::OAK_LOG.default_state.id));
++        assert!(!is_sawable(Block::STONE.default_state.id));
++        assert!(!is_sawable(Block::OAK_SAPLING.default_state.id));
++        assert_eq!(
++            tree_block(Block::RED_MUSHROOM_BLOCK.default_state.id).nondecaying_leaf_radius,
++            Some(2)
++        );
++        assert_eq!(
++            tree_block(Block::BROWN_MUSHROOM_BLOCK.default_state.id).nondecaying_leaf_radius,
++            Some(3)
++        );
++        assert_eq!(
++            tree_block(Block::SCAFFOLDING.default_state.id).leaf_distance,
++            None
++        );
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/entities/mod.rs b/crates/pumpkin-core/src/block/entities/mod.rs
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -30,6 +30,7 @@
+ pub(crate) mod create_kinetic;
+ pub(crate) mod create_millstone;
+ pub(crate) mod create_press;
++mod create_saw_tree;
+ pub(crate) use create_kinetic::set_create_wheel_material;
+ pub(crate) fn create_kinetic_node(
+     state: BlockStateId,
+diff --git a/crates/pumpkin-core/src/block/registry.rs b/crates/pumpkin-core/src/block/registry.rs
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -1331,6 +1331,55 @@
+                     .from_properties(&properties)
+                     .to_state_id(placed_block)
+             }
++            "create:mechanical_saw" => {
++                let facing = if sneaking { look } else { look.opposite() };
++                let yaw = f64::from(player.get_entity().yaw.load());
++                let horizontal = [
++                    CreateDirection::South,
++                    CreateDirection::West,
++                    CreateDirection::North,
++                    CreateDirection::East,
++                ][((yaw / 90.0 + 0.5).floor() as i64 & 3) as usize];
++                let has = |d| ports[d as usize];
++                let vertical_port = has(CreateDirection::Up) || has(CreateDirection::Down);
++                let first = match facing.axis() {
++                    KineticAxis::X => vertical_port,
++                    KineticAxis::Z => !vertical_port,
++                    KineticAxis::Y => {
++                        let x = has(CreateDirection::East) || has(CreateDirection::West);
++                        let z = has(CreateDirection::North) || has(CreateDirection::South);
++                        if x != z {
++                            x
++                        } else {
++                            horizontal.axis() == KineticAxis::X
++                        }
++                    }
++                };
++                let flipped = facing.axis() == KineticAxis::Y
++                    && matches!(horizontal, CreateDirection::South | CreateDirection::East);
++                let state = Self::set_create_facing(placed_block, state_id, facing);
++                let Some(mut properties) =
++                    placed_block.properties(state).map(|props| props.to_props())
++                else {
++                    return state;
++                };
++                for property in &mut properties {
++                    let key = property.key_str();
++                    let value = match key {
++                        "axis_along_first" => first,
++                        "flipped" => flipped,
++                        _ => continue,
++                    };
++                    if let Some(updated) =
++                        Property::from_str_pair(key, if value { "true" } else { "false" })
++                    {
++                        *property = updated;
++                    }
++                }
++                placed_block
++                    .from_properties(&properties)
++                    .to_state_id(placed_block)
++            }
+             "create:encased_fan" | "create:mechanical_drill" => {
+                 let preferred = placement::preferred(ports).unwrap_or(look);
+                 Self::set_create_facing(

@@ -16,6 +16,8 @@
 
 <p align="center"><a href="#简体中文">简体中文</a> · <a href="#english">English</a> · <a href="INSTALL.zh-CN.md">安装与排错</a></p>
 
+**机械动力 Rust 预览 / Rust Create Preview:** [Windows 下载、源码和进度 / Windows download, source and status](create-preview/README.md)。这是独立的本地实验版，不替换上面的启动器安装包。 / Separate local experimental build; does not replace the launcher beta above.
+
 ![Next MC Launcher in light mode and Simplified Chinese, showing the selected instance and the offline play button.](docs/images/launcher-light.webp)
 
 ## 简体中文

@@ -1,0 +1,192 @@
+--- a/crates/pumpkin-core/src/net/mod.rs
++++ b/crates/pumpkin-core/src/net/mod.rs
+@@ -33,6 +33,7 @@
+ pub mod bedrock;
+ pub mod chat;
+ pub mod chunk_sender;
++mod create_scene;
+ pub use chunk_sender::ChunkSender;
+ pub mod java;
+ pub mod lan_broadcast;
+--- a/crates/pumpkin-core/src/net/chunk_sender.rs
++++ b/crates/pumpkin-core/src/net/chunk_sender.rs
+@@ -7,7 +7,9 @@
+ use crate::net::java::chunk_data::CChunkData;
+ use pumpkin_data::packet::CURRENT_MC_VERSION;
+ use pumpkin_protocol::codec::var_int::VarInt;
+-use pumpkin_protocol::java::client::play::{CChunkBatchEnd, CChunkBatchStart, CUnloadChunk};
++use pumpkin_protocol::java::client::play::{
++    CChunkBatchEnd, CChunkBatchStart, CCustomPayload, CUnloadChunk,
++};
+ use pumpkin_protocol::ser::NetworkWriteExt;
+ use pumpkin_protocol::{ClientPacket, MultiVersionJavaPacket};
+ use pumpkin_util::math::vector2::Vector2;
+@@ -16,7 +18,7 @@
+ use pumpkin_world::cylindrical_chunk_iterator::Cylindrical;
+ use pumpkin_world::level::{Level, SyncChunk};
+ 
+-use crate::net::ClientPlatform;
++use crate::net::{ClientPlatform, create_scene};
+ 
+ const MIN_CHUNKS_PER_TICK: f32 = 0.01;
+ const MAX_CHUNKS_PER_TICK: f32 = 64.0;
+@@ -346,6 +348,15 @@
+             }
+ 
+             client.try_enqueue_packet(chunk.payload.clone());
++            if version == CURRENT_MC_VERSION
++                && let ClientPlatform::Java(java_client) = client
++                && let Some(data) = chunk
++                    .chunk_ref
++                    .upgrade()
++                    .and_then(|c| create_scene::snapshot(&c))
++            {
++                java_client.try_send_packet(&CCustomPayload::new(create_scene::CHANNEL, &data));
++            }
+ 
+             self.pending_chunks.remove(&chunk.position);
+             self.sent_chunks.insert(chunk.position);
+--- a/crates/pumpkin-core/src/net/java/mod.rs
++++ b/crates/pumpkin-core/src/net/java/mod.rs
+@@ -1,4 +1,7 @@
+-use pumpkin_protocol::java::client::play::{CChunkBatchEnd, CChunkBatchStart, CPlayDisconnect};
++use super::create_scene;
++use pumpkin_protocol::java::client::play::{
++    CChunkBatchEnd, CChunkBatchStart, CCustomPayload, CPlayDisconnect,
++};
+ use pumpkin_world::level::SyncChunk;
+ use std::net::SocketAddr;
+ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+@@ -355,6 +358,7 @@
+             return;
+         }
+ 
++        let scene_sync = self.version.load() == CURRENT_MC_VERSION;
+         let (tx, rx) = oneshot::channel();
+         server.compute_pool.spawn(move || {
+             let mut serialized = Vec::with_capacity(valid_chunks.len());
+@@ -371,7 +375,8 @@
+                     error!("Failed to write chunk data: {err:?}");
+                     continue;
+                 }
+-                serialized.push(Bytes::from(buf));
++                let scene = scene_sync.then(|| create_scene::snapshot(&chunk)).flatten();
++                serialized.push((Bytes::from(buf), scene));
+             }
+             let _ = tx.send(serialized);
+         });
+@@ -387,8 +392,12 @@
+         self.send_packet(&CChunkBatchStart).await;
+ 
+         // One FIFO per connection: batch start/data/end stay in enqueue order.
+-        for chunk_data in serialized {
++        for (chunk_data, scene) in serialized {
+             self.send_packet_now_data(chunk_data).await;
++            if let Some(data) = scene {
++                self.send_packet(&CCustomPayload::new(create_scene::CHANNEL, &data))
++                    .await;
++            }
+         }
+ 
+         self.send_packet(&CChunkBatchEnd::new(sent_count as u16))
+--- /dev/null
++++ b/crates/pumpkin-core/src/net/create_scene.rs
+@@ -0,0 +1,98 @@
++use pumpkin_nbt::{compound::NbtCompound, serializer::NbtWriteHelperJava, tag::NbtTag};
++use pumpkin_protocol::{codec::var_int::VarInt, ser::NetworkWriteExt};
++use pumpkin_world::chunk::ChunkData;
++
++pub(crate) const CHANNEL: &str = "horizon:attachment_sync";
++const NAMESPACE: &str = "create";
++const SCENE: &str = "contraption_scene";
++const GEOMETRY: &str = "moving_structures";
++const POSES: &str = "moving_structure_poses";
++const MAX_PAYLOAD: usize = 1_048_576;
++
++pub(crate) fn snapshot(chunk: &ChunkData) -> Option<Vec<u8>> {
++    let NbtTag::Compound(scene) = chunk.get_custom_data(NAMESPACE, SCENE)? else {
++        return None;
++    };
++    encode(chunk.x, chunk.z, &scene)
++}
++
++fn encode(x: i32, z: i32, scene: &NbtCompound) -> Option<Vec<u8>> {
++    let geometry = scene.get_compound(GEOMETRY)?;
++    let poses = scene.get_compound(POSES)?;
++    let generation = geometry.get_long("Generation").filter(|&n| n > 0)?;
++    if geometry.get_int("Version") != Some(2)
++        || poses.get_int("Version") != Some(1)
++        || poses.get_long("Generation") != Some(generation)
++    {
++        return None;
++    }
++    // Chunk holder (3), signed big-endian chunk coordinates, then a replacement snapshot.
++    let mut bytes = vec![3];
++    bytes.extend_from_slice(&x.to_be_bytes());
++    bytes.extend_from_slice(&z.to_be_bytes());
++    bytes.push(1);
++    bytes.write_var_int(&VarInt(2)).ok()?;
++    for (key, value) in [(GEOMETRY, geometry), (POSES, poses)] {
++        bytes.write_string(NAMESPACE).ok()?;
++        bytes.write_string(key).ok()?;
++        bytes.push(10); // Unnamed root compound.
++        value
++            .clone()
++            .serialize_content(&mut NbtWriteHelperJava::new(&mut bytes))
++            .ok()?;
++        if bytes.len() > MAX_PAYLOAD {
++            return None;
++        }
++    }
++    Some(bytes)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn scene(geometry_generation: i64, pose_generation: i64, padding: usize) -> NbtCompound {
++        let mut geometry = NbtCompound::new();
++        geometry.put_int("Version", 2);
++        geometry.put_long("Generation", geometry_generation);
++        if padding != 0 {
++            geometry.put(
++                "Padding",
++                NbtTag::ByteArray(vec![0; padding].into_boxed_slice()),
++            );
++        }
++        let mut poses = NbtCompound::new();
++        poses.put_int("Version", 1);
++        poses.put_long("Generation", pose_generation);
++        let mut out = NbtCompound::new();
++        out.put_compound(GEOMETRY, geometry);
++        out.put_compound(POSES, poses);
++        out
++    }
++
++    #[test]
++    fn matches_chunk_attachment_wire_format_and_only_sends_scene_keys() {
++        use pumpkin_nbt::Nbt;
++        let mut tags = scene(17, 17, 0);
++        tags.put_string("server_only", "do not send".into());
++        let packet = encode(-17, 42, &tags).unwrap();
++        let mut expected = b"\x03\xff\xff\xff\xef\x00\x00\x00\x2a\x01\x02".to_vec();
++        expected.extend_from_slice(b"\x06create\x11moving_structures");
++        expected.extend_from_slice(
++            &Nbt::from(tags.get_compound(GEOMETRY).unwrap().clone()).write_unnamed(),
++        );
++        expected.extend_from_slice(b"\x06create\x16moving_structure_poses");
++        expected.extend_from_slice(
++            &Nbt::from(tags.get_compound(POSES).unwrap().clone()).write_unnamed(),
++        );
++        assert_eq!(packet, expected);
++    }
++
++    #[test]
++    fn rejects_mixed_generations_wrong_format_and_oversize_snapshots() {
++        assert!(encode(0, 0, &scene(17, 18, 0)).is_none());
++        assert!(encode(0, 0, &scene(0, 0, 0)).is_none());
++        assert!(encode(0, 0, &NbtCompound::new()).is_none());
++        assert!(encode(0, 0, &scene(17, 17, MAX_PAYLOAD)).is_none());
++    }
++}

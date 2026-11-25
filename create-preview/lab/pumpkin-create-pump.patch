@@ -1,0 +1,295 @@
+diff --git a/crates/pumpkin-core/src/block/blocks/mod.rs b/crates/pumpkin-core/src/block/blocks/mod.rs
+--- a/crates/pumpkin-core/src/block/blocks/mod.rs
++++ b/crates/pumpkin-core/src/block/blocks/mod.rs
+@@ -122,6 +122,7 @@
+ pub(crate) mod create_depot;
+ pub(crate) mod create_drain;
+ pub(crate) mod create_fluid_tank;
++pub(crate) mod create_pump;
+ pub(crate) mod create_gauge;
+ pub(crate) mod create_hand_crank;
+ pub(crate) mod create_sail;
+diff --git a/crates/pumpkin-core/src/block/blocks/create_pump.rs b/crates/pumpkin-core/src/block/blocks/create_pump.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/blocks/create_pump.rs
+@@ -0,0 +1,135 @@
++use std::sync::Arc;
++
++use create_engine::{
++    fluid_transport,
++    placement::{self, Direction},
++};
++use pumpkin_data::BlockStateId;
++use pumpkin_macros::pumpkin_block;
++use pumpkin_util::math::position::BlockPos;
++use pumpkin_world::world::BlockFlags;
++
++use crate::{
++    block::{
++        BlockActionResult, BlockBehaviour, UseWithItemArgs,
++        entities::create_fluid_tank::{self as tank, CreateFluidTank},
++        registry::BlockRegistry,
++    },
++    world::World,
++};
++
++pub(crate) const ID: &str = "create:mechanical_pump";
++
++fn front(state: BlockStateId) -> Option<Direction> {
++    let props = state.to_block().properties(state)?.to_props();
++    let facing = props.iter().find(|p| p.key_str() == "facing")?.value_str();
++    Direction::ALL.into_iter().find(|d| d.name() == facing)
++}
++
++fn relative(pos: BlockPos, side: Direction) -> BlockPos {
++    let [x, y, z] = side.vector();
++    BlockPos::new(pos.0.x + x, pos.0.y + y, pos.0.z + z)
++}
++
++pub(crate) fn placement_front(
++    world: &World,
++    pos: BlockPos,
++    look: Direction,
++    sneaking: bool,
++    ports: [bool; 6],
++) -> Direction {
++    if sneaking {
++        return look;
++    }
++    let wanted = look.opposite();
++    let joined = Direction::ALL
++        .into_iter()
++        .rev()
++        .filter(|&side| {
++            world
++                .get_block_state_id_if_loaded(&relative(pos, side))
++                .is_some_and(|state| state.to_block().name == tank::ID)
++        })
++        .min_by_key(|&side| {
++            if side == wanted {
++                0
++            } else if side == look {
++                2
++            } else {
++                1
++            }
++        });
++    joined
++        .filter(|side| side.axis() != wanted.axis())
++        .unwrap_or_else(|| placement::preferred(ports).map_or(wanted, Direction::opposite))
++}
++
++pub(crate) fn tick(world: &Arc<World>, pos: BlockPos, state: BlockStateId, rpm: f32) {
++    if !rpm.is_finite() || rpm == 0.0 {
++        return;
++    }
++    let Some(front) = front(state) else { return };
++    // shortcut: only directly attached single-block tanks until the pipe path solver is wired.
++    let [source_pos, target_pos] = [front.opposite(), front].map(|side| relative(pos, side));
++    if ![source_pos, target_pos].iter().all(|pos| {
++        world
++            .get_block_state_id_if_loaded(pos)
++            .is_some_and(|state| state.to_block().name == tank::ID)
++    }) {
++        return;
++    }
++    let (Some(source), Some(target)) = (
++        world.get_block_entity(&source_pos),
++        world.get_block_entity(&target_pos),
++    ) else {
++        return;
++    };
++    let (Some(a), Some(b)) = (
++        source.as_any().downcast_ref::<CreateFluidTank>(),
++        target.as_any().downcast_ref::<CreateFluidTank>(),
++    ) else {
++        return;
++    };
++    // Direction is the arrow on the pump; the magnitude of RPM determines pressure.
++    let signal = [a.signal(), b.signal()];
++    if a.transfer_to(b, fluid_transport::transfer_rate(rpm.abs())) > 0 {
++        world.update_block_entity(&source);
++        world.update_block_entity(&target);
++        for (at, before, after) in [
++            (source_pos, signal[0], a.signal()),
++            (target_pos, signal[1], b.signal()),
++        ] {
++            if before != after {
++                world.update_neighbour_for_output_signal(&at, world.get_block(&at));
++            }
++        }
++    }
++}
++
++#[pumpkin_block("create:mechanical_pump")]
++pub struct MechanicalPump;
++
++impl BlockBehaviour for MechanicalPump {
++    fn use_with_item(&self, args: UseWithItemArgs<'_>) -> BlockActionResult {
++        if args.item_stack.get_item().registry_key != "create:wrench"
++            || args
++                .world
++                .is_in_spawn_protection(args.player, args.position)
++        {
++            return BlockActionResult::PassToDefaultBlockAction;
++        }
++        let Some(state) = args.world.get_block_state_id_if_loaded(args.position) else {
++            return BlockActionResult::PassToDefaultBlockAction;
++        };
++        let Some(direction) = front(state).filter(|_| state.to_block().name == ID) else {
++            return BlockActionResult::PassToDefaultBlockAction;
++        };
++        args.world.set_block_state_if(
++            args.position,
++            BlockRegistry::set_create_facing(state.to_block(), state, direction.opposite()),
++            BlockFlags::NOTIFY_ALL,
++            |current| current == state,
++        );
++        BlockActionResult::SuccessServer
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/entities/create_fluid_tank.rs b/crates/pumpkin-core/src/block/entities/create_fluid_tank.rs
+--- a/crates/pumpkin-core/src/block/entities/create_fluid_tank.rs
++++ b/crates/pumpkin-core/src/block/entities/create_fluid_tank.rs
+@@ -73,6 +73,44 @@
+         write_tank(&mut nbt, fluid, amount - BUCKET_VOLUME);
+         self.dirty.store(true, Ordering::Relaxed);
+         Some(fluid)
++    }
++
++    pub(crate) fn transfer_to(&self, target: &Self, limit: i32) -> i32 {
++        let key = |t: &Self| (t.position.0.x, t.position.0.y, t.position.0.z);
++        let (first, second, forward) = match key(self).cmp(&key(target)) {
++            std::cmp::Ordering::Less => (self, target, true),
++            std::cmp::Ordering::Greater => (target, self, false),
++            std::cmp::Ordering::Equal => return 0,
++        };
++        // Opposing pumps must take the tank locks in the same order.
++        let first = first.nbt.lock().unwrap_or_else(PoisonError::into_inner);
++        let second = second.nbt.lock().unwrap_or_else(PoisonError::into_inner);
++        let (mut from, mut to) = if forward {
++            (first, second)
++        } else {
++            (second, first)
++        };
++        let (Some((fluid, stocked)), Some((existing, filled))) =
++            (tank_contents(&from), tank_contents(&to))
++        else {
++            return 0;
++        };
++        if filled > 0 && fluid != existing {
++            return 0;
++        }
++        let volume = limit.min(stocked).min(CAPACITY - filled);
++        if volume > 0 {
++            let fluid = if fluid == "minecraft:lava" {
++                "minecraft:lava"
++            } else {
++                "minecraft:water"
++            };
++            write_tank(&mut from, fluid, stocked - volume);
++            write_tank(&mut to, fluid, filled + volume);
++            self.dirty.store(true, Ordering::Relaxed);
++            target.dirty.store(true, Ordering::Relaxed);
++        }
++        volume.max(0)
+     }
+ 
+     pub fn signal(&self) -> u8 {
+@@ -177,6 +215,22 @@
+     use super::*;
+ 
+     #[test]
++    fn tank_transfer_conserves_amount_and_rejects_other_fluid() {
++        let src = CreateFluidTank::new(BlockPos::new(1, 2, 3));
++        let dst = CreateFluidTank::new(BlockPos::new(3, 2, 3));
++        assert!(src.pour("minecraft:water", 1000));
++        assert!(dst.pour("minecraft:water", CAPACITY - 10));
++        assert_eq!(src.transfer_to(&dst, 16), 10);
++        assert_eq!(src.transfer_to(&dst, 16), 0);
++        assert_eq!(dst.transfer_to(&src, 10), 10);
++        assert_eq!(src.take_bucket(), Some("minecraft:water"));
++        assert!(src.pour("minecraft:lava", 1000));
++        assert_eq!(dst.transfer_to(&src, 16), 0);
++        assert_eq!(src.transfer_to(&src, 16), 0);
++        assert_eq!(src.take_bucket(), Some("minecraft:lava"));
++    }
++
++    #[test]
+     fn bucket_transfers_conserve_fluid_across_saved_nbt() {
+         let position = BlockPos::new(0, 0, 0);
+         let tank = CreateFluidTank::new(position);
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -19,7 +19,8 @@
+ use super::{BlockEntity, create_press as press};
+ use crate::{
+     block::blocks::{
+-        create_chain as chain, create_water_wheel as wheel, redstone::block_receives_redstone_power,
++        create_chain as chain, create_pump as pump, create_water_wheel as wheel,
++        redstone::block_receives_redstone_power,
+     },
+     entity::{EntityBase, player::Player},
+     world::World,
+@@ -46,6 +47,7 @@
+     STRESSOMETER,
+     CRANK,
+     press::ID,
++    pump::ID,
+     chain::DRIVE,
+     chain::ADJUSTABLE,
+     wheel::SMALL,
+@@ -371,7 +373,7 @@
+     };
+     let gauge = matches!(id, SPEEDOMETER | STRESSOMETER);
+     let value = get(
+-        if gauge || matches!(id, MOTOR | CRANK | wheel::SMALL | press::ID) {
++        if gauge || matches!(id, MOTOR | CRANK | wheel::SMALL | press::ID | pump::ID) {
+             "facing"
+         } else {
+             "axis"
+@@ -420,6 +422,7 @@
+         "create:large_cogwheel" => Kind::Cog { large: true },
+         GEARBOX => Kind::Gearbox,
+         press::ID => Kind::Press,
++        pump::ID => Kind::Pump,
+         wheel::SMALL | wheel::LARGE => Kind::WaterWheel {
+             rpm: 0.0,
+             capacity: if id == wheel::LARGE { 128.0 } else { 32.0 },
+@@ -745,6 +748,9 @@
+             next.crank = self.crank_direction(tick);
+         }
+         next.chain_signal = chain_signal;
++        if self.id == pump::ID {
++            pump::tick(world, self.position, state, next.rpm);
++        }
+         let (changed, changed_signal) = {
+             let mut readings = self
+                 .readings
+diff --git a/crates/pumpkin-core/src/block/registry.rs b/crates/pumpkin-core/src/block/registry.rs
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -258,6 +258,7 @@
+     manager.register(crate::block::blocks::create_depot::CreateDepotBlock);
+     manager.register(crate::block::blocks::create_drain::ItemDrain);
+     manager.register(crate::block::blocks::create_fluid_tank::FluidTank);
++    manager.register(crate::block::blocks::create_pump::MechanicalPump);
+     manager.register(crate::block::blocks::create_sail::CreateSail);
+     manager.register(crate::block::blocks::create_gauge::CreateSpeedometer);
+     manager.register(crate::block::blocks::create_gauge::CreateStressometer);
+@@ -1261,6 +1262,13 @@
+                 };
+                 Self::set_create_axis(placed_block, state_id, axis)
+             }
++            crate::block::blocks::create_pump::ID => Self::set_create_facing(
++                placed_block,
++                state_id,
++                crate::block::blocks::create_pump::placement_front(
++                    world, position, look, sneaking, ports,
++                ),
++            ),
+             crate::block::entities::create_press::ID => {
+                 let yaw = f64::from(player.get_entity().yaw.load());
+                 let facing = [

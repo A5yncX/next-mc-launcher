@@ -1,0 +1,500 @@
+diff --git a/crates/pumpkin-core/src/block/blocks/mod.rs b/crates/pumpkin-core/src/block/blocks/mod.rs
+--- a/crates/pumpkin-core/src/block/blocks/mod.rs
++++ b/crates/pumpkin-core/src/block/blocks/mod.rs
+@@ -129,6 +129,7 @@ pub(crate) mod create_millstone;
+ pub(crate) mod create_pipe;
+ pub(crate) mod create_pump;
+ pub(crate) mod create_sail;
++pub(crate) mod create_burner;
+ pub(crate) mod create_chassis;
+ pub(crate) mod create_sticker;
+ pub(crate) mod create_water_wheel;
+diff --git a/crates/pumpkin-core/src/block/entities/mod.rs b/crates/pumpkin-core/src/block/entities/mod.rs
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -207,6 +207,10 @@ pub fn block_entity_from_nbt(nbt: &NbtCompound) -> Option<Arc<dyn BlockEntity>>
+     let y = nbt.get_int("y")?;
+     let z = nbt.get_int("z")?;
+     let pos = BlockPos::new(x, y, z);
++    use crate::block::blocks::create_burner::{self, CreateBurner};
++    if id == create_burner::ID {
++        return Some(Arc::new(CreateBurner::from_nbt(nbt, pos)));
++    }
+     if crate::block::blocks::create_chassis::id(id).is_some() {
+         return Some(Arc::new(crate::block::blocks::create_chassis::ChassisEntity::from_nbt(nbt, pos)));
+     }
+@@ -388,6 +392,7 @@ pub fn has_block_block_entity(block: &Block) -> bool {
+     BLOCK_ENTITY_TYPES.contains(&block.name)
+         || block.name == create_depot::CreateDepotBlockEntity::ID
+         || block.name == create_drain::ID
++        || block.name == crate::block::blocks::create_burner::ID
+         || matches!(
+             block.name,
+             create_fluid_tank::ID | create_chute::ID | create_chute::SMART_ID | create_crusher::ID
+@@ -420,6 +425,7 @@ pub fn create_block_entity(
+         return Some(Arc::new(create_kinetic::CreateKinetic::new(id, position)));
+     }
+     match *name {
++        "blaze_burner" => Some(Arc::new(crate::block::blocks::create_burner::CreateBurner::new(position))),
+         "depot" => Some(Arc::new(create_depot::CreateDepotBlockEntity::new(
+             position,
+         ))),
+diff --git a/crates/pumpkin-core/src/block/registry.rs b/crates/pumpkin-core/src/block/registry.rs
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -265,6 +265,7 @@ pub fn default_registry() -> Arc<BlockRegistry> {
+     manager.register(crate::block::blocks::create_pump::MechanicalPump);
+     manager.register(crate::block::blocks::create_sail::CreateSail);
+     manager.register(crate::block::blocks::create_sticker::CreateStickerBlock);
++    manager.register(crate::block::blocks::create_burner::BlazeBurner);
+     manager.register(crate::block::blocks::create_chassis::CreateChassis);
+     manager.register(crate::block::blocks::create_gauge::CreateSpeedometer);
+     manager.register(crate::block::blocks::create_gauge::CreateStressometer);
+@@ -1034,6 +1035,13 @@ impl BlockRegistry {
+             );
+             new_state = Self::set_create_facing(placed_block, new_state, facing);
+         }
++        use crate::block::blocks::{create_burner as burner, create_pipe as pipe};
++        if placed_block.name == burner::ID && let Some(ref stack) = held_stack {
++            let yaw = f64::from(player.get_entity().yaw.load()).to_radians();
++            let facing = Self::create_direction(BlockDirection::get_nearest(-yaw.sin(), 0.0, yaw.cos())).opposite();
++            let heat = if stack.get_item().registry_key == burner::ID { "smouldering" } else { "none" };
++            new_state = pipe::with_property(Self::set_create_facing(placed_block, new_state, facing), "blaze", heat);
++        }
+         if let PlacementMode::Create(assist) = mode {
+             new_state = self.create_placement_state(
+                 placed_block,
+@@ -1128,7 +1136,7 @@ impl BlockRegistry {
+         );
+ 
+         if let Some(ref stack) = held_stack
+-            && placed_block.default_state.block_entity_type != u16::MAX
++            && new_state.to_state().block_entity_type != u16::MAX
+         {
+             if let Some(block_entity_data) =
+                 stack.get_data_component::<pumpkin_data::data_component_impl::BlockEntityDataImpl>()
+diff --git a/crates/pumpkin-core/src/net/java/play/use_item_on.rs b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+--- a/crates/pumpkin-core/src/net/java/play/use_item_on.rs
++++ b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+@@ -194,7 +194,13 @@ impl JavaClient {
+         if should_try_block_placement(&item_result) {
+             // Check if the item is a block, because not every item can be placed :D
+             let item_id = item.item.id;
+-            if let Some(block) = Block::from_item_id(item_id) {
++            use crate::block::blocks::create_burner as burner;
++            let placed = if item.item.registry_key == burner::EMPTY {
++                Block::from_registry_key(burner::ID)
++            } else {
++                Block::from_item_id(item_id)
++            };
++            if let Some(block) = placed {
+                 let assist =
+                     Self::create_placement_assist(player, block, use_item_on, face, &world, server);
+                 if is_create_kinetic_block(block)
+diff --git a/crates/pumpkin-core/src/world/mod.rs b/crates/pumpkin-core/src/world/mod.rs
+--- a/crates/pumpkin-core/src/world/mod.rs
++++ b/crates/pumpkin-core/src/world/mod.rs
+@@ -5593,10 +5593,10 @@ impl World {
+         let is_new_block = old_block != new_block;
+         let block_moved = flags.contains(BlockFlags::MOVED);
+ 
+-        if is_new_block
+-            && old_block.default_state.block_entity_type != u16::MAX
+-            && old_block.default_state.block_entity_type
+-                != new_block.default_state.block_entity_type
++        let old_entity_type = replaced_block_state_id.to_state().block_entity_type;
++        let new_entity_type = block_state_id.to_state().block_entity_type;
++        if old_entity_type != u16::MAX
++            && old_entity_type != new_entity_type
+             && let Some(entity) = self.get_block_entity(position)
+         {
+             if !flags.contains(BlockFlags::SKIP_BLOCK_ENTITY_REPLACED_CALLBACK) {
+@@ -5615,7 +5615,9 @@ impl World {
+             );
+         }
+ 
+-        if !flags.contains(BlockFlags::SKIP_BLOCK_ADDED_CALLBACK) && is_new_block {
++        if !flags.contains(BlockFlags::SKIP_BLOCK_ADDED_CALLBACK)
++            && (is_new_block || (new_entity_type != u16::MAX && old_entity_type != new_entity_type))
++        {
+             self.on_block_placed(
+                 position,
+                 new_block,
+diff --git a/crates/pumpkin-core/src/block/blocks/create_burner.rs b/crates/pumpkin-core/src/block/blocks/create_burner.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/blocks/create_burner.rs
+@@ -0,0 +1,373 @@
++use std::{
++    any::Any,
++    sync::{
++        Arc, Mutex, PoisonError,
++        atomic::{AtomicBool, Ordering},
++    },
++};
++
++use create_engine::burner::{Burner, Candidate, Fuel, Heat};
++use pumpkin_data::{
++    Block, BlockStateId,
++    data_component_impl::{CookingFuelImpl, EquipmentSlot},
++    item::Item,
++    item_stack::ItemStack,
++    tag::Taggable,
++};
++use pumpkin_inventory::screen_handler::InventoryPlayer;
++use pumpkin_macros::pumpkin_block;
++use pumpkin_nbt::compound::NbtCompound;
++use pumpkin_util::{GameMode, Hand, math::position::BlockPos};
++
++use crate::{
++    block::{
++        BlockActionResult, BlockBehaviour, GetComparatorOutputArgs, NormalUseArgs, UseWithItemArgs,
++        entities::BlockEntity,
++    },
++    entity::{EntityBase, player::Player},
++    world::{BlockFlags, World},
++};
++
++use super::create_pipe::{property, with_property};
++
++pub(crate) const ID: &str = "create:blaze_burner";
++pub(crate) const LIT: &str = "create:lit_blaze_burner";
++pub(crate) const EMPTY: &str = "create:empty_blaze_burner";
++const CREATIVE: &str = "create:creative_blaze_cake";
++
++pub(crate) fn heat(state: BlockStateId) -> Option<Heat> {
++    Some(match property(state, "blaze")? {
++        "none" => Heat::None,
++        "smouldering" => Heat::Smouldering,
++        "fading" => Heat::Fading,
++        "kindled" => Heat::Kindled,
++        "seething" => Heat::Seething,
++        _ => return None,
++    })
++}
++
++fn heat_name(heat: Heat) -> &'static str {
++    match heat {
++        Heat::None => "none",
++        Heat::Smouldering => "smouldering",
++        Heat::Fading => "fading",
++        Heat::Kindled => "kindled",
++        Heat::Seething => "seething",
++    }
++}
++
++#[pumpkin_block("create:blaze_burner", "create:lit_blaze_burner")]
++pub struct BlazeBurner;
++
++fn can_use(world: &World, pos: &BlockPos, player: &Player) -> bool {
++    matches!(
++        player.gamemode.load(),
++        GameMode::Survival | GameMode::Adventure | GameMode::Creative
++    ) && !world.is_in_spawn_protection(player, pos)
++        && (!player.get_entity().is_sneaking()
++            || [Hand::Right, Hand::Left]
++                .into_iter()
++                .all(|hand| player.get_inventory().get_stack_in_hand(hand).is_empty()))
++}
++
++impl BlockBehaviour for BlazeBurner {
++    fn get_comparator_output(&self, args: GetComparatorOutputArgs<'_>) -> Option<u8> {
++        Some(if args.block.name == ID {
++            heat(args.state.id).map_or(0, Heat::comparator)
++        } else {
++            0
++        })
++    }
++
++    fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
++        if !can_use(args.world, args.position, args.player)
++            || [Hand::Right, Hand::Left].into_iter().any(|hand| {
++                !args
++                    .player
++                    .get_inventory()
++                    .get_stack_in_hand(hand)
++                    .is_empty()
++            })
++        {
++            return BlockActionResult::Pass;
++        }
++        let Some(entity) = args.world.get_block_entity(args.position) else {
++            return BlockActionResult::Pass;
++        };
++        if let Some(burner) = entity.as_any().downcast_ref::<CreateBurner>()
++            && burner.set_goggles(false)
++        {
++            args.world.update_block_entity(&entity);
++            return BlockActionResult::SuccessServer;
++        }
++        BlockActionResult::Pass
++    }
++
++    fn use_with_item(&self, args: UseWithItemArgs<'_>) -> BlockActionResult {
++        use BlockActionResult::{PassToDefaultBlockAction, SuccessServer};
++        if !can_use(args.world, args.position, args.player) || args.item_stack.is_empty() {
++            return PassToDefaultBlockAction;
++        }
++        let state = args.world.get_block_state_id(args.position);
++        if state.to_block() != args.block {
++            return PassToDefaultBlockAction;
++        }
++        let item = args.item_stack.get_item();
++        let key = item.registry_key;
++        let creative = args.player.gamemode.load() == GameMode::Creative;
++        if args.block.name == LIT || heat(state) == Some(Heat::None) {
++            let (new, wear) = if args.block.name == ID && item == &Item::FLINT_AND_STEEL {
++                (
++                    Block::from_registry_key(LIT).map(|block| block.default_state.id),
++                    true,
++                )
++            } else if args.block.name == LIT && args.item_stack.is_shovel() {
++                (
++                    Block::from_registry_key(ID).map(|block| block.default_state.id),
++                    true,
++                )
++            } else if args.block.name == LIT
++                && property(state, "flame_type") == Some("regular")
++                && item.is_tagged_with("minecraft:soul_fire_base_blocks") == Some(true)
++            {
++                (Some(with_property(state, "flame_type", "soul")), false)
++            } else {
++                return PassToDefaultBlockAction;
++            };
++            if let Some(new) = new
++                && args
++                    .world
++                    .set_block_state_if(args.position, new, BlockFlags::NOTIFY_ALL, |old| {
++                        old == state
++                    })
++                    .is_some()
++                && wear
++                && !creative
++            {
++                args.player.damage_item_in_slot(args.equipment_slot, 1);
++            }
++            return SuccessServer;
++        }
++        let Some(entity) = args.world.get_block_entity(args.position) else {
++            return PassToDefaultBlockAction;
++        };
++        let Some(burner) = entity.as_any().downcast_ref::<CreateBurner>() else {
++            return PassToDefaultBlockAction;
++        };
++        if key == "create:goggles" {
++            if burner.set_goggles(true) {
++                args.world.update_block_entity(&entity);
++            }
++            return SuccessServer;
++        }
++        let special = (key == "create:blaze_cake").then_some(3200);
++        let fuel_ticks = args
++            .item_stack
++            .get_data_component::<CookingFuelImpl>()
++            .map_or(0, |fuel| i32::from(fuel.get_burn_ticks(false)));
++        let candidate = Candidate::resolve(special, None, false, fuel_ticks, false);
++        let Some(next) = burner.feed(heat(state).unwrap_or_default(), candidate, key == CREATIVE)
++        else {
++            return PassToDefaultBlockAction;
++        };
++        burner.sync_heat(args.world, state, next);
++        args.world.update_block_entity(&entity);
++        if !creative && key != CREATIVE {
++            // Lava buckets are the stock furnace fuel with an empty container.
++            args.item_stack.decrement(1);
++            let inventory = args.player.get_inventory();
++            if item == &Item::LAVA_BUCKET {
++                let mut bucket = ItemStack::new(1, &Item::BUCKET);
++                if args.item_stack.is_empty() {
++                    *args.item_stack = bucket;
++                } else {
++                    inventory.insert_stack_anywhere(&mut bucket);
++                    if !bucket.is_empty() {
++                        args.world.drop_stack(args.position, bucket);
++                    }
++                }
++            }
++            let hand = if *args.equipment_slot == EquipmentSlot::OFF_HAND {
++                Hand::Left
++            } else {
++                Hand::Right
++            };
++            inventory.set_stack_in_hand(hand, args.item_stack.clone());
++            args.player.sync_inventory_to_client();
++        }
++        SuccessServer
++    }
++}
++
++pub(crate) struct CreateBurner {
++    position: BlockPos,
++    store: Mutex<(Burner, bool)>,
++    dirty: AtomicBool,
++}
++
++impl CreateBurner {
++    pub(crate) fn new(position: BlockPos) -> Self {
++        Self::from_nbt(&NbtCompound::new(), position)
++    }
++
++    fn set_goggles(&self, next: bool) -> bool {
++        let mut store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
++        if store.1 == next {
++            return false;
++        }
++        store.1 = next;
++        self.dirty.store(true, Ordering::Relaxed);
++        true
++    }
++
++    fn feed(&self, heat: Heat, fuel: Candidate, creative_cake: bool) -> Option<Heat> {
++        if heat == Heat::None {
++            return None;
++        }
++        let mut store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
++        store.0.heat = heat;
++        if creative_cake {
++            store.0.apply_creative(|_| {});
++        } else if !store.0.insert(fuel, true, false, |_| {}) {
++            return None;
++        }
++        self.dirty.store(true, Ordering::Relaxed);
++        Some(store.0.heat)
++    }
++
++    fn sync_heat(&self, world: &Arc<World>, state: BlockStateId, heat: Heat) -> bool {
++        let next = with_property(state, "blaze", heat_name(heat));
++        next != state
++            && world
++                .set_block_state_if(&self.position, next, BlockFlags::NOTIFY_ALL, |old| {
++                    old == state
++                })
++                .is_some()
++    }
++}
++
++impl BlockEntity for CreateBurner {
++    fn resource_location(&self) -> &'static str {
++        ID
++    }
++    fn get_position(&self) -> BlockPos {
++        self.position
++    }
++    fn from_nbt(nbt: &NbtCompound, position: BlockPos) -> Self {
++        let fuel = match nbt.get_int("fuelLevel") {
++            Some(1) => Fuel::Normal,
++            Some(2) => Fuel::Special,
++            _ => Fuel::None,
++        };
++        Self {
++            position,
++            store: Mutex::new((
++                Burner {
++                    fuel,
++                    remaining: nbt
++                        .get_int("burnTimeRemaining")
++                        .unwrap_or(0)
++                        .clamp(0, 10_000),
++                    creative: nbt.get_byte("isCreative").unwrap_or(0) != 0,
++                    ..Burner::default()
++                },
++                nbt.get_byte("Goggles").unwrap_or(0) != 0,
++            )),
++            dirty: AtomicBool::new(false),
++        }
++    }
++    fn write_nbt(&self, tag: &mut NbtCompound) {
++        let &(burner, goggles) = &*self.store.lock().unwrap_or_else(PoisonError::into_inner);
++        if burner.creative {
++            tag.put_bool("isCreative", true);
++        } else {
++            tag.put_int("fuelLevel", burner.fuel as i32);
++            tag.put_int("burnTimeRemaining", burner.remaining);
++        }
++        if goggles {
++            tag.put_bool("Goggles", true);
++        }
++    }
++    fn chunk_data_nbt(&self) -> Option<NbtCompound> {
++        let mut tag = NbtCompound::new();
++        self.write_nbt(&mut tag);
++        Some(tag)
++    }
++    fn tick(&self, world: &Arc<World>) {
++        let Some(state) = world.get_block_state_id_if_loaded(&self.position) else {
++            return;
++        };
++        let Some(current) = (state.to_block().name == ID)
++            .then(|| heat(state))
++            .flatten()
++            .filter(|heat| *heat != Heat::None)
++        else {
++            return;
++        };
++        let (next, changed) = {
++            let mut store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
++            store.0.heat = current;
++            let before = store.0;
++            store.0.tick(|_| {});
++            let next = store.0;
++            (next, before != next)
++        };
++        if changed {
++            self.dirty.store(true, Ordering::Relaxed);
++            let heat_changed = self.sync_heat(world, state, next.heat);
++            if (heat_changed || next.remaining % 20 == 0)
++                && let Some(entity) = world.get_block_entity(&self.position)
++            {
++                world.update_block_entity(&entity);
++            }
++        }
++    }
++    fn is_dirty(&self) -> bool {
++        self.dirty.load(Ordering::Relaxed)
++    }
++    fn clear_dirty(&self) {
++        self.dirty.store(false, Ordering::Relaxed);
++    }
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn fuel_priority_goggles_and_creative_persist() {
++        let burner = CreateBurner::new(BlockPos::new(0, 78, 0));
++        let coal = Candidate {
++            fuel: Fuel::Normal,
++            burn_time: 1600,
++        };
++        let cake = Candidate {
++            fuel: Fuel::Special,
++            burn_time: 3200,
++        };
++        assert_eq!(burner.feed(Heat::None, coal, false), None);
++        assert_eq!(
++            burner.feed(Heat::Smouldering, coal, false),
++            Some(Heat::Kindled)
++        );
++        assert_eq!(
++            burner.feed(Heat::Kindled, cake, false),
++            Some(Heat::Seething)
++        );
++        assert_eq!(burner.feed(Heat::Seething, coal, false), None);
++        assert!(burner.set_goggles(true));
++        let saved = burner.chunk_data_nbt().unwrap();
++        assert_eq!(saved.get_int("burnTimeRemaining"), Some(3200));
++        let after = CreateBurner::from_nbt(&saved, burner.position);
++        assert_eq!(
++            after.feed(Heat::Seething, coal, true),
++            Some(Heat::Smouldering)
++        );
++        assert!(after.set_goggles(false));
++        let saved = after.chunk_data_nbt().unwrap();
++        assert_eq!(saved.get_byte("isCreative"), Some(1));
++        assert!(saved.get_int("fuelLevel").is_none());
++    }
++}

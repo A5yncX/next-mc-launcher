@@ -1,0 +1,284 @@
+diff --git a/crates/pumpkin-core/src/block/blocks/create_encasing.rs b/crates/pumpkin-core/src/block/blocks/create_encasing.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/blocks/create_encasing.rs
+@@ -0,0 +1,248 @@
++use std::sync::Arc;
++
++use create_engine::{
++    kinetics::{Axis, Kind},
++    placement::Direction,
++};
++use pumpkin_data::{Block, BlockDirection, BlockStateId, block_properties::Property};
++use pumpkin_util::{GameMode, math::position::BlockPos};
++use pumpkin_world::world::BlockFlags;
++
++use crate::{
++    block::{entities::create_kinetic_node, registry::BlockRegistry},
++    entity::{EntityBase, player::Player},
++    world::World,
++};
++
++use super::create_pipe::property;
++
++const SHAFT: &str = "create:shaft";
++const COG: &str = "create:cogwheel";
++const LARGE: &str = "create:large_cogwheel";
++const PARTS: [(u8, &str, &str, &str); 6] = [
++    (
++        0,
++        "create:andesite_casing",
++        SHAFT,
++        "create:andesite_encased_shaft",
++    ),
++    (
++        1,
++        "create:andesite_casing",
++        COG,
++        "create:andesite_encased_cogwheel",
++    ),
++    (
++        2,
++        "create:andesite_casing",
++        LARGE,
++        "create:andesite_encased_large_cogwheel",
++    ),
++    (
++        0,
++        "create:brass_casing",
++        SHAFT,
++        "create:brass_encased_shaft",
++    ),
++    (
++        1,
++        "create:brass_casing",
++        COG,
++        "create:brass_encased_cogwheel",
++    ),
++    (
++        2,
++        "create:brass_casing",
++        LARGE,
++        "create:brass_encased_large_cogwheel",
++    ),
++];
++
++fn positive(axis: Axis) -> Direction {
++    match axis {
++        Axis::X => Direction::East,
++        Axis::Y => Direction::Up,
++        Axis::Z => Direction::South,
++    }
++}
++
++fn vector(pos: BlockPos) -> [i32; 3] {
++    [pos.0.x, pos.0.y, pos.0.z]
++}
++
++fn adjacent(world: &World, pos: BlockPos, face: Direction) -> Option<BlockStateId> {
++    let [x, y, z] = face.vector();
++    world.get_block_state_id_if_loaded(&BlockPos::new(pos.0.x + x, pos.0.y + y, pos.0.z + z))
++}
++
++fn state(base: BlockStateId, axis: Axis, ends: Option<[bool; 2]>) -> Option<BlockStateId> {
++    let block = base.to_block();
++    let mut props = block.properties(base)?.to_props();
++    for p in &mut props {
++        let value = match (p.key_str(), ends) {
++            ("axis", _) => axis.name(),
++            ("top_shaft", Some([top, _])) => {
++                if top {
++                    "true"
++                } else {
++                    "false"
++                }
++            }
++            ("bottom_shaft", Some([_, bottom])) => {
++                if bottom {
++                    "true"
++                } else {
++                    "false"
++                }
++            }
++            _ => continue,
++        };
++        *p = Property::from_str_pair(p.key_str(), value)?;
++    }
++    Some(block.from_properties(&props).to_state_id(block))
++}
++
++fn cog_size(name: &str) -> Option<bool> {
++    match name {
++        COG => Some(false),
++        LARGE => Some(true),
++        _ => PARTS
++            .iter()
++            .find_map(|&(kind, _, _, encased)| (kind > 0 && name == encased).then_some(kind == 2)),
++    }
++}
++
++fn cog_survives(world: &World, pos: BlockPos, axis: Axis, large: bool) -> bool {
++    Direction::ALL.into_iter().all(|face| {
++        face.axis() == axis
++            || adjacent(world, pos, face).is_some_and(|near| {
++                property(near, "axis") == Some(face.axis().name())
++                    || cog_size(near.to_block().name)
++                        .is_none_or(|other_large| !large && !other_large)
++            })
++    })
++}
++
++fn rotate_cog(axis: Axis, ends: [bool; 2], face: Direction) -> (Axis, [bool; 2]) {
++    if face.axis() == axis {
++        let top = face == positive(axis);
++        return (axis, [ends[0] ^ top, ends[1] ^ !top]);
++    }
++    let direction = positive(axis).clockwise(face.axis());
++    let axis = direction.axis();
++    (
++        axis,
++        if direction == positive(axis) {
++            ends
++        } else {
++            [ends[1], ends[0]]
++        },
++    )
++}
++
++pub(crate) fn interact(
++    world: &Arc<World>,
++    player: &Player,
++    pos: BlockPos,
++    face: BlockDirection,
++    item: &str,
++) -> bool {
++    if !matches!(
++        item,
++        "create:wrench" | "create:andesite_casing" | "create:brass_casing"
++    ) || !matches!(
++        player.gamemode.load(),
++        GameMode::Survival | GameMode::Creative
++    ) || world.is_in_spawn_protection(player, &pos)
++    {
++        return false;
++    }
++    let Some(old) = world.get_block_state_id_if_loaded(&pos) else {
++        return false;
++    };
++    let name = old.to_block().name;
++    let Some(node) = create_kinetic_node(old, vector(pos)) else {
++        return false;
++    };
++    let face = BlockRegistry::create_direction(face);
++    let sneak = player.get_entity().is_sneaking();
++    let new = if item == "create:wrench" {
++        let Some(&(kind, _, bare, _)) = PARTS.iter().find(|part| part.3 == name) else {
++            return false;
++        };
++        if sneak {
++            Block::from_registry_key(bare)
++                .and_then(|block| state(block.default_state.id, node.axis, None))
++        } else if let Kind::EncasedCog {
++            top_shaft,
++            bottom_shaft,
++            large,
++        } = node.kind
++        {
++            let (axis, ends) = rotate_cog(node.axis, [top_shaft, bottom_shaft], face);
++            if axis != node.axis && !cog_survives(world, pos, axis, large) {
++                return true;
++            }
++            state(old, axis, Some(ends))
++        } else if kind == 0 {
++            state(old, positive(node.axis).clockwise(face.axis()).axis(), None)
++        } else {
++            return false;
++        }
++    } else {
++        let Some(&(kind, _, _, target)) =
++            PARTS.iter().find(|part| part.1 == item && part.2 == name)
++        else {
++            return false;
++        };
++        if sneak {
++            return false;
++        }
++        let ends = (kind > 0).then(|| {
++            let side = positive(node.axis);
++            [side, side.opposite()].map(|face| {
++                let [x, y, z] = vector(pos);
++                let [dx, dy, dz] = face.vector();
++                adjacent(world, pos, face)
++                    .and_then(|state| create_kinetic_node(state, [x + dx, y + dy, z + dz]))
++                    .is_some_and(|neighbor| neighbor.shaft_port(face.opposite().vector()))
++            })
++        });
++        // The pinned Horizon interaction applies casing without consuming it.
++        Block::from_registry_key(target)
++            .and_then(|block| state(block.default_state.id, node.axis, ends))
++    };
++    if let Some(new) = new
++        && new != old
++    {
++        world.set_block_state_if(&pos, new, BlockFlags::NOTIFY_ALL, |current| current == old);
++    }
++    true
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn cog_wrench_preserves_the_physical_shaft_ends() {
++        assert_eq!(
++            rotate_cog(Axis::X, [true, false], Direction::East),
++            (Axis::X, [false, false])
++        );
++        assert_eq!(
++            rotate_cog(Axis::X, [false, false], Direction::West),
++            (Axis::X, [false, true])
++        );
++        for face in Direction::ALL {
++            if face.axis() == Axis::X {
++                continue;
++            }
++            let (mut axis, mut ends) = (Axis::X, [true, false]);
++            for _ in 0..4 {
++                (axis, ends) = rotate_cog(axis, ends, face);
++            }
++            assert_eq!((axis, ends), (Axis::X, [true, false]));
++        }
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/blocks/mod.rs b/crates/pumpkin-core/src/block/blocks/mod.rs
+--- a/crates/pumpkin-core/src/block/blocks/mod.rs
++++ b/crates/pumpkin-core/src/block/blocks/mod.rs
+@@ -122,6 +122,7 @@
+ pub(crate) mod create_chute;
+ pub(crate) mod create_depot;
+ pub(crate) mod create_drain;
++pub(crate) mod create_encasing;
+ pub(crate) mod create_fluid_tank;
+ pub(crate) mod create_gauge;
+ pub(crate) mod create_hand_crank;
+diff --git a/crates/pumpkin-core/src/net/java/play/use_item_on.rs b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+--- a/crates/pumpkin-core/src/net/java/play/use_item_on.rs
++++ b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+@@ -114,6 +114,16 @@
+         };
+ 
+         let sneaking = player.get_entity().is_sneaking();
++        if crate::block::blocks::create_encasing::interact(
++            &world,
++            player,
++            position,
++            face,
++            item.item.registry_key,
++        ) {
++            player.swing_hand(hand, true);
++            return Ok(());
++        }
+ 
+         // Code based on the java class ServerPlayerInteractionManager
+         if !(sneaking && (!held_item_empty || !off_hand_item_empty)) {

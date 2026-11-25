@@ -1,0 +1,261 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_bearing.rs b/crates/pumpkin-core/src/block/entities/create_bearing.rs
+--- a/crates/pumpkin-core/src/block/entities/create_bearing.rs
++++ b/crates/pumpkin-core/src/block/entities/create_bearing.rs
+@@ -3,6 +3,7 @@
+ use create_engine::{
+     contraption::{
+         Adhesion, Assembly, BlockRules, CaptureView, Cell, QuarterTurn, Rotation,
++        actors::Tool,
+         bearing::{Bearing, Mode, TickAction},
+         clockwork::{self, Angles, ClockTime, Mode as ClockMode},
+         plan_landing,
+@@ -26,7 +27,7 @@
+     world::World,
+ };
+ 
+-use super::create_harvester as harvester;
++use super::{create_harvester as harvester, create_plough as plough};
+ 
+ pub(crate) const ID: &str = "create:mechanical_bearing";
+ pub(crate) const WINDMILL: &str = "create:windmill_bearing";
+@@ -84,7 +85,7 @@
+     Some(if let Some(sail) = create_sail::read(id) {
+         with_property(id, "facing", turn.facing(sail.facing).name())
+     } else if let Some(face) = harvester::facing(id) {
+-        harvester::state(turn.facing(face).name())?
++        harvester::state(id.to_block().name, turn.facing(face).name())?
+     } else {
+         id
+     })
+@@ -95,10 +96,10 @@
+     if let Some((_, block, _)) = PAYLOAD.iter().find(|(id, _, _)| *id == name) {
+         return Some(block.default_state.id);
+     }
+-    if actors && name == harvester::ID {
++    if actors && matches!(name, harvester::ID | plough::ID) {
+         let props = state.get_compound("properties")?;
+         return (props.get_string("waterlogged")? == "false")
+-            .then(|| harvester::state(props.get_string("facing")?))
++            .then(|| harvester::state(name, props.get_string("facing")?))
+             .flatten();
+     }
+     if !windmill {
+@@ -530,9 +531,14 @@
+         ) && commit(world, controller, state, Some(previous), new, &[])
+         {
+             drop(_guard);
+-            for target in visits.into_iter().map(pos) {
++            for (tool, target) in visits {
++                let target = pos(target);
+                 if within_landing_scope(world, controller, target) {
+-                    harvester::harvest_wheat(world, target);
++                    match tool {
++                        Tool::Harvester => harvester::harvest_wheat(world, target),
++                        Tool::Plough => plough::till(world, target),
++                        _ => {}
++                    }
+                 }
+             }
+         }
+diff --git a/crates/pumpkin-core/src/block/entities/create_harvester.rs b/crates/pumpkin-core/src/block/entities/create_harvester.rs
+--- a/crates/pumpkin-core/src/block/entities/create_harvester.rs
++++ b/crates/pumpkin-core/src/block/entities/create_harvester.rs
+@@ -1,5 +1,6 @@
+ use std::sync::Arc;
+ 
++use super::create_plough;
+ use create_engine::{
+     contraption::{
+         Rotation,
+@@ -20,7 +21,6 @@
+ };
+ use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
+ use pumpkin_util::math::position::BlockPos;
+-use pumpkin_world::world::BlockFlags;
+ 
+ use crate::{
+     block::blocks::{
+@@ -35,7 +35,7 @@
+ 
+ pub(super) fn facing(id: BlockStateId) -> Option<Direction> {
+     let block = id.to_block();
+-    if block.name != ID {
++    if !matches!(block.name, ID | create_plough::ID) {
+         return None;
+     }
+     let props = block.properties(id)?.to_props();
+@@ -54,8 +54,8 @@
+         .find(|d| d.axis() != Axis::Y && d.name() == face)
+ }
+ 
+-pub(super) fn state(face: &str) -> Option<BlockStateId> {
+-    let block = Block::from_registry_key(ID)?;
++pub(super) fn state(name: &str, face: &str) -> Option<BlockStateId> {
++    let block = Block::from_registry_key(name)?;
+     let id = with_property(
+         with_property(block.default_state.id, "waterlogged", "false"),
+         "facing",
+@@ -70,7 +70,7 @@
+     angle: f32,
+     previous: Option<&NbtCompound>,
+     next: &mut NbtCompound,
+-) -> Vec<Pos> {
++) -> Vec<(Tool, Pos)> {
+     let rotation = Rotation::new(anchor, Axis::Y, angle).expect("validated pose");
+     let inverse = Rotation::new([0; 3], Axis::Y, -angle).expect("validated pose");
+     let mut saved = Vec::new();
+@@ -80,6 +80,11 @@
+         .unwrap_or_default();
+     for &(local, id) in blocks {
+         let Some(face) = facing(id) else { continue };
++        let tool = if id.to_block().name == ID {
++            Tool::Harvester
++        } else {
++            Tool::Plough
++        };
+         let state = entries.iter().find_map(|entry| {
+             let NbtTag::Compound(entry) = entry else {
+                 return None;
+@@ -101,7 +106,7 @@
+         let mut tracker = state.unwrap_or_default();
+         let result = tracker.sample(
+             Sample {
+-                position: rotation.to_world(Tool::Harvester.active_point(local, face)),
++                position: rotation.to_world(tool.active_point(local, face)),
+                 facing: face,
+                 stalled: false,
+                 disabled: false,
+@@ -110,7 +115,7 @@
+             |motion| motion,
+             |motion| inverse.rotate_vector(motion),
+         );
+-        visits.extend(result.visit);
++        visits.extend(result.visit.map(|pos| (tool, pos)));
+         let state = tracker.state();
+         let mut entry = NbtCompound::new();
+         entry.put("Pos", NbtTag::IntArray(local.into()));
+@@ -189,13 +194,11 @@
+     } else {
+         Block::AIR.default_state.id
+     };
+-    // This exact CAS gates all loot release so concurrent harvest attempts cannot duplicate drops.
+-    if world
+-        .set_block_state_if(&pos, replanted_state, BlockFlags::NOTIFY_ALL, |current| {
+-            current == original_state
+-        })
+-        .is_none()
+-    {
++    // Compare the crop and its supporting soil before releasing any loot.
++    if !world.compare_create_field(
++        pos,
++        [(original_state, replanted_state), (soil_state, soil_state)],
++    ) {
+         return;
+     }
+ 
+@@ -261,13 +264,13 @@
+     #[test]
+     fn saved_tracker_crosses_the_expected_crop_cell() {
+         let anchor = [-266, 80, -108];
+-        let tool = [([3, 0, 0], state("north").unwrap())];
++        let tool = [([3, 0, 0], state(ID, "north").unwrap())];
+         let mut first = NbtCompound::new();
+         assert!(sample(&tool, anchor, 9.6, None, &mut first).is_empty());
+         let mut second = NbtCompound::new();
+         assert_eq!(
+             sample(&tool, anchor, 19.2, Some(&first), &mut second),
+-            [[-263, 80, -109]]
++            [(Tool::Harvester, [-263, 80, -109])]
+         );
+         let mut duplicate = NbtCompound::new();
+         assert!(sample(&tool, anchor, 19.2, Some(&second), &mut duplicate).is_empty());
+diff --git a/crates/pumpkin-core/src/block/entities/mod.rs b/crates/pumpkin-core/src/block/entities/mod.rs
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -24,6 +24,7 @@
+ pub(crate) mod create_basin;
+ pub(crate) mod create_bearing;
+ mod create_harvester;
++mod create_plough;
+ pub(crate) mod create_chute;
+ pub(crate) mod create_crusher;
+ pub(crate) mod create_deployer;
+diff --git a/crates/pumpkin-core/src/world/mod.rs b/crates/pumpkin-core/src/world/mod.rs
+--- a/crates/pumpkin-core/src/world/mod.rs
++++ b/crates/pumpkin-core/src/world/mod.rs
+@@ -5558,6 +5558,39 @@
+             .flatten()
+     }
+ 
++    pub(crate) fn compare_create_field(
++        self: &Arc<Self>,
++        top: BlockPos,
++        edits: [(BlockStateId, BlockStateId); 2],
++    ) -> bool {
++        let positions = [top, top.down()];
++        if positions
++            .iter()
++            .any(|p| !self.is_in_build_limit(*p) || self.spawn_protects_position(p))
++        {
++            return false;
++        }
++        let key = top.chunk_and_chunk_relative_position().0;
++        let changes = std::array::from_fn::<_, 2, _>(|i| {
++            let (_, relative) = positions[i].chunk_and_chunk_relative_position();
++            (relative.x as usize, relative.y, relative.z as usize, edits[i].0, edits[i].1)
++        });
++        if self
++            .level
++            .read_chunk_sync(&key, |chunk| chunk.compare_set_blocks(&changes, None))
++            .flatten()
++            .is_none()
++        {
++            return false;
++        }
++        for (pos, (before, after)) in positions.into_iter().zip(edits) {
++            if before != after {
++                self.on_block_state_set(&pos, before, after, BlockFlags::NOTIFY_ALL);
++            }
++        }
++        true
++    }
++
+     pub(crate) fn commit_create_scene(
+         self: &Arc<Self>,
+         controller: BlockPos,
+diff --git a/crates/pumpkin-core/src/block/entities/create_plough.rs b/crates/pumpkin-core/src/block/entities/create_plough.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_plough.rs
+@@ -0,0 +1,31 @@
++use std::sync::Arc;
++
++use pumpkin_data::{Block, item::Item, item_stack::ItemStack};
++use pumpkin_util::math::position::BlockPos;
++
++use crate::world::World;
++
++pub(super) const ID: &str = "create:mechanical_plough";
++
++pub(super) fn till(world: &Arc<World>, top: BlockPos) {
++    let (Some(air), Some(soil)) = (
++        world.get_block_state_id_if_loaded(&top),
++        world.get_block_state_id_if_loaded(&top.down()),
++    ) else {
++        return;
++    };
++    if !air.to_state().is_air() {
++        return;
++    }
++    let kind = soil.to_block();
++    let result = match kind.name {
++        "grass_block" | "dirt" | "dirt_path" => &Block::FARMLAND,
++        "coarse_dirt" | "rooted_dirt" => &Block::DIRT,
++        _ => return,
++    };
++    if world.compare_create_field(top, [(air, air), (soil, result.default_state.id)])
++        && kind == &Block::ROOTED_DIRT
++    {
++        world.drop_stack(&top, ItemStack::new(1, &Item::HANGING_ROOTS));
++    }
++}

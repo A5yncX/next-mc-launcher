@@ -1,0 +1,2190 @@
+diff --git a/crates/pumpkin-core/src/block/blocks/mod.rs b/crates/pumpkin-core/src/block/blocks/mod.rs
+--- a/crates/pumpkin-core/src/block/blocks/mod.rs
++++ b/crates/pumpkin-core/src/block/blocks/mod.rs
+@@ -119,13 +119,15 @@
+ pub mod cauldron;
+ pub mod composter;
+ pub(crate) mod create_chain;
++pub(crate) mod create_chute;
+ pub(crate) mod create_depot;
+ pub(crate) mod create_drain;
+ pub(crate) mod create_fluid_tank;
++pub(crate) mod create_gauge;
++pub(crate) mod create_hand_crank;
++pub(crate) mod create_millstone;
+ pub(crate) mod create_pipe;
+ pub(crate) mod create_pump;
+-pub(crate) mod create_gauge;
+-pub(crate) mod create_hand_crank;
+ pub(crate) mod create_sail;
+ pub(crate) mod create_water_wheel;
+ pub mod dried_ghast;
+diff --git a/crates/pumpkin-core/src/block/entities/mod.rs b/crates/pumpkin-core/src/block/entities/mod.rs
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -21,10 +21,13 @@
+ pub mod chiseled_bookshelf;
+ pub mod command_block;
+ pub mod comparator;
++pub(crate) mod create_chute;
+ pub(crate) mod create_depot;
+ pub(crate) mod create_drain;
++pub(crate) mod create_fan_airflow;
+ pub(crate) mod create_fluid_tank;
+ pub(crate) mod create_kinetic;
++pub(crate) mod create_millstone;
+ pub(crate) mod create_press;
+ pub(crate) use create_kinetic::set_create_wheel_material;
+ pub(crate) fn create_kinetic_node(
+@@ -213,6 +216,16 @@
+             nbt, pos,
+         )));
+     }
++    if matches!(id, create_chute::ID | create_chute::SMART_ID) {
++        return Some(Arc::new(create_chute::CreateChuteBlockEntity::from_nbt(
++            nbt, pos,
++        )));
++    }
++    if id == create_millstone::ID {
++        return Some(Arc::new(
++            create_millstone::CreateMillstoneBlockEntity::from_nbt(nbt, pos),
++        ));
++    }
+     if create_kinetic::kinetic_id(id).is_some() {
+         return Some(Arc::new(create_kinetic::CreateKinetic::from_nbt(nbt, pos)));
+     }
+@@ -363,7 +376,10 @@
+     BLOCK_ENTITY_TYPES.contains(&block.name)
+         || block.name == create_depot::CreateDepotBlockEntity::ID
+         || block.name == create_drain::ID
+-        || block.name == create_fluid_tank::ID
++        || matches!(
++            block.name,
++            create_fluid_tank::ID | create_chute::ID | create_chute::SMART_ID
++        )
+         || is_create_kinetic_block(block)
+ }
+ 
+@@ -378,6 +394,11 @@
+         return None;
+     }
+     let name = BLOCK_ENTITY_TYPES.get(block_entity_type_id as usize)?;
++    if *name == "millstone" {
++        return Some(Arc::new(create_millstone::CreateMillstoneBlockEntity::new(
++            position,
++        )));
++    }
+     if let Some(id) = create_kinetic::kinetic_id_from_path(name) {
+         return Some(Arc::new(create_kinetic::CreateKinetic::new(id, position)));
+     }
+@@ -386,6 +407,12 @@
+             position,
+         ))),
+         "item_drain" => Some(Arc::new(create_drain::CreateDrain::new(position))),
++        "chute" => Some(Arc::new(create_chute::CreateChuteBlockEntity::new(
++            position,
++        ))),
++        "smart_chute" => Some(Arc::new(create_chute::CreateChuteBlockEntity::new_smart(
++            position,
++        ))),
+         "fluid_tank" => Some(Arc::new(create_fluid_tank::CreateFluidTank::new(position))),
+         "furnace" => Some(Arc::new(furnace::FurnaceBlockEntity::new(position))),
+         "chest" => Some(Arc::new(chest::ChestBlockEntity::new(position))),
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -16,7 +16,9 @@
+ use pumpkin_util::{GameMode, math::position::BlockPos};
+ use pumpkin_world::world::BlockFlags;
+ 
+-use super::{BlockEntity, create_press as press};
++use super::{
++    BlockEntity, create_fan_airflow as fan, create_millstone as millstone, create_press as press,
++};
+ use crate::{
+     block::blocks::{
+         create_chain as chain, create_pipe as pipe, create_pump as pump,
+@@ -48,6 +50,8 @@
+     CRANK,
+     press::ID,
+     pump::ID,
++    fan::ID,
++    millstone::ID,
+     pipe::VALVE,
+     chain::DRIVE,
+     chain::ADJUSTABLE,
+@@ -163,6 +167,7 @@
+     press: PressCycle,
+     press_finished: bool,
+     valve: Option<[f32; 3]>,
++    air_current: Option<[i32; 8]>,
+ }
+ 
+ #[derive(Default, PartialEq)]
+@@ -289,6 +294,13 @@
+ }
+ 
+ impl CreateKinetic {
++    pub(super) fn rpm(&self) -> f32 {
++        self.readings
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .rpm
++    }
++
+     pub(super) fn new(id: &'static str, position: BlockPos) -> Self {
+         Self {
+             id,
+@@ -366,6 +378,13 @@
+             kind: Kind::Chain { state, signal: 0 },
+         });
+     }
++    if id == millstone::ID {
++        return Some(Node {
++            pos,
++            axis: Axis::Y,
++            kind: Kind::Millstone,
++        });
++    }
+     let properties = block.properties(state)?.to_props();
+     let get = |key| {
+         properties
+@@ -382,7 +401,12 @@
+     }
+     let gauge = matches!(id, SPEEDOMETER | STRESSOMETER);
+     let value = get(
+-        if gauge || matches!(id, MOTOR | CRANK | wheel::SMALL | press::ID | pump::ID) {
++        if gauge
++            || matches!(
++                id,
++                MOTOR | CRANK | wheel::SMALL | press::ID | pump::ID | fan::ID
++            )
++        {
+             "facing"
+         } else {
+             "axis"
+@@ -432,6 +456,14 @@
+         GEARBOX => Kind::Gearbox,
+         press::ID => Kind::Press,
+         pump::ID => Kind::Pump,
++        fan::ID => Kind::Consumer {
++            facing: Direction::ALL
++                .into_iter()
++                .find(|d| d.name() == value)?
++                .opposite()
++                .vector(),
++            impact: 2.0,
++        },
+         wheel::SMALL | wheel::LARGE => Kind::WaterWheel {
+             rpm: 0.0,
+             capacity: if id == wheel::LARGE { 128.0 } else { 32.0 },
+@@ -531,6 +563,16 @@
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
+         tag.put_float("Speed", readings.rpm);
++        if self.id == fan::ID {
++            tag.put(
++                fan::TAG,
++                pumpkin_nbt::tag::NbtTag::IntArray(
++                    readings
++                        .air_current
++                        .map_or_else(Vec::new, |data| data.to_vec()),
++                ),
++            );
++        }
+         if self.id == press::ID {
+             tag.put_bool("Running", readings.press.running);
+             tag.put_int("Ticks", readings.press.ticks);
+@@ -776,6 +818,9 @@
+         if self.id == pump::ID {
+             pump::tick(world, self.position, state, next.rpm);
+         }
++        if self.id == fan::ID {
++            next.air_current = fan::tick(world, self.position, state, next.rpm);
++        }
+         if self.id == pipe::VALVE {
+             let enabled = pipe::property(state, "enabled") == Some("true");
+             let [mut value, mut target, _] = self
+diff --git a/crates/pumpkin-core/src/block/registry.rs b/crates/pumpkin-core/src/block/registry.rs
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -255,6 +255,9 @@
+     // Blocks
+     manager.register(crate::block::blocks::create_chain::EncasedChainDrive);
+     manager.register(crate::block::blocks::create_chain::AdjustableChainGearshift);
++    manager.register(crate::block::blocks::create_chute::CreateChuteBlock);
++    manager.register(crate::block::blocks::create_chute::CreateSmartChuteBlock);
++    manager.register(crate::block::blocks::create_millstone::CreateMillstoneBlock);
+     manager.register(crate::block::blocks::create_depot::CreateDepotBlock);
+     manager.register(crate::block::blocks::create_drain::ItemDrain);
+     manager.register(crate::block::blocks::create_fluid_tank::FluidTank);
+@@ -1328,6 +1331,18 @@
+                     .from_properties(&properties)
+                     .to_state_id(placed_block)
+             }
++            "create:encased_fan" => {
++                let preferred = placement::preferred(ports).unwrap_or(look);
++                Self::set_create_facing(
++                    placed_block,
++                    state_id,
++                    if sneaking {
++                        preferred
++                    } else {
++                        preferred.opposite()
++                    },
++                )
++            }
+             "create:water_wheel" => {
+                 let facing = if sneaking {
+                     look
+diff --git a/crates/pumpkin-core/src/block/blocks/create_chute.rs b/crates/pumpkin-core/src/block/blocks/create_chute.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/blocks/create_chute.rs
+@@ -0,0 +1,78 @@
++use std::sync::Arc;
++
++use pumpkin_data::{Block, block_properties::Property};
++use pumpkin_macros::pumpkin_block;
++use pumpkin_util::math::position::BlockPos;
++use pumpkin_world::world::BlockFlags;
++
++use crate::{
++    block::{
++        BlockBehaviour, OnNeighborUpdateArgs, PlacedArgs, blocks::redstone,
++        entities::create_chute::CreateChuteBlockEntity,
++    },
++    world::World,
++};
++
++#[pumpkin_block("create:chute")]
++pub struct CreateChuteBlock;
++
++impl BlockBehaviour for CreateChuteBlock {
++    fn placed(&self, args: PlacedArgs<'_>) {
++        add_chute(args.world, args.position, false);
++    }
++}
++
++#[pumpkin_block("create:smart_chute")]
++pub struct CreateSmartChuteBlock;
++
++impl BlockBehaviour for CreateSmartChuteBlock {
++    fn placed(&self, args: PlacedArgs<'_>) {
++        update_powered(args.world, args.block, args.position);
++        add_chute(args.world, args.position, true);
++    }
++
++    fn on_neighbor_update(&self, args: OnNeighborUpdateArgs<'_>) {
++        update_powered(args.world, args.block, args.position);
++    }
++}
++
++fn update_powered(world: &Arc<World>, block: &Block, position: &BlockPos) {
++    let powered = redstone::block_receives_redstone_power(world, position);
++    let (_, state) = world.get_block_and_state_id(position);
++    let Some(mut properties) = block
++        .properties(state)
++        .map(|properties| properties.to_props())
++    else {
++        return;
++    };
++    let value = if powered { "true" } else { "false" };
++    let Some(property) = Property::from_str_pair("powered", value) else {
++        return;
++    };
++    let Some(current) = properties
++        .iter_mut()
++        .find(|property| property.key_str() == "powered")
++    else {
++        return;
++    };
++    if current.value_str() == value {
++        return;
++    }
++    *current = property;
++    world.set_block_state(
++        position,
++        block.from_properties(&properties).to_state_id(block),
++        BlockFlags::NOTIFY_ALL,
++    );
++}
++
++fn add_chute(world: &Arc<World>, position: &BlockPos, smart: bool) {
++    if world.get_block_entity(position).is_none() {
++        let entity = if smart {
++            CreateChuteBlockEntity::new_smart(*position)
++        } else {
++            CreateChuteBlockEntity::new(*position)
++        };
++        world.add_block_entity(Arc::new(entity));
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/blocks/create_millstone.rs b/crates/pumpkin-core/src/block/blocks/create_millstone.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/blocks/create_millstone.rs
+@@ -0,0 +1,129 @@
++use std::sync::Arc;
++
++use pumpkin_data::data_component_impl::EquipmentSlot;
++use pumpkin_data::{BlockDirection, entity::EntityType, item_stack::ItemStack};
++use pumpkin_inventory::screen_handler::InventoryPlayer;
++use pumpkin_macros::pumpkin_block;
++use pumpkin_util::{Hand, math::vector3::Vector3};
++
++use crate::{
++    block::{
++        BlockBehaviour, NormalUseArgs, PlacedArgs, UseWithItemArgs,
++        entities::create_millstone::CreateMillstoneBlockEntity, registry::BlockActionResult,
++    },
++    entity::{Entity, EntityBase, item::ItemEntity, player::Player},
++    world::World,
++};
++
++#[pumpkin_block("create:millstone")]
++pub struct CreateMillstoneBlock;
++
++impl BlockBehaviour for CreateMillstoneBlock {
++    fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
++        if args.hit.face != &BlockDirection::Up || shift_has_item(args.player) {
++            return BlockActionResult::Pass;
++        }
++        if interact(args.world, args.player, args.position) {
++            BlockActionResult::SuccessServer
++        } else {
++            BlockActionResult::Pass
++        }
++    }
++
++    fn use_with_item(&self, args: UseWithItemArgs<'_>) -> BlockActionResult {
++        if args.hit.face != &BlockDirection::Up || shift_has_item(args.player) {
++            return BlockActionResult::PassToDefaultBlockAction;
++        }
++        let Some(entity) = args.world.get_block_entity(args.position) else {
++            return BlockActionResult::PassToDefaultBlockAction;
++        };
++        let Some(millstone) = entity
++            .as_any()
++            .downcast_ref::<CreateMillstoneBlockEntity>()
++            .filter(|millstone| millstone.is_supported())
++        else {
++            return BlockActionResult::PassToDefaultBlockAction;
++        };
++        let hand = if *args.equipment_slot == EquipmentSlot::OFF_HAND {
++            Hand::Left
++        } else {
++            Hand::Right
++        };
++        let incoming = args.item_stack.clone();
++        let inserted = millstone.insert_stack(&incoming);
++        if inserted == 0 {
++            return BlockActionResult::PassToDefaultBlockAction;
++        }
++        let mut remaining = incoming;
++        remaining.item_count -= inserted;
++        if remaining.is_empty() {
++            remaining = ItemStack::EMPTY.clone();
++        }
++        let inventory = args.player.get_inventory();
++        inventory.set_stack_in_hand(hand, remaining);
++        args.player.sync_inventory_to_client();
++        *args.item_stack = inventory.get_stack_in_hand(hand);
++        args.world.update_block_entity(&entity);
++        BlockActionResult::SuccessServer
++    }
++
++    fn placed(&self, args: PlacedArgs<'_>) {
++        if args.world.get_block_entity(args.position).is_none() {
++            args.world
++                .add_block_entity(Arc::new(CreateMillstoneBlockEntity::new(*args.position)));
++        }
++    }
++}
++
++fn shift_has_item(player: &Player) -> bool {
++    player.get_entity().is_sneaking()
++        && [Hand::Right, Hand::Left]
++            .into_iter()
++            .any(|hand| !player.get_inventory().get_stack_in_hand(hand).is_empty())
++}
++
++fn interact(
++    world: &Arc<World>,
++    player: &Arc<Player>,
++    position: &pumpkin_util::math::position::BlockPos,
++) -> bool {
++    let Some(entity) = world.get_block_entity(position) else {
++        return false;
++    };
++    let Some(millstone) = entity
++        .as_any()
++        .downcast_ref::<CreateMillstoneBlockEntity>()
++        .filter(|millstone| millstone.is_supported())
++    else {
++        return false;
++    };
++    let stacks = millstone.collect_items();
++    if stacks.is_empty() {
++        return false;
++    }
++    let inventory = player.get_inventory();
++    for mut stack in stacks {
++        inventory.insert_stack_anywhere(&mut stack);
++        if !stack.is_empty() {
++            drop_overflow(world, player, stack);
++        }
++    }
++    player.sync_inventory_to_client();
++    world.update_block_entity(&entity);
++    true
++}
++
++fn drop_overflow(world: &Arc<World>, player: &Player, stack: ItemStack) {
++    let player_pos = player.get_entity().pos.load();
++    let entity = Entity::new(
++        world.clone(),
++        Vector3::new(player_pos.x, player_pos.y + 1.0, player_pos.z),
++        &EntityType::ITEM,
++    );
++    world.spawn_entity(Arc::new(ItemEntity::new_with_velocity(
++        entity,
++        stack,
++        Vector3::new(0.0, 0.2, 0.0),
++        10,
++    )));
++}
+diff --git a/crates/pumpkin-core/src/block/entities/create_chute.rs b/crates/pumpkin-core/src/block/entities/create_chute.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_chute.rs
+@@ -0,0 +1,616 @@
++use std::{
++    any::Any,
++    sync::{
++        Arc, PoisonError, RwLock,
++        atomic::{AtomicBool, AtomicU32, Ordering},
++    },
++};
++
++use pumpkin_data::{Block, BlockStateId, item_stack::ItemStack};
++use pumpkin_inventory::{Clearable, Inventory};
++use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
++use pumpkin_util::math::position::BlockPos;
++
++use super::{BlockEntity, hopper::HopperBlockEntity};
++use crate::world::World;
++
++pub const ID: &str = "create:chute";
++pub const SMART_ID: &str = "create:smart_chute";
++const NORMAL_EXTRACTION: u8 = 16;
++const MAX_STACK: u8 = 64;
++const NATIVE_FIELDS: [&str; 9] = [
++    "id",
++    "x",
++    "y",
++    "z",
++    "Item",
++    "ItemPosition",
++    "Pull",
++    "Push",
++    "BottomAirFlowDistance",
++];
++const SMART_FIELDS: [&str; 3] = ["Filter", "FilterAmount", "UpTo"];
++
++struct Extraction {
++    one_item: ItemStack,
++    snapshot: ItemStack,
++    remainder: ItemStack,
++}
++
++pub struct CreateChuteBlockEntity {
++    pub position: BlockPos,
++    item: RwLock<ItemStack>,
++    item_position: AtomicU32,
++    pull: AtomicU32,
++    push: AtomicU32,
++    bottom_air_flow_distance: AtomicU32,
++    filter: ItemStack,
++    opaque_item: Option<NbtTag>,
++    opaque_filter: Option<NbtTag>,
++    opaque_fields: NbtCompound,
++    filter_amount: i32,
++    up_to: bool,
++    powered: AtomicBool,
++    smart: bool,
++    dirty: AtomicBool,
++}
++
++impl BlockEntity for CreateChuteBlockEntity {
++    fn resource_location(&self) -> &'static str {
++        if self.smart { SMART_ID } else { ID }
++    }
++
++    fn get_position(&self) -> BlockPos {
++        self.position
++    }
++
++    fn from_nbt(nbt: &NbtCompound, position: BlockPos) -> Self {
++        let smart = nbt.get_string("id") == Some(SMART_ID);
++        let (item, opaque_item) = read_stack(nbt, "Item");
++        let (filter, opaque_filter) = if smart {
++            read_stack(nbt, "Filter")
++        } else {
++            (ItemStack::EMPTY.clone(), None)
++        };
++        let position_in_chute = nbt
++            .get_float("ItemPosition")
++            .filter(|v| v.is_finite())
++            .unwrap_or(0.0)
++            .clamp(0.0, 1.0);
++        let mut filter_amount = nbt.get_int("FilterAmount").unwrap_or(0);
++        let mut up_to = nbt.get_bool("UpTo").unwrap_or(false);
++        if filter_amount == 0 {
++            filter_amount = i32::from(MAX_STACK);
++            up_to = true;
++        }
++
++        let mut opaque_fields = NbtCompound::new();
++        for (key, value) in &nbt.child_tags {
++            let key = key.as_ref();
++            if !NATIVE_FIELDS.contains(&key) && !(smart && SMART_FIELDS.contains(&key)) {
++                opaque_fields.put(key, value.clone());
++            }
++        }
++
++        Self {
++            position,
++            item: RwLock::new(item),
++            item_position: AtomicU32::new(position_in_chute.to_bits()),
++            pull: AtomicU32::new(nbt.get_float("Pull").unwrap_or(0.0).to_bits()),
++            push: AtomicU32::new(nbt.get_float("Push").unwrap_or(0.0).to_bits()),
++            bottom_air_flow_distance: AtomicU32::new(
++                nbt.get_float("BottomAirFlowDistance")
++                    .unwrap_or(0.0)
++                    .to_bits(),
++            ),
++            filter,
++            opaque_item,
++            opaque_filter,
++            opaque_fields,
++            filter_amount,
++            up_to,
++            powered: AtomicBool::new(smart),
++            smart,
++            dirty: AtomicBool::new(false),
++        }
++    }
++
++    fn write_nbt(&self, nbt: &mut NbtCompound) {
++        for (key, value) in &self.opaque_fields.child_tags {
++            nbt.put(key, value.clone());
++        }
++        if let Some(item) = &self.opaque_item {
++            nbt.put("Item", item.clone());
++        } else {
++            let mut item = NbtCompound::new();
++            self.item
++                .read()
++                .unwrap_or_else(PoisonError::into_inner)
++                .write_item_stack(&mut item);
++            nbt.put_compound("Item", item);
++        }
++        nbt.put_float(
++            "ItemPosition",
++            f32::from_bits(self.item_position.load(Ordering::Relaxed)),
++        );
++        nbt.put_float("Pull", f32::from_bits(self.pull.load(Ordering::Relaxed)));
++        nbt.put_float("Push", f32::from_bits(self.push.load(Ordering::Relaxed)));
++        nbt.put_float(
++            "BottomAirFlowDistance",
++            f32::from_bits(self.bottom_air_flow_distance.load(Ordering::Relaxed)),
++        );
++        if self.smart {
++            if let Some(filter) = &self.opaque_filter {
++                nbt.put("Filter", filter.clone());
++            } else {
++                let mut filter = NbtCompound::new();
++                self.filter.write_item_stack(&mut filter);
++                nbt.put_compound("Filter", filter);
++            }
++            nbt.put_int("FilterAmount", self.filter_amount);
++            nbt.put_bool("UpTo", self.up_to);
++        }
++    }
++
++    fn tick(&self, world: &Arc<World>) {
++        if self.opaque_item.is_some() {
++            return;
++        }
++        let (block, state) = world.get_block_and_state_id(&self.position);
++        let smart = block.name == SMART_ID;
++        if (block.name != ID && !smart) || smart != self.smart {
++            return;
++        }
++        let powered = smart && bool_property(block, state, "powered").unwrap_or(true);
++        self.powered.store(powered, Ordering::Relaxed);
++
++        let Some(output_pos) = offset(self.position, [0, -1, 0]) else {
++            return;
++        };
++        let Some(input_pos) = offset(self.position, [0, 1, 0]) else {
++            return;
++        };
++
++        let mut changed = false;
++        let mut spills = Vec::new();
++        let carried = self.get_stack(0);
++        if !powered && !carried.is_empty() {
++            use create_engine::chute::{Step, motion, step};
++            let target = world
++                .get_block_entity(&output_pos)
++                .filter(|entity| !entity.has_loot_table())
++                .and_then(|entity| Some((entity.clone(), entity.get_inventory()?)));
++            let previous = f32::from_bits(self.item_position.load(Ordering::Relaxed));
++            match step(previous, motion(0.0, 0.0), || {
++                target.as_ref().is_some_and(|(_, inventory)| {
++                    (0..inventory.size()).any(|slot| {
++                        inventory.is_valid_slot_for(slot, &carried) && {
++                            let existing = inventory.get_stack(slot);
++                            existing.is_empty()
++                                || (existing.are_items_and_components_equal(&carried)
++                                    && existing.item_count < existing.get_max_stack_size())
++                        }
++                    })
++                })
++            }) {
++                Step::Position(next) => {
++                    self.item_position.store(next.to_bits(), Ordering::Relaxed);
++                    changed = previous != next;
++                }
++                Step::Output => {
++                    if let Some((entity, target)) = target {
++                        let (moved, overflow) = self.push_to(target.as_ref());
++                        if moved {
++                            world.update_block_entity(&entity);
++                        }
++                        let position = if self.get_stack(0).is_empty() {
++                            0.0_f32
++                        } else {
++                            0.5_f32
++                        };
++                        self.item_position
++                            .store(position.to_bits(), Ordering::Relaxed);
++                        changed = moved || previous != position;
++                        spills.extend(overflow);
++                    }
++                }
++            }
++        }
++        if !powered
++            && self.get_stack(0).is_empty()
++            && let Some(entity) = world
++                .get_block_entity(&input_pos)
++                .filter(|entity| !entity.has_loot_table())
++            && let Some(source) = entity.clone().get_inventory()
++        {
++            let (moved, overflow) = self.pull_from(source.as_ref(), powered);
++            if moved {
++                world.update_block_entity(&entity);
++            }
++            changed |= moved;
++            spills.extend(overflow);
++        }
++
++        if !spills.is_empty() {
++            let pos = self.position.to_centered_f64();
++            for stack in spills {
++                world.scatter_stack(pos.x, pos.y, pos.z, stack);
++            }
++        }
++        if changed {
++            self.mark_dirty();
++            if let Some(entity) = world.get_block_entity(&self.position)
++                && entity
++                    .as_any()
++                    .downcast_ref::<Self>()
++                    .is_some_and(|live| std::ptr::eq(self, live))
++            {
++                world.update_block_entity(&entity);
++            }
++        }
++    }
++
++    fn get_inventory(self: Arc<Self>) -> Option<Arc<dyn Inventory>> {
++        self.opaque_item.is_none().then_some(self)
++    }
++
++    fn on_block_replaced(self: Arc<Self>, world: &Arc<World>, position: &BlockPos) {
++        if self.opaque_item.is_none() {
++            let inventory: Arc<dyn Inventory> = self;
++            world.scatter_inventory(position, &inventory);
++        }
++    }
++
++    fn is_dirty(&self) -> bool {
++        self.dirty.load(Ordering::Relaxed)
++    }
++
++    fn clear_dirty(&self) {
++        self.dirty.store(false, Ordering::Relaxed);
++    }
++
++    fn chunk_data_nbt(&self) -> Option<NbtCompound> {
++        let mut nbt = NbtCompound::new();
++        self.write_nbt(&mut nbt);
++        Some(nbt)
++    }
++
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++}
++
++impl CreateChuteBlockEntity {
++    #[cfg(test)]
++    pub const ID: &'static str = ID;
++    #[cfg(test)]
++    pub const SMART_ID: &'static str = SMART_ID;
++
++    #[must_use]
++    pub fn new(position: BlockPos) -> Self {
++        Self::with_mode(position, false)
++    }
++
++    #[must_use]
++    pub fn new_smart(position: BlockPos) -> Self {
++        Self::with_mode(position, true)
++    }
++
++    fn with_mode(position: BlockPos, smart: bool) -> Self {
++        Self {
++            position,
++            item: RwLock::new(ItemStack::EMPTY.clone()),
++            item_position: AtomicU32::new(0.0_f32.to_bits()),
++            pull: AtomicU32::new(0.0_f32.to_bits()),
++            push: AtomicU32::new(0.0_f32.to_bits()),
++            bottom_air_flow_distance: AtomicU32::new(0.0_f32.to_bits()),
++            filter: ItemStack::EMPTY.clone(),
++            opaque_item: None,
++            opaque_filter: None,
++            opaque_fields: NbtCompound::new(),
++            filter_amount: i32::from(MAX_STACK),
++            up_to: true,
++            powered: AtomicBool::new(smart),
++            smart,
++            dirty: AtomicBool::new(false),
++        }
++    }
++
++    pub fn pull_from(&self, source: &dyn Inventory, powered: bool) -> (bool, Vec<ItemStack>) {
++        self.powered.store(powered, Ordering::Relaxed);
++        if self.opaque_item.is_some()
++            || (self.smart && powered)
++            || source
++                .as_any()
++                .downcast_ref::<Self>()
++                .is_some_and(|other| std::ptr::eq(other, self))
++            || !self.get_stack(0).is_empty()
++        {
++            return (false, Vec::new());
++        }
++
++        for slot in 0..source.size() {
++            let candidate = source.get_stack(slot);
++            if candidate.is_empty()
++                || !source.can_transfer_to(self, slot, &candidate)
++                || !self.filter_matches(&candidate)
++            {
++                continue;
++            }
++            let Some(amount) = self.extraction_amount(candidate.item_count) else {
++                continue;
++            };
++            let extracted = source.remove_stack_specific(slot, amount);
++            if extracted.is_empty() {
++                continue;
++            }
++            let expected_remainder = remainder_after(&candidate, &extracted);
++            let mut held = self.item.write().unwrap_or_else(PoisonError::into_inner);
++            if held.is_empty() && self.filter_matches(&extracted) {
++                *held = extracted;
++                self.item_position
++                    .store(create_engine::chute::ENTRY.to_bits(), Ordering::Relaxed);
++                self.mark_dirty();
++                return (true, Vec::new());
++            }
++            drop(held);
++            let spill =
++                restore_inventory_slot(source, slot, &candidate, &expected_remainder, extracted);
++            return (false, spill.into_iter().collect());
++        }
++        (false, Vec::new())
++    }
++
++    pub fn push_to(&self, target: &dyn Inventory) -> (bool, Vec<ItemStack>) {
++        if self.opaque_item.is_some() || (self.smart && self.powered.load(Ordering::Relaxed)) {
++            return (false, Vec::new());
++        }
++        let mut moved = false;
++        let mut spills = Vec::new();
++        while let Some(extraction) = self.take_one() {
++            if HopperBlockEntity::add_one_item(self, target, &extraction.one_item) {
++                moved = true;
++                continue;
++            }
++            if let Some(spill) = self.put_back(extraction) {
++                spills.push(spill);
++            }
++            break;
++        }
++        (moved, spills)
++    }
++
++    fn extraction_amount(&self, available: u8) -> Option<u8> {
++        let amount = if self.smart {
++            self.filter_amount.clamp(1, i32::from(MAX_STACK)) as u8
++        } else {
++            NORMAL_EXTRACTION
++        };
++        if self.smart && !self.up_to {
++            (available >= amount).then_some(amount)
++        } else {
++            Some(available.min(amount))
++        }
++    }
++
++    fn filter_matches(&self, stack: &ItemStack) -> bool {
++        if !self.smart {
++            return true;
++        }
++        if self.opaque_filter.is_some() {
++            return false;
++        }
++        self.filter.is_empty() || self.filter.are_items_and_components_equal(stack)
++    }
++
++    fn take_one(&self) -> Option<Extraction> {
++        let mut item = self.item.write().unwrap_or_else(PoisonError::into_inner);
++        if item.is_empty() {
++            return None;
++        }
++        let snapshot = item.clone();
++        let one_item = item.split(1);
++        let remainder = item.clone();
++        self.mark_dirty();
++        Some(Extraction {
++            one_item,
++            snapshot,
++            remainder,
++        })
++    }
++
++    fn put_back(&self, extraction: Extraction) -> Option<ItemStack> {
++        let mut item = self.item.write().unwrap_or_else(PoisonError::into_inner);
++        self.mark_dirty();
++        if item.are_equal(&extraction.remainder) {
++            *item = extraction.snapshot;
++            return None;
++        }
++        if item.is_empty() {
++            *item = extraction.one_item;
++            return None;
++        }
++        if item.are_items_and_components_equal(&extraction.one_item)
++            && item.item_count < item.get_max_stack_size()
++        {
++            item.item_count += 1;
++            return None;
++        }
++        Some(extraction.one_item)
++    }
++
++    fn mark_dirty(&self) {
++        self.dirty.store(true, Ordering::Relaxed);
++    }
++}
++
++impl Inventory for CreateChuteBlockEntity {
++    fn size(&self) -> usize {
++        1
++    }
++
++    fn is_empty(&self) -> bool {
++        self.get_stack(0).is_empty()
++    }
++
++    fn get_stack(&self, slot: usize) -> ItemStack {
++        if slot != 0 {
++            return ItemStack::EMPTY.clone();
++        }
++        self.item
++            .read()
++            .unwrap_or_else(PoisonError::into_inner)
++            .clone()
++    }
++
++    fn remove_stack(&self, slot: usize) -> ItemStack {
++        if slot != 0 {
++            return ItemStack::EMPTY.clone();
++        }
++        let mut item = self.item.write().unwrap_or_else(PoisonError::into_inner);
++        let removed = std::mem::replace(&mut *item, ItemStack::EMPTY.clone());
++        if !removed.is_empty() {
++            self.item_position
++                .store(0.0_f32.to_bits(), Ordering::Relaxed);
++            self.mark_dirty();
++        }
++        removed
++    }
++
++    fn remove_stack_specific(&self, slot: usize, amount: u8) -> ItemStack {
++        if slot != 0 || amount == 0 {
++            return ItemStack::EMPTY.clone();
++        }
++        let mut item = self.item.write().unwrap_or_else(PoisonError::into_inner);
++        if item.is_empty() {
++            return ItemStack::EMPTY.clone();
++        }
++        let removed = item.split(amount);
++        if item.is_empty() {
++            self.item_position
++                .store(0.0_f32.to_bits(), Ordering::Relaxed);
++        }
++        self.mark_dirty();
++        removed
++    }
++
++    fn set_stack(&self, slot: usize, stack: ItemStack) {
++        if !self.is_valid_slot_for(slot, &stack) {
++            return;
++        }
++        *self.item.write().unwrap_or_else(PoisonError::into_inner) = stack;
++        self.mark_dirty();
++    }
++
++    fn get_max_count_per_stack(&self) -> u8 {
++        MAX_STACK
++    }
++
++    fn is_valid_slot_for(&self, slot: usize, stack: &ItemStack) -> bool {
++        if slot != 0
++            || self.opaque_item.is_some()
++            || (self.smart && self.powered.load(Ordering::Relaxed))
++            || (!stack.is_empty() && stack.item_count > stack.get_max_stack_size())
++            || !self.filter_matches(stack)
++        {
++            return false;
++        }
++        let current = self.get_stack(0);
++        current.is_empty()
++            || (current.are_items_and_components_equal(stack)
++                && current.item_count < current.get_max_stack_size())
++    }
++
++    fn can_transfer_to(&self, _target: &dyn Inventory, slot: usize, stack: &ItemStack) -> bool {
++        slot == 0 && self.opaque_item.is_none() && self.filter_matches(stack)
++    }
++
++    fn mark_dirty(&self) {
++        self.dirty.store(true, Ordering::Relaxed);
++    }
++
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++}
++
++impl Clearable for CreateChuteBlockEntity {
++    fn clear(&self) {
++        self.item
++            .write()
++            .unwrap_or_else(PoisonError::into_inner)
++            .clear();
++        self.item_position
++            .store(0.0_f32.to_bits(), Ordering::Relaxed);
++        self.mark_dirty();
++    }
++}
++
++fn read_stack(nbt: &NbtCompound, key: &str) -> (ItemStack, Option<NbtTag>) {
++    match nbt.child_tags.get(key) {
++        None => (ItemStack::EMPTY.clone(), None),
++        Some(NbtTag::Compound(compound)) if compound.is_empty() => (ItemStack::EMPTY.clone(), None),
++        Some(NbtTag::Compound(compound)) => match ItemStack::read_item_stack(compound) {
++            Some(stack) => (stack, None),
++            None => (
++                ItemStack::EMPTY.clone(),
++                Some(NbtTag::Compound(compound.clone())),
++            ),
++        },
++        Some(tag) => (ItemStack::EMPTY.clone(), Some(tag.clone())),
++    }
++}
++
++fn remainder_after(original: &ItemStack, extracted: &ItemStack) -> ItemStack {
++    let mut remainder = original.clone();
++    remainder.decrement(extracted.item_count);
++    if remainder.is_empty() {
++        ItemStack::EMPTY.clone()
++    } else {
++        remainder
++    }
++}
++
++fn restore_inventory_slot(
++    inventory: &dyn Inventory,
++    slot: usize,
++    original: &ItemStack,
++    expected_remainder: &ItemStack,
++    extracted: ItemStack,
++) -> Option<ItemStack> {
++    let mut current = inventory.get_stack(slot);
++    if current.are_equal(expected_remainder) {
++        inventory.set_stack(slot, original.clone());
++        return (!inventory.get_stack(slot).are_equal(original)).then_some(extracted);
++    }
++    if current.is_empty() {
++        inventory.set_stack(slot, extracted.clone());
++        return (!inventory.get_stack(slot).are_equal(&extracted)).then_some(extracted);
++    }
++    if current.are_items_and_components_equal(&extracted)
++        && u16::from(current.item_count) + u16::from(extracted.item_count)
++            <= u16::from(current.get_max_stack_size())
++    {
++        current.item_count += extracted.item_count;
++        inventory.set_stack(slot, current.clone());
++        return (!inventory.get_stack(slot).are_equal(&current)).then_some(extracted);
++    }
++    Some(extracted)
++}
++
++fn bool_property(block: &Block, state: BlockStateId, key: &str) -> Option<bool> {
++    block
++        .properties(state)?
++        .to_props()
++        .into_iter()
++        .find(|property| property.key_str() == key)
++        .map(|property| property.value_str() == "true")
++}
++
++fn offset(position: BlockPos, direction: [i32; 3]) -> Option<BlockPos> {
++    Some(BlockPos::new(
++        position.0.x.checked_add(direction[0])?,
++        position.0.y.checked_add(direction[1])?,
++        position.0.z.checked_add(direction[2])?,
++    ))
++}
+diff --git a/crates/pumpkin-core/src/block/entities/create_fan_airflow.rs b/crates/pumpkin-core/src/block/entities/create_fan_airflow.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_fan_airflow.rs
+@@ -0,0 +1,218 @@
++use create_engine::{
++    fan::{self, Config},
++    fan_entities,
++    placement::Direction,
++};
++use pumpkin_data::{Block, BlockStateId};
++use pumpkin_util::math::position::BlockPos;
++
++pub(crate) const ID: &str = "create:encased_fan";
++pub(super) const TAG: &str = "CreateHorizonAirCurrent";
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct Airflow {
++    position: BlockPos,
++    facing: Direction,
++    flow: [i32; 3],
++    rpm: f32,
++    pushing: bool,
++    nominal_distance: f32,
++    reach: f32,
++}
++
++impl Airflow {
++    fn wire(self) -> [i32; 8] {
++        let direction = Direction::ALL
++            .iter()
++            .position(|dir| *dir == self.facing)
++            .unwrap_or(0);
++        [
++            2,
++            direction as i32,
++            self.rpm.to_bits() as i32,
++            self.reach.to_bits() as i32,
++            1,
++            if self.pushing {
++                self.reach.ceil() as i32
++            } else {
++                0
++            },
++            0,
++            0,
++        ]
++    }
++
++    #[cfg(test)]
++    pub(crate) fn nominal_distance(self) -> f32 {
++        self.nominal_distance
++    }
++
++    #[cfg(test)]
++    pub(crate) fn reach(self) -> f32 {
++        self.reach
++    }
++
++    #[cfg(test)]
++    pub(crate) fn pushing(self) -> bool {
++        self.pushing
++    }
++
++    #[cfg(test)]
++    pub(crate) fn flow(self) -> [i32; 3] {
++        self.flow
++    }
++
++    pub(crate) fn bounds(self) -> [[f64; 3]; 2] {
++        let mut min = [
++            f64::from(self.position.0.x),
++            f64::from(self.position.0.y),
++            f64::from(self.position.0.z),
++        ];
++        let mut max = min.map(|coordinate| coordinate + 1.0);
++        for (axis, direction) in self.facing.vector().into_iter().enumerate() {
++            if direction > 0 {
++                min[axis] += 1.0;
++                max[axis] += f64::from(self.reach);
++            } else if direction < 0 {
++                min[axis] -= f64::from(self.reach);
++                max[axis] -= 1.0;
++            }
++        }
++        [min, max]
++    }
++
++    pub(crate) fn affects(self, entity_bounds: [[f64; 3]; 2]) -> bool {
++        fan_entities::intersects(self.bounds(), entity_bounds)
++    }
++
++    pub(crate) fn velocity(
++        self,
++        entity_bounds: [[f64; 3]; 2],
++        position: [f64; 3],
++        velocity: [f64; 3],
++        sneaking: bool,
++    ) -> Option<[f64; 3]> {
++        self.affects(entity_bounds).then(|| {
++            let origin = [
++                f64::from(self.position.0.x) + 0.5,
++                f64::from(self.position.0.y) + 0.5,
++                f64::from(self.position.0.z) + 0.5,
++            ];
++            fan_entities::movement(
++                velocity,
++                position,
++                origin,
++                self.flow,
++                self.rpm,
++                self.nominal_distance,
++                sneaking,
++            )
++        })
++    }
++}
++
++pub(super) fn tick(
++    world: &crate::world::World,
++    position: BlockPos,
++    state: BlockStateId,
++    rpm: f32,
++) -> Option<[i32; 8]> {
++    use pumpkin_data::entity::EntityType;
++    use pumpkin_util::math::{boundingbox::BoundingBox, vector3::Vector3};
++    let flow = current(position, state, rpm, |pos| {
++        world.get_block_state_id_if_loaded(&pos)
++    })?;
++    let [min, max] = flow.bounds();
++    for entity in world.get_entities_at_box(&BoundingBox::new_array(min, max)) {
++        let base = entity.get_entity();
++        // The pinned Horizon client uses the same synced current for its own player.
++        if base.entity_type == &EntityType::PLAYER || !base.is_alive() || entity.is_spectator() {
++            continue;
++        }
++        let bounds = base.bounding_box.load();
++        let xyz = |vector: Vector3<f64>| [vector.x, vector.y, vector.z];
++        if let Some([x, y, z]) = flow.velocity(
++            [xyz(bounds.min), xyz(bounds.max)],
++            xyz(base.pos.load()),
++            xyz(base.velocity.load()),
++            base.is_sneaking(),
++        ) {
++            base.set_velocity(Vector3::new(x, y, z));
++        }
++    }
++    Some(flow.wire())
++}
++
++pub(crate) fn current(
++    position: BlockPos,
++    state: BlockStateId,
++    rpm: f32,
++    mut state_at: impl FnMut(BlockPos) -> Option<BlockStateId>,
++) -> Option<Airflow> {
++    if !rpm.is_finite() || rpm == 0.0 || Block::from_state_id(state).name != ID {
++        return None;
++    }
++    let block = Block::from_state_id(state);
++    let facing = block
++        .properties(state)?
++        .to_props()
++        .into_iter()
++        .find(|property| property.key_str() == "facing")
++        .and_then(|property| {
++            Direction::ALL
++                .into_iter()
++                .find(|dir| dir.name() == property.value_str())
++        })?;
++    let nominal_distance = Config::DEFAULT.max_distance(rpm);
++    let pushing = fan::pushing(rpm, facing);
++    let flow = facing
++        .vector()
++        .map(|component| component * if pushing { 1 } else { -1 });
++    let mut reach = nominal_distance;
++
++    for offset in 1..=nominal_distance.ceil() as i32 {
++        let vector = facing.vector();
++        let cell = BlockPos::new(
++            position.0.x.checked_add(vector[0].checked_mul(offset)?)?,
++            position.0.y.checked_add(vector[1].checked_mul(offset)?)?,
++            position.0.z.checked_add(vector[2].checked_mul(offset)?)?,
++        );
++        let Some(state) = state_at(cell) else {
++            // Do not force a chunk load just to extend the current.
++            reach = reach.min((offset - 1) as f32);
++            break;
++        };
++        let shapes = state
++            .to_state()
++            .get_block_collision_shapes_at(&cell)
++            .map(|shape| {
++                [
++                    shape.min.x,
++                    shape.min.y,
++                    shape.min.z,
++                    shape.max.x,
++                    shape.max.y,
++                    shape.max.z,
++                ]
++            })
++            .collect::<Vec<_>>();
++        let depth = fan::shape_depth(&shapes, facing);
++        if depth.is_finite() {
++            let obstruction = (offset - 1) as f32 + depth as f32;
++            reach = reach.min(obstruction);
++            if obstruction <= offset as f32 {
++                break;
++            }
++        }
++    }
++
++    (reach > 0.0).then_some(Airflow {
++        position,
++        facing,
++        flow,
++        rpm,
++        pushing,
++        nominal_distance,
++        reach,
++    })
++}
+diff --git a/crates/pumpkin-core/src/block/entities/create_millstone.rs b/crates/pumpkin-core/src/block/entities/create_millstone.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_millstone.rs
+@@ -0,0 +1,502 @@
++use std::{
++    any::Any,
++    array::from_fn,
++    sync::{
++        Arc, Mutex, OnceLock, PoisonError, RwLock,
++        atomic::{AtomicBool, Ordering},
++    },
++};
++
++use create_engine::milling::{Action, MillCycle, roll_count};
++use pumpkin_data::{item::Item, item_stack::ItemStack, tag::Taggable};
++use pumpkin_inventory::{Clearable, Inventory};
++use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
++use pumpkin_util::math::position::BlockPos;
++
++use super::{BlockEntity, create_kinetic::CreateKinetic};
++use crate::world::World;
++use rand::RngExt;
++use serde::Deserialize;
++
++pub(crate) const ID: &str = "create:millstone";
++const INPUT_SLOT: usize = 0;
++const OUTPUT_START: usize = 1;
++const PROCESSING_TIMER_KEY: &str = "Timer";
++
++pub struct CreateMillstoneBlockEntity {
++    pub position: BlockPos,
++    pub items: RwLock<[ItemStack; Self::INVENTORY_SIZE]>,
++    cycle: Mutex<MillCycle>,
++    kinetic: CreateKinetic,
++    dirty: AtomicBool,
++    opaque_items: Option<NbtCompound>,
++}
++
++impl BlockEntity for CreateMillstoneBlockEntity {
++    fn resource_location(&self) -> &'static str {
++        ID
++    }
++
++    fn get_position(&self) -> BlockPos {
++        self.position
++    }
++
++    fn from_nbt(nbt: &NbtCompound, position: BlockPos) -> Self {
++        let mut items = from_fn(|_| ItemStack::EMPTY.clone());
++        let opaque_items = (!read_items(nbt, &mut items)).then(|| {
++            let mut opaque = NbtCompound::new();
++            for name in ["Items", "InputInventory", "OutputInventory"] {
++                if let Some(tag) = nbt.get(name) {
++                    opaque.put(name, tag.clone());
++                }
++            }
++            opaque
++        });
++        let timer = nbt
++            .get_int(PROCESSING_TIMER_KEY)
++            .or_else(|| nbt.get_int("ProcessingTicks"))
++            .filter(|timer| (-512..=1_000_000).contains(timer))
++            .unwrap_or(0);
++        Self {
++            position,
++            items: RwLock::new(items),
++            cycle: Mutex::new(MillCycle { timer }),
++            kinetic: CreateKinetic::new(ID, position),
++            dirty: AtomicBool::new(false),
++            opaque_items,
++        }
++    }
++
++    fn write_nbt(&self, nbt: &mut NbtCompound) {
++        let cycle = self.cycle.lock().unwrap_or_else(PoisonError::into_inner);
++        let items = self.items.read().unwrap_or_else(PoisonError::into_inner);
++        nbt.child_tags.remove("Items");
++        if let Some(opaque_items) = &self.opaque_items {
++            nbt.child_tags.extend(opaque_items.child_tags.clone());
++        } else {
++            write_items(nbt, "InputInventory", &items[..OUTPUT_START]);
++            write_items(nbt, "OutputInventory", &items[OUTPUT_START..]);
++        }
++        nbt.put_int(PROCESSING_TIMER_KEY, cycle.timer);
++        self.kinetic.write_nbt(nbt);
++    }
++
++    fn tick(&self, world: &Arc<World>) {
++        if !self.is_supported() {
++            return;
++        }
++        let old_rpm = self.kinetic.rpm();
++        self.kinetic.tick(world);
++        let rpm = self.kinetic.rpm();
++        let mut cycle = self.cycle.lock().unwrap_or_else(PoisonError::into_inner);
++        let previous_timer = cycle.timer;
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        let recipe = recipe_for(&items[INPUT_SLOT]);
++        let action = cycle.tick(
++            rpm,
++            items[OUTPUT_START..]
++                .iter()
++                .map(|stack| u32::from(stack.item_count)),
++            !items[INPUT_SLOT].is_empty(),
++            recipe.as_ref().map(|recipe| recipe.duration),
++        );
++        let processed = if action == Action::Process {
++            let mut random = rand::rng();
++            let done = process_items(&mut items, || random.random::<f32>());
++            if !done && recipe.is_some() {
++                cycle.timer = 1;
++            }
++            done
++        } else {
++            false
++        };
++        let changed = previous_timer != cycle.timer || processed || rpm != old_rpm;
++        drop(items);
++        drop(cycle);
++
++        if changed {
++            self.mark_dirty();
++            if let Some(entity) = world.get_block_entity(&self.position)
++                && entity
++                    .as_any()
++                    .downcast_ref::<Self>()
++                    .is_some_and(|live| std::ptr::eq(self, live))
++            {
++                world.update_block_entity(&entity);
++            }
++        }
++    }
++
++    fn chunk_data_nbt(&self) -> Option<NbtCompound> {
++        let mut nbt = NbtCompound::new();
++        self.write_nbt(&mut nbt);
++        Some(nbt)
++    }
++
++    fn get_inventory(self: Arc<Self>) -> Option<Arc<dyn Inventory>> {
++        self.is_supported().then_some(self)
++    }
++
++    fn on_block_replaced(self: Arc<Self>, world: &Arc<World>, position: &BlockPos) {
++        if self.is_supported() {
++            let inventory: Arc<dyn Inventory> = self;
++            world.scatter_inventory(position, &inventory);
++        }
++    }
++
++    fn is_dirty(&self) -> bool {
++        self.dirty.load(Ordering::Relaxed)
++    }
++
++    fn clear_dirty(&self) {
++        self.dirty.store(false, Ordering::Relaxed);
++    }
++
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++}
++
++impl CreateMillstoneBlockEntity {
++    pub const INVENTORY_SIZE: usize = 1 + create_engine::milling::OUTPUT_SLOTS;
++
++    #[must_use]
++    pub fn new(position: BlockPos) -> Self {
++        Self {
++            position,
++            items: RwLock::new(from_fn(|_| ItemStack::EMPTY.clone())),
++            cycle: Mutex::new(MillCycle::default()),
++            kinetic: CreateKinetic::new(ID, position),
++            dirty: AtomicBool::new(false),
++            opaque_items: None,
++        }
++    }
++
++    #[must_use]
++    pub fn is_supported(&self) -> bool {
++        self.opaque_items.is_none()
++    }
++
++    pub(crate) fn insert_stack(&self, incoming: &ItemStack) -> u8 {
++        if incoming.is_empty() || !self.is_supported() {
++            return 0;
++        }
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        let input = &mut items[INPUT_SLOT];
++        let room = if input.is_empty() {
++            incoming.get_max_stack_size()
++        } else if input.are_items_and_components_equal(incoming) {
++            input.get_max_stack_size().saturating_sub(input.item_count)
++        } else {
++            return 0;
++        };
++        let inserted = incoming.item_count.min(room);
++        if inserted == 0 {
++            return 0;
++        }
++        if input.is_empty() {
++            *input = incoming.clone();
++            input.item_count = inserted;
++        } else {
++            input.item_count += inserted;
++        }
++        self.mark_dirty();
++        inserted
++    }
++
++    pub(crate) fn collect_items(&self) -> Vec<ItemStack> {
++        if !self.is_supported() {
++            return Vec::new();
++        }
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        let mut collected = items[OUTPUT_START..]
++            .iter_mut()
++            .filter_map(|slot| {
++                (!slot.is_empty()).then(|| std::mem::replace(slot, ItemStack::EMPTY.clone()))
++            })
++            .collect::<Vec<_>>();
++        if collected.is_empty() && !items[INPUT_SLOT].is_empty() {
++            collected.push(std::mem::replace(
++                &mut items[INPUT_SLOT],
++                ItemStack::EMPTY.clone(),
++            ));
++        }
++        if !collected.is_empty() {
++            self.mark_dirty();
++        }
++        collected
++    }
++
++    fn mark_dirty(&self) {
++        self.dirty.store(true, Ordering::Relaxed);
++    }
++}
++
++#[cfg(test)]
++fn process(millstone: &CreateMillstoneBlockEntity) -> bool {
++    if !millstone.is_supported() {
++        return false;
++    }
++    let mut items = millstone
++        .items
++        .write()
++        .unwrap_or_else(PoisonError::into_inner);
++    let processed = process_items(&mut items, || 0.9);
++    if processed {
++        millstone.mark_dirty();
++    }
++    processed
++}
++
++fn process_items(
++    items: &mut [ItemStack; CreateMillstoneBlockEntity::INVENTORY_SIZE],
++    mut draw: impl FnMut() -> f32,
++) -> bool {
++    let Some(recipe) = recipe_for(&items[INPUT_SLOT]) else {
++        return false;
++    };
++    let outputs = &mut items[OUTPUT_START..];
++    // Reserve room for the maximum roll so a blocked output never rerolls odds or loses input.
++    let mut trial = outputs.to_vec();
++    if !add_outputs(&mut trial, recipe, |output| output.count) {
++        return false;
++    }
++    trial.clone_from_slice(outputs);
++    if !add_outputs(&mut trial, recipe, |output| {
++        roll_count(output.count.into(), output.chance, &mut draw) as u8
++    }) {
++        return false;
++    }
++    outputs.clone_from_slice(&trial);
++    let _ = items[INPUT_SLOT].split(1);
++    true
++}
++
++fn add_outputs(
++    slots: &mut [ItemStack],
++    recipe: &MillingRecipe,
++    mut count: impl FnMut(&Output) -> u8,
++) -> bool {
++    for output in &recipe.results {
++        let Some(item) = Item::from_registry_key(&output.id) else {
++            return false;
++        };
++        let mut stack = ItemStack::new(count(output), item);
++        for slot in slots.iter_mut() {
++            if stack.is_empty() {
++                break;
++            }
++            if slot.is_empty() {
++                *slot = stack.split(stack.item_count.min(stack.get_max_stack_size()));
++            } else if slot.are_items_and_components_equal(&stack) {
++                let added = stack
++                    .item_count
++                    .min(slot.get_max_stack_size().saturating_sub(slot.item_count));
++                slot.item_count += added;
++                stack.item_count -= added;
++            }
++        }
++        if !stack.is_empty() {
++            return false;
++        }
++    }
++    true
++}
++
++#[derive(Deserialize)]
++struct MillingRecipe {
++    ingredients: [String; 1],
++    #[serde(rename = "processing_time")]
++    duration: i32,
++    results: Vec<Output>,
++}
++
++#[derive(Deserialize)]
++struct Output {
++    id: String,
++    #[serde(default = "one")]
++    count: u8,
++    #[serde(default = "guaranteed")]
++    chance: f32,
++}
++
++const fn one() -> u8 {
++    1
++}
++const fn guaranteed() -> f32 {
++    1.0
++}
++
++fn recipes() -> &'static [MillingRecipe] {
++    static RECIPES: OnceLock<Vec<MillingRecipe>> = OnceLock::new();
++    RECIPES.get_or_init(|| {
++        serde_json::from_str(include_str!(concat!(
++            env!("CARGO_MANIFEST_DIR"),
++            "/../../assets/nextmc-create-milling.json"
++        )))
++        .unwrap_or_else(|error| {
++            tracing::error!(%error, "Could not read embedded Create milling recipes");
++            Vec::new()
++        })
++    })
++}
++
++fn recipe_for(input: &ItemStack) -> Option<&'static MillingRecipe> {
++    if input.is_empty() {
++        return None;
++    }
++    let item = input.get_item();
++    recipes()
++        .iter()
++        .find(|recipe| match recipe.ingredients[0].as_str() {
++            "#minecraft:wool" => item.has_tag(&pumpkin_data::tag::Item::MINECRAFT_WOOL),
++            id => Item::from_registry_key(id) == Some(item),
++        })
++}
++
++fn write_items(nbt: &mut NbtCompound, key: &str, items: &[ItemStack]) {
++    let mut inventory = NbtCompound::new();
++    inventory.put_int("Size", items.len() as i32);
++    let list = items
++        .iter()
++        .enumerate()
++        .filter(|(_, stack)| !stack.is_empty())
++        .map(|(slot, stack)| {
++            let mut tag = NbtCompound::new();
++            stack.write_item_stack(&mut tag);
++            tag.put_int("Slot", slot as i32);
++            NbtTag::Compound(tag)
++        })
++        .collect();
++    inventory.put("Items", NbtTag::List(list));
++    nbt.put_compound(key, inventory);
++}
++
++fn read_items(nbt: &NbtCompound, items: &mut [ItemStack]) -> bool {
++    fn read_slots(nbt: &NbtCompound, items: &mut [ItemStack]) -> Option<()> {
++        if let Some(tag) = nbt.get("Items") {
++            let NbtTag::List(list) = tag else { return None };
++            if list.len() > items.len() {
++                return None;
++            }
++            for entry in list {
++                let entry = entry.extract_compound()?;
++                let slot = entry
++                    .get_int("Slot")
++                    .or_else(|| entry.get_byte("Slot").map(i32::from))?;
++                let item = items.get_mut(usize::try_from(slot).ok()?)?;
++                if !item.is_empty() {
++                    return None;
++                }
++                *item = ItemStack::read_item_stack(entry)?;
++            }
++        }
++        Some(())
++    }
++    if nbt.get("Items").is_some() {
++        return read_slots(nbt, items).is_some();
++    }
++    let (input, output) = items.split_at_mut(OUTPUT_START);
++    [("InputInventory", input), ("OutputInventory", output)]
++        .into_iter()
++        .all(|(key, slots)| {
++            nbt.get(key).is_none()
++                || nbt.get_compound(key).is_some_and(|data| {
++                    data.get_int("Size") == Some(slots.len() as i32)
++                        && read_slots(data, slots).is_some()
++                })
++        })
++}
++
++#[cfg(test)]
++#[path = "create_millstone_tests.rs"]
++mod tests;
++
++impl Inventory for CreateMillstoneBlockEntity {
++    fn size(&self) -> usize {
++        Self::INVENTORY_SIZE
++    }
++
++    fn is_empty(&self) -> bool {
++        self.items
++            .read()
++            .unwrap_or_else(PoisonError::into_inner)
++            .iter()
++            .all(ItemStack::is_empty)
++    }
++
++    fn get_stack(&self, slot: usize) -> ItemStack {
++        self.items
++            .read()
++            .unwrap_or_else(PoisonError::into_inner)
++            .get(slot)
++            .cloned()
++            .unwrap_or_else(|| ItemStack::EMPTY.clone())
++    }
++
++    fn remove_stack(&self, slot: usize) -> ItemStack {
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        let Some(stack) = items.get_mut(slot) else {
++            return ItemStack::EMPTY.clone();
++        };
++        let removed = std::mem::replace(stack, ItemStack::EMPTY.clone());
++        self.mark_dirty();
++        removed
++    }
++
++    fn remove_stack_specific(&self, slot: usize, amount: u8) -> ItemStack {
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        let Some(stack) = items.get_mut(slot) else {
++            return ItemStack::EMPTY.clone();
++        };
++        if stack.is_empty() || amount == 0 {
++            return ItemStack::EMPTY.clone();
++        }
++        let removed = stack.split(amount);
++        self.mark_dirty();
++        removed
++    }
++
++    fn set_stack(&self, slot: usize, stack: ItemStack) {
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        if let Some(target) = items.get_mut(slot) {
++            *target = stack;
++            self.mark_dirty();
++        }
++    }
++
++    fn get_max_count_per_stack(&self) -> u8 {
++        create_engine::milling::SLOT_LIMIT as u8
++    }
++
++    fn is_valid_slot_for(&self, slot: usize, _stack: &ItemStack) -> bool {
++        self.is_supported() && slot == INPUT_SLOT
++    }
++
++    fn can_transfer_to(
++        &self,
++        _hopper_inventory: &dyn Inventory,
++        slot: usize,
++        _stack: &ItemStack,
++    ) -> bool {
++        self.is_supported() && slot >= OUTPUT_START && slot < Self::INVENTORY_SIZE
++    }
++
++    fn mark_dirty(&self) {
++        CreateMillstoneBlockEntity::mark_dirty(self);
++    }
++
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++}
++
++impl Clearable for CreateMillstoneBlockEntity {
++    fn clear(&self) {
++        self.items
++            .write()
++            .unwrap_or_else(PoisonError::into_inner)
++            .fill_with(|| ItemStack::EMPTY.clone());
++        self.mark_dirty();
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/entities/create_millstone_tests.rs b/crates/pumpkin-core/src/block/entities/create_millstone_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_millstone_tests.rs
+@@ -0,0 +1,103 @@
++use super::*;
++
++fn loaded(count: u8) -> CreateMillstoneBlockEntity {
++    let mill = CreateMillstoneBlockEntity::new(BlockPos::new(0, 0, 0));
++    assert_eq!(
++        mill.insert_stack(&ItemStack::new(count, &Item::WHEAT)),
++        count
++    );
++    mill
++}
++
++#[test]
++fn all_pinned_recipe_outputs_resolve_and_wool_tag_is_supported() {
++    assert_eq!(recipes().len(), 47);
++    assert!(recipe_for(&ItemStack::new(1, &Item::WHITE_WOOL)).is_some());
++    for recipe in recipes() {
++        assert!(recipe.duration > 0);
++        assert!(
++            recipe
++                .ingredients
++                .iter()
++                .all(|key| key == "#minecraft:wool" || Item::from_registry_key(key).is_some()),
++            "{:?}",
++            recipe.ingredients
++        );
++        assert!(
++            recipe
++                .results
++                .iter()
++                .all(|output| Item::from_registry_key(&output.id).is_some()
++                    && output.count > 0
++                    && (0.0..=1.0).contains(&output.chance)),
++            "{:?}",
++            recipe.ingredients
++        );
++    }
++}
++
++#[test]
++fn seeded_outcomes_use_each_pinned_chance_and_consume_one_item() {
++    let mill = loaded(2);
++    let mut items = mill.items.write().unwrap();
++    let mut draws = [0.1, 0.9, 0.1].into_iter();
++    assert!(process_items(&mut items, || draws.next().unwrap()));
++    assert_eq!(items[0].item_count, 1);
++    assert_eq!(items[1].get_item(), &Item::CREATE_WHEAT_FLOUR);
++    assert_eq!(items[1].item_count, 2);
++    assert_eq!(items[2].get_item(), &Item::WHEAT_SEEDS);
++    assert_eq!(items[2].item_count, 1);
++    assert!(draws.next().is_none());
++}
++
++#[test]
++fn full_output_leaves_input_and_does_not_roll_again() {
++    let mill = loaded(2);
++    let mut items = mill.items.write().unwrap();
++    for slot in &mut items[OUTPUT_START..] {
++        *slot = ItemStack::new(64, &Item::STONE);
++    }
++    assert!(!process_items(&mut items, || panic!(
++        "blocked output must not roll"
++    )));
++    assert_eq!(items[0].item_count, 2);
++}
++
++#[test]
++fn pending_inventory_and_timer_round_trip_and_output_is_collected_first() {
++    let mill = loaded(2);
++    assert!(super::process(&mill));
++    assert_eq!(mill.insert_stack(&ItemStack::new(1, &Item::STONE)), 0);
++    let mut nbt = NbtCompound::new();
++    mill.write_nbt(&mut nbt);
++    assert_eq!(
++        nbt.get_compound("InputInventory").unwrap().get_int("Size"),
++        Some(1)
++    );
++    assert_eq!(
++        nbt.get_compound("OutputInventory").unwrap().get_int("Size"),
++        Some(9)
++    );
++    nbt.put_int("Timer", 37);
++    let restored = CreateMillstoneBlockEntity::from_nbt(&nbt, BlockPos::new(1, 2, 3));
++    let mut saved = NbtCompound::new();
++    restored.write_nbt(&mut saved);
++    assert_eq!(saved.get_int("Timer"), Some(37));
++    assert_eq!(
++        restored.collect_items()[0].get_item(),
++        &Item::CREATE_WHEAT_FLOUR
++    );
++    assert_eq!(restored.collect_items()[0].get_item(), &Item::WHEAT);
++}
++
++#[test]
++fn opaque_inventory_is_preserved_and_not_processed() {
++    let mut nbt = NbtCompound::new();
++    nbt.put_int("InputInventory", 17);
++    let mill = CreateMillstoneBlockEntity::from_nbt(&nbt, BlockPos::new(1, 2, 3));
++    assert!(!mill.is_supported());
++    assert!(!super::process(&mill));
++    let mut saved = NbtCompound::new();
++    mill.write_nbt(&mut saved);
++    assert_eq!(saved.get_int("InputInventory"), Some(17));
++}
+diff --git a/crates/pumpkin-core/tests/create_chute.rs b/crates/pumpkin-core/tests/create_chute.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/tests/create_chute.rs
+@@ -0,0 +1,177 @@
++use std::sync::Arc;
++
++pub use pumpkin_core::block::entities::BlockEntity;
++
++pub mod block {
++    pub use pumpkin_core::block::{
++        BlockBehaviour, BlockMetadata, OnNeighborUpdateArgs, PlacedArgs,
++    };
++
++    pub mod blocks {
++        pub use pumpkin_core::block::blocks::redstone;
++    }
++
++    pub mod entities {
++        pub mod create_chute {
++            pub use crate::create_chute::CreateChuteBlockEntity;
++        }
++    }
++}
++
++pub mod hopper {
++    pub use pumpkin_core::block::entities::hopper::*;
++}
++
++pub mod world {
++    pub use pumpkin_core::world::World;
++}
++
++#[path = "../src/block/entities/create_chute.rs"]
++mod create_chute;
++#[allow(dead_code)]
++#[path = "../src/block/blocks/create_chute.rs"]
++mod create_chute_block;
++
++use create_chute::CreateChuteBlockEntity;
++use pumpkin_data::{item::Item, item_stack::ItemStack};
++use pumpkin_inventory::{Inventory, SimpleInventory};
++use pumpkin_nbt::compound::NbtCompound;
++use pumpkin_util::math::position::BlockPos;
++
++fn inventory_with(slot_stacks: &[(usize, ItemStack)]) -> SimpleInventory {
++    let inventory = SimpleInventory::new(4);
++    for (slot, stack) in slot_stacks {
++        inventory.set_stack(*slot, stack.clone());
++    }
++    inventory
++}
++
++fn total(inventories: &[&dyn Inventory]) -> u16 {
++    inventories
++        .iter()
++        .flat_map(|inventory| (0..inventory.size()).map(|slot| inventory.get_stack(slot)))
++        .map(|stack| u16::from(stack.item_count))
++        .sum()
++}
++
++#[test]
++fn native_block_entity_type_ids_resolve_for_both_chutes() {
++    for (entity, name) in [
++        (CreateChuteBlockEntity::new(BlockPos::new(0, 0, 0)), "chute"),
++        (
++            CreateChuteBlockEntity::new_smart(BlockPos::new(0, 0, 0)),
++            "smart_chute",
++        ),
++    ] {
++        assert_eq!(
++            pumpkin_data::block_properties::BLOCK_ENTITY_TYPES[entity.get_id() as usize],
++            name
++        );
++    }
++}
++
++#[test]
++fn normal_chute_pulls_sixteen_and_retries_partial_output_without_loss() {
++    assert_eq!(
++        CreateChuteBlockEntity::new_smart(BlockPos::new(0, 0, 0)).resource_location(),
++        CreateChuteBlockEntity::SMART_ID
++    );
++    let source = inventory_with(&[(0, ItemStack::new(40, &Item::STONE))]);
++    let target = SimpleInventory::new(1);
++    target.set_stack(0, ItemStack::new(60, &Item::STONE));
++    let chute = CreateChuteBlockEntity::new(BlockPos::new(0, 0, 0));
++
++    let (pulled, spill) = chute.pull_from(&source, false);
++    assert!(pulled);
++    assert!(spill.is_empty());
++    assert_eq!(source.get_stack(0).item_count, 24);
++    assert_eq!(chute.get_stack(0).item_count, 16);
++
++    let (pushed, spill) = chute.push_to(&target);
++    assert!(pushed);
++    assert!(spill.is_empty());
++    assert_eq!(target.get_stack(0).item_count, 64);
++    assert_eq!(chute.get_stack(0).item_count, 12);
++    assert_eq!(total(&[&source, &chute, &target]), 100);
++}
++
++#[test]
++fn smart_chute_uses_filter_count_and_stops_while_powered() {
++    let mut filter = NbtCompound::new();
++    ItemStack::new(1, &Item::DIAMOND).write_item_stack(&mut filter);
++    let mut nbt = NbtCompound::new();
++    nbt.put_string("id", CreateChuteBlockEntity::SMART_ID.to_owned());
++    nbt.put_compound("Filter", filter);
++    nbt.put_int("FilterAmount", 3);
++    nbt.put_bool("UpTo", false);
++    let chute = CreateChuteBlockEntity::from_nbt(&nbt, BlockPos::new(0, 0, 0));
++    let source = inventory_with(&[
++        (0, ItemStack::new(8, &Item::STONE)),
++        (1, ItemStack::new(5, &Item::DIAMOND)),
++    ]);
++
++    assert!(!chute.pull_from(&source, true).0);
++    assert_eq!(total(&[&source, &chute]), 13);
++    assert!(chute.pull_from(&source, false).0);
++    assert_eq!(source.get_stack(0).item_count, 8);
++    assert_eq!(source.get_stack(1).item_count, 2);
++    assert_eq!(chute.get_stack(0).item_count, 3);
++    assert_eq!(total(&[&source, &chute]), 13);
++
++    let target = SimpleInventory::new(1);
++    assert!(!chute.pull_from(&source, true).0);
++    assert!(!chute.push_to(&target).0);
++    assert_eq!(chute.get_stack(0).item_count, 3);
++    assert!(!chute.pull_from(&source, false).0);
++    assert!(chute.push_to(&target).0);
++    assert_eq!(target.get_stack(0).item_count, 3);
++    assert_eq!(total(&[&source, &chute, &target]), 13);
++}
++
++#[test]
++fn unsupported_item_nbt_is_preserved_and_not_exposed_as_inventory() {
++    let mut nbt = NbtCompound::new();
++    nbt.put_string("id", CreateChuteBlockEntity::ID.to_owned());
++    nbt.put_string("Item", "future_item_payload".to_owned());
++    let chute = CreateChuteBlockEntity::from_nbt(&nbt, BlockPos::new(0, 0, 0));
++    let mut written = NbtCompound::new();
++    chute.write_nbt(&mut written);
++
++    assert!(written.get_string("Item").is_some());
++    assert!(Arc::new(chute).get_inventory().is_none());
++}
++
++#[test]
++fn native_chute_nbt_round_trips_and_preserves_unknown_fields() {
++    let position = BlockPos::new(1, 2, 3);
++    let mut nbt = NbtCompound::new();
++    nbt.put_string("id", CreateChuteBlockEntity::ID.to_owned());
++    let mut item = NbtCompound::new();
++    ItemStack::new(7, &Item::IRON_INGOT).write_item_stack(&mut item);
++    nbt.put_compound("Item", item);
++    nbt.put_float("ItemPosition", 0.25);
++    nbt.put_float("Pull", 0.5);
++    nbt.put_float("Push", 0.75);
++    nbt.put_float("BottomAirFlowDistance", 2.0);
++    nbt.put_string("FutureChuteData", "preserve-me".to_owned());
++
++    let chute = CreateChuteBlockEntity::from_nbt(&nbt, position);
++    let mut written = NbtCompound::new();
++    chute.write_nbt(&mut written);
++
++    assert_eq!(
++        written.get_compound("Item").unwrap().get_string("id"),
++        Some("minecraft:iron_ingot")
++    );
++    assert_eq!(
++        written.get_compound("Item").unwrap().get_int("count"),
++        Some(7)
++    );
++    assert_eq!(written.get_float("ItemPosition"), Some(0.25));
++    assert_eq!(written.get_float("Pull"), Some(0.5));
++    assert_eq!(written.get_float("Push"), Some(0.75));
++    assert_eq!(written.get_float("BottomAirFlowDistance"), Some(2.0));
++    assert_eq!(written.get_string("FutureChuteData"), Some("preserve-me"));
++    assert_eq!(chute.get_position(), position);
++    assert_eq!(chute.get_stack(0).item_count, 7);
++}
+diff --git a/crates/pumpkin-core/tests/create_fan_airflow.rs b/crates/pumpkin-core/tests/create_fan_airflow.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/tests/create_fan_airflow.rs
+@@ -0,0 +1,88 @@
++#[path = "../src/block/entities/create_fan_airflow.rs"]
++mod airflow;
++
++use pumpkin_core::world;
++use pumpkin_data::{Block, BlockStateId, Property};
++use pumpkin_util::math::position::BlockPos;
++
++fn state(name: &str, facing: Option<&str>) -> BlockStateId {
++    let block = Block::from_name(name).expect("pinned block registry entry");
++    let mut properties = block
++        .properties(block.default_state.id)
++        .map_or_else(Vec::new, |properties| properties.to_props());
++    if let Some(facing) = facing {
++        let property = properties
++            .iter_mut()
++            .find(|property| property.key_str() == "facing")
++            .expect("facing property");
++        *property = Property::from_str_pair("facing", facing).expect("valid facing");
++    }
++    block
++        .state_from_properties(&properties)
++        .expect("valid block state")
++        .id
++}
++
++#[test]
++fn engine_range_tracks_fan_direction_and_rpm_sign() {
++    let fan = state("create:encased_fan", Some("east"));
++    let air = state("minecraft:air", None);
++    let position = BlockPos::new(0, 80, 0);
++    let current = airflow::current(position, fan, 32.0, |_| Some(air)).expect("running fan");
++    assert_eq!(current.nominal_distance(), 5.125);
++    assert_eq!(current.reach(), 5.125);
++    assert!(current.pushing());
++    assert_eq!(current.flow(), [1, 0, 0]);
++    assert_eq!(current.bounds(), [[1.0, 80.0, 0.0], [6.125, 81.0, 1.0]]);
++
++    let reverse = airflow::current(position, fan, -32.0, |_| Some(air)).expect("reversed fan");
++    assert!(!reverse.pushing());
++    assert_eq!(reverse.flow(), [-1, 0, 0]);
++    assert_eq!(reverse.bounds(), current.bounds());
++
++    let west_facing = state("create:encased_fan", Some("west"));
++    let reversed_axis =
++        airflow::current(position, west_facing, 32.0, |_| Some(air)).expect("west-facing fan");
++    assert!(!reversed_axis.pushing());
++    assert_eq!(reversed_axis.flow(), [1, 0, 0]);
++}
++
++#[test]
++fn collision_shape_truncates_current_and_blocks_entities_beyond_it() {
++    let fan = state("create:encased_fan", Some("east"));
++    let air = state("minecraft:air", None);
++    let stone = state("minecraft:stone", None);
++    let position = BlockPos::new(0, 80, 0);
++    let current = airflow::current(position, fan, 32.0, |cell| {
++        Some(if cell.0.x == 3 { stone } else { air })
++    })
++    .expect("air path before the obstacle");
++
++    assert_eq!(current.reach(), 2.0);
++    let unloaded = airflow::current(position, fan, 32.0, |cell| (cell.0.x < 3).then_some(air))
++        .expect("known cells before an unloaded boundary");
++    assert_eq!(unloaded.reach(), 2.0);
++    assert!(current.affects([[2.0, 80.1, 0.1], [2.5, 80.9, 0.9]]));
++    assert!(!current.affects([[3.1, 80.1, 0.1], [3.5, 80.9, 0.9]]));
++
++    let moved = current
++        .velocity(
++            [[2.0, 80.1, 0.1], [2.5, 80.9, 0.9]],
++            [2.25, 80.0, 0.5],
++            [0.0; 3],
++            false,
++        )
++        .expect("entity inside the unobstructed current");
++    assert!(moved[0] > 0.0);
++    assert_eq!(&moved[1..], &[0.0, 0.0]);
++    assert!(
++        current
++            .velocity(
++                [[3.1, 80.1, 0.1], [3.5, 80.9, 0.9]],
++                [3.25, 80.0, 0.5],
++                [0.0; 3],
++                false,
++            )
++            .is_none()
++    );
++}

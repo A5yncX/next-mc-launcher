@@ -1,0 +1,553 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_bearing.rs b/crates/pumpkin-core/src/block/entities/create_bearing.rs
+--- a/crates/pumpkin-core/src/block/entities/create_bearing.rs
++++ b/crates/pumpkin-core/src/block/entities/create_bearing.rs
+@@ -2,9 +2,10 @@
+ 
+ use create_engine::{
+     contraption::{
+-        Adhesion, Assembly, BlockRules, CaptureView, Cell, Rotation,
++        Adhesion, Assembly, BlockRules, CaptureView, Cell, QuarterTurn, Rotation,
+         bearing::{Bearing, Mode},
+         plan_landing,
++        windmill::{Config, RESTORE_ANGLE, RotationDirection, Windmill},
+     },
+     kinetics::Pos,
+     placement::Direction,
+@@ -15,14 +16,24 @@
+ use pumpkin_world::chunk::ChunkDataEdit;
+ 
+ use crate::{
+-    block::registry::BlockRegistry,
++    block::{
++        blocks::{create_pipe::with_property, create_sail},
++        registry::BlockRegistry,
++    },
+     entity::{EntityBase, player::Player},
+     net::create_scene::{GEOMETRY, NAMESPACE, POSES, SCENE},
+     world::World,
+ };
+ 
+ pub(crate) const ID: &str = "create:mechanical_bearing";
++pub(crate) const WINDMILL: &str = "create:windmill_bearing";
+ const MAX_BLOCKS: usize = 32;
++// shortcut: pinned explicit scene format caps directional sail assemblies at 64.
++const MAX_WINDMILL_BLOCKS: usize = 64;
++
++pub(crate) fn is_bearing(name: &str) -> bool {
++    matches!(name, ID | WINDMILL)
++}
+ const MAX_RECORDS: usize = 4; // Pinned Horizon's scene decoder limit.
+ static EDIT: Mutex<()> = Mutex::new(());
+ 
+@@ -53,7 +64,47 @@
+     })
+ }
+ 
+-struct View<'a>(&'a World, BlockPos);
++fn wool(id: BlockStateId) -> bool {
++    let block = id.to_block();
++    !block.name.contains(':') && block.name.ends_with("_wool") && block.default_state.id == id
++}
++
++fn sail_count(blocks: &[(Pos, BlockStateId)]) -> usize {
++    blocks
++        .iter()
++        .filter(|(_, id)| wool(*id) || create_sail::read(*id).is_some())
++        .count()
++}
++
++fn transformed(id: BlockStateId, turn: QuarterTurn) -> Option<BlockStateId> {
++    Some(if let Some(sail) = create_sail::read(id) {
++        with_property(id, "facing", turn.facing(sail.facing).name())
++    } else {
++        id
++    })
++}
++
++fn decode_state(state: &NbtCompound, windmill: bool) -> Option<BlockStateId> {
++    let name = state.get_string("id")?;
++    if let Some((_, block, _)) = PAYLOAD.iter().find(|(id, _, _)| *id == name) {
++        return Some(block.default_state.id);
++    }
++    if !windmill {
++        return None;
++    }
++    let block = Block::from_registry_key(name.strip_prefix("minecraft:").unwrap_or(name))?;
++    let id = block.default_state.id;
++    if wool(id) && name.starts_with("minecraft:") {
++        return Some(id);
++    }
++    let face = state.get_compound("properties")?.get_string("facing")?;
++    let face = Direction::ALL.into_iter().find(|dir| dir.name() == face)?;
++    create_sail::read(id)?;
++    let id = with_property(id, "facing", face.name());
++    (create_sail::read(id)?.facing == face).then_some(id)
++}
++
++struct View<'a>(&'a World, BlockPos, bool);
+ 
+ impl CaptureView for View<'_> {
+     type Block = BlockStateId;
+@@ -68,6 +119,19 @@
+         };
+         if id == Block::AIR.default_state.id {
+             return Cell::Empty;
++        }
++        if self.2 {
++            if let Some(sail) = create_sail::read(id) {
++                let attached = Direction::ALL.map(|face| sail.attaches(face));
++                return Cell::Block(BlockRules {
++                    attached,
++                    unsupported_faces: attached.map(|face| !face),
++                    ..Default::default()
++                });
++            }
++            if wool(id) {
++                return Cell::Block(BlockRules::default());
++            }
+         }
+         let Some((_, adhesion)) = payload(id) else {
+             return Cell::Block(BlockRules {
+@@ -150,6 +214,7 @@
+     blocks: Vec<(Pos, BlockStateId)>,
+     angle: f32,
+     stalled: bool,
++    windmill: bool,
+ }
+ 
+ impl Motion {
+@@ -162,8 +227,14 @@
+         let angle = pose
+             .get_float("Angle")
+             .filter(|a| a.is_finite() && a.abs() < 360.0)?;
++        let windmill = geo.get_bool("ReturnHome")?;
++        let limit = if windmill {
++            MAX_WINDMILL_BLOCKS
++        } else {
++            MAX_BLOCKS
++        };
+         let data = geo.get_list("Blocks")?;
+-        if !(1..=MAX_BLOCKS).contains(&data.len())
++        if !(1..=limit).contains(&data.len())
+             || axis > 2
+             || vector(pose, "Controller")? != controller
+         {
+@@ -175,16 +246,16 @@
+                 return None;
+             };
+             let local = vector(block, "Pos")?;
+-            if local.iter().any(|p| p.unsigned_abs() > MAX_BLOCKS as u32)
++            if local.iter().any(|p| p.unsigned_abs() > limit as u32)
+                 || blocks.iter().any(|(p, _)| *p == local)
+             {
+                 return None;
+             }
+-            let name = block.get_compound("State")?.get_string("id")?;
+-            let (_, kind, _) = PAYLOAD.iter().find(|(id, _, _)| *id == name)?;
+-            blocks.push((local, kind.default_state.id));
+-        }
+-        if !blocks.iter().any(|(p, _)| *p == [0; 3]) {
++            blocks.push((local, decode_state(block.get_compound("State")?, windmill)?));
++        }
++        if !blocks.iter().any(|(p, _)| *p == [0; 3])
++            || (windmill && geo.get_int("WindmillSails") != Some(sail_count(&blocks) as i32))
++        {
+             return None;
+         }
+         Some(Self {
+@@ -194,6 +265,7 @@
+             blocks,
+             angle,
+             stalled: pose.get_bool("Stalled").unwrap_or(false),
++            windmill,
+         })
+     }
+ 
+@@ -208,14 +280,28 @@
+         put_vector(&mut geo, "Controller", self.controller);
+         put_vector(&mut geo, "Anchor", self.anchor);
+         geo.put_int("Axis", self.axis as i32);
+-        geo.put_bool("ReturnHome", false);
++        geo.put_bool("ReturnHome", self.windmill);
++        if self.windmill {
++            geo.put_int("WindmillSails", sail_count(&self.blocks) as i32);
++        }
+         geo.put_list(
+             "Blocks",
+             self.blocks
+                 .iter()
+                 .map(|&(p, id)| {
+                     let mut state = NbtCompound::new();
+-                    state.put_string("id", payload(id).expect("validated bearing block").0.into());
++                    let block = id.to_block();
++                    let name = if block.name.contains(':') {
++                        block.name.to_owned()
++                    } else {
++                        format!("minecraft:{}", block.name)
++                    };
++                    state.put_string("id", name);
++                    if let Some(sail) = create_sail::read(id) {
++                        let mut props = NbtCompound::new();
++                        props.put_string("facing", sail.facing.name().into());
++                        state.put_compound("properties", props);
++                    }
+                     let mut block = NbtCompound::new();
+                     put_vector(&mut block, "Pos", p);
+                     block.put_compound("State", state);
+@@ -273,6 +359,26 @@
+     Some(scene)
+ }
+ 
++pub(super) fn windmill_rpm(world: &World, controller: BlockPos) -> f32 {
++    let capacity = world
++        .level
++        .read_chunk_sync(&controller.chunk_and_chunk_relative_position().0, |chunk| {
++            let Some(NbtTag::Compound(scene)) = chunk.get_custom_data(NAMESPACE, SCENE) else {
++                return None;
++            };
++            generation(&scene)?;
++            let geo = owned_entry(&scene, GEOMETRY, coords(controller))?;
++            (geo.get_bool("ReturnHome") == Some(true)).then_some(())?;
++            usize::try_from(geo.get_int("WindmillSails")?)
++                .ok()
++                .filter(|&sails| (8..=MAX_WINDMILL_BLOCKS).contains(&sails))
++        })
++        .flatten();
++    capacity.map_or(0.0, |sails| {
++        Config::default().rpm(sails, RotationDirection::Clockwise)
++    })
++}
++
+ pub(super) fn tick(
+     world: &Arc<World>,
+     controller: BlockPos,
+@@ -291,13 +397,24 @@
+     let changed = !running.swap(true, Relaxed);
+     let angle = motion.angle;
+     let rpm = if motion.stalled { 0.0 } else { rpm };
+-    let mut bearing = Bearing::resume(angle);
+-    bearing.tick(rpm, rpm, Mode::Place, motion.stalled, || false);
+-    motion.angle = bearing.angle();
++    let speed = if motion.windmill && rpm != 0.0 {
++        Config::default().rpm(sail_count(&motion.blocks), RotationDirection::Clockwise)
++    } else {
++        rpm
++    };
++    if motion.windmill {
++        let mut windmill = Windmill::restored(true, angle, speed, false);
++        windmill.finish_tick(speed, rpm, motion.stalled);
++        motion.angle = windmill.angle();
++    } else {
++        let mut bearing = Bearing::resume(angle);
++        bearing.tick(rpm, rpm, Mode::Place, motion.stalled, || false);
++        motion.angle = bearing.angle();
++    }
+     let previous_speed =
+         owned_entry(&previous, POSES, coords(controller)).and_then(|pose| pose.get_float("Speed"));
+-    if (motion.angle != angle || previous_speed != Some(rpm))
+-        && let Some(new) = motion.write(&previous, generation(&previous).unwrap(), angle, rpm)
++    if (motion.angle != angle || previous_speed != Some(speed))
++        && let Some(new) = motion.write(&previous, generation(&previous).unwrap(), angle, speed)
+     {
+         commit(world, controller, state, Some(previous), new, &[]);
+     }
+@@ -321,14 +438,16 @@
+     };
+     let facing = facing(state)?;
+     let anchor = plus(coords(controller), facing.vector());
+-    let motion = Motion::read(&scene, coords(controller))
+-        .filter(|m| m.matches(coords(controller), anchor, facing.axis().index()));
++    let motion = Motion::read(&scene, coords(controller)).filter(|m| {
++        m.matches(coords(controller), anchor, facing.axis().index())
++            && m.windmill == (state.to_block().name == WINDMILL)
++    });
+     Some((previous, scene, motion))
+ }
+ 
+ fn facing(state: BlockStateId) -> Option<Direction> {
+     let block = state.to_block();
+-    if block.name != ID {
++    if !is_bearing(block.name) {
+         return None;
+     }
+     let facing = block
+@@ -390,6 +509,7 @@
+         return true;
+     };
+     let air = Block::AIR.default_state.id;
++    let windmill = state.to_block().name == WINDMILL;
+     let anchor = plus(coords(controller), facing.vector());
+     let axis = facing.axis();
+     let in_scope = |p: BlockPos| {
+@@ -408,14 +528,19 @@
+             })
+     };
+     if let Some(mut motion) = motion {
+-        let turn = Rotation::new(anchor, axis, motion.angle)
++        let land_angle = if windmill {
++            RESTORE_ANGLE
++        } else {
++            motion.angle
++        };
++        let turn = Rotation::new(anchor, axis, land_angle)
+             .expect("validated angle")
+             .snapped();
+         let plan = plan_landing(
+             &motion.blocks,
+             anchor,
+             turn,
+-            |id, _| Some(*id),
++            |id, turn| transformed(*id, turn),
+             |p, id| {
+                 let p = pos(p);
+                 in_scope(p)
+@@ -449,15 +574,24 @@
+                         .all(|entry| owner(entry).is_some_and(|owner| owner != coords(controller)))
+                 })
+             })))
+-        && super::create_kinetic::rpm_at(world, &controller).is_some_and(|rpm| rpm != 0.0)
++        && (windmill
++            || super::create_kinetic::rpm_at(world, &controller).is_some_and(|rpm| rpm != 0.0))
+         && let Ok(assembly) = Assembly::capture(
+-            &View(world, controller),
++            &View(world, controller, windmill),
+             anchor,
+             Some(coords(controller)),
+             None,
+-            MAX_BLOCKS,
++            if windmill {
++                MAX_WINDMILL_BLOCKS
++            } else {
++                MAX_BLOCKS
++            },
+         )
+         && !assembly.blocks().is_empty()
++        && (!windmill
++            || Config::default()
++                .check_sails(sail_count(assembly.blocks()))
++                .is_ok())
+     {
+         let blocks = assembly.blocks().to_vec();
+         let edits: Vec<_> = blocks
+@@ -465,7 +599,13 @@
+             .map(|&(local, id)| (pos(plus(anchor, local)), id, air))
+             .collect();
+         // A running assembly must be able to land at any snapped angle within this chunk.
+-        if [0.0, 90.0, 180.0, 270.0].into_iter().all(|angle| {
++        if (if windmill {
++            &[0.0][..]
++        } else {
++            &[0.0, 90.0, 180.0, 270.0]
++        })
++        .iter()
++        .all(|&angle| {
+             let turn = Rotation::new(anchor, axis, angle)
+                 .expect("finite quarter turn")
+                 .snapped();
+@@ -485,6 +625,7 @@
+                 blocks,
+                 angle: 0.0,
+                 stalled: false,
++                windmill,
+             };
+             if let Some(captured) = motion.write(&old, next_generation, 0.0, 0.0) {
+                 commit(
+@@ -517,6 +658,7 @@
+             ],
+             angle: -90.0,
+             stalled: true,
++            windmill: false,
+         };
+         let empty = NbtCompound::new();
+         let encoded = motion.write(&empty, 12, -87.0, 0.0).unwrap();
+@@ -538,6 +680,44 @@
+     }
+ 
+     #[test]
++    fn windmill_scene_round_trips_directional_sails_and_counts_wool() {
++        let frame = Block::from_registry_key("create:sail_frame")
++            .unwrap()
++            .default_state
++            .id;
++        let sail = with_property(frame, "facing", "north");
++        let motion = Motion {
++            controller: [3, 4, 5],
++            anchor: [3, 4, 6],
++            axis: 2,
++            blocks: (0..8)
++                .map(|x| {
++                    (
++                        [x, 0, 0],
++                        if x == 0 {
++                            sail
++                        } else {
++                            Block::WHITE_WOOL.default_state.id
++                        },
++                    )
++                })
++                .collect(),
++            angle: 1.5,
++            stalled: false,
++            windmill: true,
++        };
++        assert_eq!(sail_count(&motion.blocks), 8);
++        let raw = motion.write(&NbtCompound::new(), 1, 0.0, 1.0).unwrap();
++        let loaded = Motion::read(&raw, motion.controller).unwrap();
++        assert!(loaded.windmill);
++        assert_eq!(loaded.blocks, motion.blocks);
++        assert_eq!(
++            create_sail::read(loaded.blocks[0].1).unwrap().facing,
++            Direction::North
++        );
++    }
++
++    #[test]
+     fn edits_preserve_unrelated_scene_data_and_other_controllers() {
+         let mut scene_data = scene(&NbtCompound::new(), [0; 3], 1, None, None).unwrap();
+         scene_data.put_int("ServerOnly", 42);
+@@ -549,6 +729,7 @@
+                 blocks: vec![([0; 3], Block::STONE.default_state.id)],
+                 angle: x as f32,
+                 stalled: false,
++                windmill: false,
+             };
+             scene_data = motion
+                 .write(&scene_data, i64::from(x) + 2, 0.0, 32.0)
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -74,6 +74,7 @@
+     super::create_mechanical_crafter::ID,
+     "create:mechanical_bearing",
+     "create:clockwork_bearing",
++    super::create_bearing::WINDMILL,
+     wheel::SMALL,
+     wheel::LARGE,
+     "create:large_cogwheel",
+@@ -157,6 +158,7 @@
+     material: AtomicU16,
+     structure_ready: AtomicBool,
+     bearing_running: AtomicBool,
++    windmill_generated: AtomicI32,
+     drill: Option<Box<drill::Drill>>,
+     saw_processing: Option<Box<Mutex<SawProcessing>>>,
+     mixer: Option<Box<Mutex<mixer::Mixer>>>,
+@@ -432,6 +434,7 @@
+             material: AtomicU16::new(Item::SPRUCE_PLANKS.id),
+             structure_ready: AtomicBool::new(false),
+             bearing_running: AtomicBool::new(false),
++            windmill_generated: AtomicI32::new(0),
+             drill: matches!(id, drill::ID | saw::ID).then(|| Box::new(drill::Drill::new())),
+             saw_processing: (id == saw::ID).then(|| Box::new(Mutex::new(SawProcessing::default()))),
+             mixer: (id == mixer::ID).then(|| Box::new(Mutex::new(mixer::Mixer::default()))),
+@@ -573,6 +576,7 @@
+                     | super::create_mechanical_crafter::ID
+                     | "create:mechanical_bearing"
+                     | "create:clockwork_bearing"
++                    | super::create_bearing::WINDMILL
+             )
+         {
+             "facing"
+@@ -631,6 +635,15 @@
+         actuator::PISTON | actuator::STICKY | actuator::PULLEY | super::create_deployer::ID => {
+             Kind::LinearActuator
+         }
++        super::create_bearing::WINDMILL => Kind::Motor {
++            facing: Direction::ALL
++                .into_iter()
++                .find(|d| d.name() == value)?
++                .opposite()
++                .vector(),
++            rpm: 0.0,
++            capacity: create_engine::contraption::windmill::CAPACITY_PER_RPM,
++        },
+         fan::ID
+         | drill::ID
+         | saw::ID
+@@ -667,7 +680,7 @@
+         let id = nbt.get_string("id").and_then(kinetic_id).unwrap_or(COG);
+         // The next tick recalculates the readings once the neighborhood is loaded.
+         let mut entity = Self::new(id, position);
+-        if id == super::create_bearing::ID {
++        if super::create_bearing::is_bearing(id) {
+             entity.bearing_running = AtomicBool::new(nbt.get_bool("Running").unwrap_or(false));
+         }
+         if id == belt::ID {
+@@ -768,8 +781,15 @@
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
+         tag.put_float("Speed", readings.rpm);
+-        if self.id == super::create_bearing::ID {
++        if super::create_bearing::is_bearing(self.id) {
+             tag.put_bool("Running", self.bearing_running.load(Ordering::Relaxed));
++            if self.id == super::create_bearing::WINDMILL {
++                tag.put_float(
++                    "LastGenerated",
++                    self.windmill_generated.load(Ordering::Relaxed) as f32,
++                );
++                tag.put_int("ScrollValue", 0);
++            }
+         }
+         let segment = *self
+             .belt
+@@ -986,6 +1006,10 @@
+             !self.structure_ready.swap(true, Ordering::Relaxed)
+         } else {
+             false
++        };
++        let windmill_changed = self.id == super::create_bearing::WINDMILL && {
++            let rpm = super::create_bearing::windmill_rpm(world, self.position) as i32;
++            self.windmill_generated.swap(rpm, Ordering::Relaxed) != rpm
+         };
+         let read = |[x, y, z]: Pos| {
+             let pos = BlockPos::new(x, y, z);
+@@ -1006,7 +1030,9 @@
+                 && let Some(kinetic) = entity.as_any().downcast_ref::<Self>()
+             {
+                 if let Kind::Motor { facing, rpm, .. } = &mut node.kind {
+-                    *rpm = if kinetic.id == CRANK {
++                    *rpm = if kinetic.id == super::create_bearing::WINDMILL {
++                        kinetic.windmill_generated.load(Ordering::Relaxed) as f32
++                    } else if kinetic.id == CRANK {
+                         (-32 * i32::from(kinetic.crank_direction(tick)) * facing[node.axis.index()])
+                             as f32
+                     } else {
+@@ -1195,8 +1221,15 @@
+             *readings = next;
+             (changed || press_changed, changed_signal)
+         };
+-        let bearing = self.id == super::create_bearing::ID
+-            && super::create_bearing::tick(world, self.position, state, bearing_rpm, &self.bearing_running);
++        let bearing = super::create_bearing::is_bearing(self.id)
++            && super::create_bearing::tick(
++                world,
++                self.position,
++                state,
++                bearing_rpm,
++                &self.bearing_running,
++            );
++        let bearing = bearing || windmill_changed;
+         if (changed || built || worked || processed || mixed || conveyed || bearing)
+             && let Some(entity) = world.get_block_entity(&self.position)
+             && entity
+diff --git a/crates/pumpkin-core/src/world/mod.rs b/crates/pumpkin-core/src/world/mod.rs
+--- a/crates/pumpkin-core/src/world/mod.rs
++++ b/crates/pumpkin-core/src/world/mod.rs
+@@ -5543,7 +5543,7 @@
+                     block_state_id,
+                     |old| {
+                         use crate::{block::entities::create_bearing, net::create_scene};
+-                        condition(old) && (old == block_state_id || old.to_block().name != create_bearing::ID
++                        condition(old) && (old == block_state_id || !create_bearing::is_bearing(old.to_block().name)
+                             || !create_bearing::locks_controller(
+                                 chunk.get_custom_data(create_scene::NAMESPACE, create_scene::SCENE), *position))
+                     },
+@@ -5838,7 +5838,7 @@
+                 Block::AIR.default_state.id
+             }
+         };
+-        let expected = expected.or_else(|| (broken_block.name == crate::block::entities::create_bearing::ID)
++        let expected = expected.or_else(|| crate::block::entities::create_bearing::is_bearing(broken_block.name)
+             .then_some(broken_block_state.id));
+         let guarded_replacement = if let Some(expected) = expected {
+             let state = replacement();

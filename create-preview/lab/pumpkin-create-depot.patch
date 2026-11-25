@@ -1,0 +1,623 @@
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -253,6 +253,7 @@
+     let mut manager = BlockRegistry::default();
+ 
+     // Blocks
++    manager.register(crate::block::blocks::create_depot::CreateDepotBlock);
+     manager.register(crate::block::blocks::create_water_wheel::CreateWaterWheel);
+     manager.register(crate::block::blocks::create_water_wheel::CreateLargeWaterWheel);
+     manager.register(AnvilBlock);
+--- a/crates/pumpkin-core/src/block/blocks/mod.rs
++++ b/crates/pumpkin-core/src/block/blocks/mod.rs
+@@ -118,6 +118,7 @@
+ pub mod cake;
+ pub mod cauldron;
+ pub mod composter;
++pub(crate) mod create_depot;
+ pub(crate) mod create_water_wheel;
+ pub mod dried_ghast;
+ pub mod frogspawn;
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -21,7 +21,9 @@
+ pub mod chiseled_bookshelf;
+ pub mod command_block;
+ pub mod comparator;
++pub(crate) mod create_depot;
+ pub(crate) mod create_kinetic;
++pub(crate) use create_kinetic::set_create_wheel_material;
+ pub(crate) fn create_kinetic_node(
+     state: BlockStateId,
+     pos: create_engine::kinetics::Pos,
+@@ -195,6 +197,11 @@
+     let y = nbt.get_int("y")?;
+     let z = nbt.get_int("z")?;
+     let pos = BlockPos::new(x, y, z);
++    if id == create_depot::CreateDepotBlockEntity::ID {
++        return Some(Arc::new(create_depot::CreateDepotBlockEntity::from_nbt(
++            nbt, pos,
++        )));
++    }
+     if create_kinetic::kinetic_id(id).is_some() {
+         return Some(Arc::new(create_kinetic::CreateKinetic::from_nbt(nbt, pos)));
+     }
+@@ -342,7 +349,9 @@
+ 
+ #[must_use]
+ pub fn has_block_block_entity(block: &Block) -> bool {
+-    BLOCK_ENTITY_TYPES.contains(&block.name) || is_create_kinetic_block(block)
++    BLOCK_ENTITY_TYPES.contains(&block.name)
++        || block.name == create_depot::CreateDepotBlockEntity::ID
++        || is_create_kinetic_block(block)
+ }
+ 
+ #[must_use]
+@@ -360,6 +369,9 @@
+         return Some(Arc::new(create_kinetic::CreateKinetic::new(id, position)));
+     }
+     match *name {
++        "depot" => Some(Arc::new(create_depot::CreateDepotBlockEntity::new(
++            position,
++        ))),
+         "furnace" => Some(Arc::new(furnace::FurnaceBlockEntity::new(position))),
+         "chest" => Some(Arc::new(chest::ChestBlockEntity::new(position))),
+         "trapped_chest" => Some(Arc::new(trapped_chest::TrappedChestBlockEntity::new(
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/blocks/create_depot.rs
+@@ -0,0 +1,154 @@
++use std::sync::Arc;
++
++use pumpkin_data::data_component_impl::EquipmentSlot;
++use pumpkin_data::{BlockDirection, entity::EntityType, item_stack::ItemStack};
++use pumpkin_inventory::screen_handler::InventoryPlayer;
++use pumpkin_macros::pumpkin_block;
++use pumpkin_util::{Hand, math::vector3::Vector3};
++
++use crate::{
++    block::{
++        BlockBehaviour, NormalUseArgs, PlacedArgs, UseWithItemArgs,
++        entities::create_depot::CreateDepotBlockEntity, registry::BlockActionResult,
++    },
++    entity::{Entity, EntityBase, item::ItemEntity, player::Player},
++    world::World,
++};
++
++#[pumpkin_block("create:depot")]
++pub struct CreateDepotBlock;
++
++impl BlockBehaviour for CreateDepotBlock {
++    fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
++        if args.hit.face != &BlockDirection::Up || shift_has_item(args.player) {
++            return BlockActionResult::Pass;
++        }
++        if interact(args.world, args.player, args.position, None, 3) {
++            BlockActionResult::SuccessServer
++        } else {
++            BlockActionResult::Pass
++        }
++    }
++
++    fn use_with_item(&self, args: UseWithItemArgs<'_>) -> BlockActionResult {
++        if args.hit.face != &BlockDirection::Up {
++            return BlockActionResult::PassToDefaultBlockAction;
++        }
++        if shift_has_item(args.player) {
++            return BlockActionResult::PassToDefaultBlockAction;
++        }
++
++        let item_key = args.item_stack.get_item().registry_key;
++        let put = !args.item_stack.is_empty()
++            && !matches!(item_key, "create:mechanical_arm" | "mechanical_arm");
++        let hand = if *args.equipment_slot == EquipmentSlot::OFF_HAND {
++            Hand::Left
++        } else {
++            Hand::Right
++        };
++        let incoming = put.then(|| (hand, args.item_stack.clone()));
++        let yaw = args.player.get_entity().yaw.load();
++        if interact(
++            args.world,
++            args.player,
++            args.position,
++            incoming,
++            horizontal_direction(yaw),
++        ) {
++            if put {
++                *args.item_stack = args.player.get_inventory().get_stack_in_hand(hand);
++            }
++            BlockActionResult::SuccessServer
++        } else {
++            BlockActionResult::PassToDefaultBlockAction
++        }
++    }
++
++    fn placed(&self, args: PlacedArgs<'_>) {
++        if args.world.get_block_entity(args.position).is_none() {
++            args.world
++                .add_block_entity(Arc::new(CreateDepotBlockEntity::new(*args.position)));
++        }
++    }
++}
++
++fn shift_has_item(player: &Player) -> bool {
++    player.get_entity().is_sneaking()
++        && [Hand::Right, Hand::Left]
++            .into_iter()
++            .any(|hand| !player.get_inventory().get_stack_in_hand(hand).is_empty())
++}
++
++fn interact(
++    world: &Arc<World>,
++    player: &Arc<Player>,
++    position: &pumpkin_util::math::position::BlockPos,
++    incoming: Option<(Hand, ItemStack)>,
++    direction: i32,
++) -> bool {
++    let Some(block_entity) = world.get_block_entity(position) else {
++        return false;
++    };
++    let Some(depot) = block_entity
++        .as_any()
++        .downcast_ref::<CreateDepotBlockEntity>()
++    else {
++        return false;
++    };
++    if !depot.is_supported() {
++        return false;
++    }
++
++    let inventory = player.get_inventory();
++    let incoming = incoming.map(|(hand, stack)| {
++        // Free the selected slot before returning items, so the final packet cannot overwrite them.
++        inventory.set_stack_in_hand(hand, ItemStack::EMPTY.clone());
++        stack
++    });
++    for mut stack in depot.swap_contents(incoming, direction) {
++        inventory.insert_stack_anywhere(&mut stack);
++        if !stack.is_empty() {
++            drop_overflow(world, player, stack);
++        }
++    }
++    player.sync_inventory_to_client();
++    world.update_block_entity(&block_entity);
++    true
++}
++
++fn drop_overflow(world: &Arc<World>, player: &Player, stack: ItemStack) {
++    let player_pos = player.get_entity().pos.load();
++    let entity = Entity::new(
++        world.clone(),
++        Vector3::new(player_pos.x, player_pos.y + 1.0, player_pos.z),
++        &EntityType::ITEM,
++    );
++    world.spawn_entity(Arc::new(ItemEntity::new_with_velocity(
++        entity,
++        stack,
++        Vector3::new(0.0, 0.2, 0.0),
++        10,
++    )));
++}
++
++fn horizontal_direction(yaw: f32) -> i32 {
++    match ((f64::from(yaw) / 90.0 + 0.5).floor() as i64 & 3) as u8 {
++        0 => 3, // south
++        1 => 4, // west
++        2 => 2, // north
++        _ => 5, // east
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::horizontal_direction;
++
++    #[test]
++    fn maps_yaw_to_create_direction_indices() {
++        assert_eq!(horizontal_direction(0.0), 3);
++        assert_eq!(horizontal_direction(90.0), 4);
++        assert_eq!(horizontal_direction(180.0), 2);
++        assert_eq!(horizontal_direction(270.0), 5);
++    }
++}
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_depot.rs
+@@ -0,0 +1,398 @@
++use std::any::Any;
++use std::array::from_fn;
++use std::sync::{
++    Arc, RwLock,
++    atomic::{AtomicBool, AtomicI32, Ordering},
++};
++
++use pumpkin_data::item_stack::ItemStack;
++use pumpkin_inventory::{Clearable, Inventory, sync_write_items_to_nbt};
++use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
++use pumpkin_util::math::position::BlockPos;
++
++use crate::{block::entities::BlockEntity, world::World};
++
++pub struct CreateDepotBlockEntity {
++    pub position: BlockPos,
++    pub items: RwLock<[ItemStack; Self::INVENTORY_SIZE]>,
++    pub dirty: AtomicBool,
++    held_direction: AtomicI32,
++    opaque_items: Option<NbtTag>,
++    opaque_held_item: Option<NbtCompound>,
++    opaque_output_buffer: Option<NbtCompound>,
++}
++
++impl BlockEntity for CreateDepotBlockEntity {
++    fn resource_location(&self) -> &'static str {
++        Self::ID
++    }
++
++    fn get_position(&self) -> BlockPos {
++        self.position
++    }
++
++    fn from_nbt(nbt: &NbtCompound, position: BlockPos) -> Self {
++        let mut items = from_fn(|_| ItemStack::EMPTY.clone());
++        let opaque_items = read_items_preserving_unknown(nbt, &mut items);
++        let held_direction = nbt
++            .get_compound("HeldItem")
++            .and_then(|held| held.get_int("InDirection"))
++            .filter(|direction| (0..6).contains(direction))
++            .unwrap_or(3);
++        let mut opaque_output_buffer = nbt
++            .get_compound("OutputBuffer")
++            .filter(|buffer| buffer.get_int("Size").is_some_and(|size| size != 8))
++            .cloned();
++        let mut opaque_held_item = None;
++
++        if let Some(held) = nbt.get_compound("HeldItem") {
++            if let Some(item) = held
++                .get_compound("Item")
++                .and_then(ItemStack::read_item_stack)
++            {
++                items[0] = item;
++            } else if held.has("Item") {
++                opaque_held_item = Some(held.clone());
++            }
++        }
++
++        if let Some(output_buffer) = nbt.get_compound("OutputBuffer")
++            && let Some(output_items) = output_buffer.get_list("Items")
++        {
++            for entry in output_items {
++                let Some(entry) = entry.extract_compound() else {
++                    opaque_output_buffer.get_or_insert_with(|| output_buffer.clone());
++                    break;
++                };
++                let Some(slot) = numeric_slot(entry) else {
++                    opaque_output_buffer.get_or_insert_with(|| output_buffer.clone());
++                    break;
++                };
++                let Some(stack) = ItemStack::read_item_stack(entry) else {
++                    opaque_output_buffer.get_or_insert_with(|| output_buffer.clone());
++                    break;
++                };
++                if !(0..8).contains(&slot) {
++                    opaque_output_buffer.get_or_insert_with(|| output_buffer.clone());
++                    break;
++                }
++                items[slot as usize + 1] = stack;
++            }
++        }
++
++        Self {
++            position,
++            items: RwLock::new(items),
++            dirty: AtomicBool::new(false),
++            held_direction: AtomicI32::new(held_direction),
++            opaque_items,
++            opaque_held_item,
++            opaque_output_buffer,
++        }
++    }
++
++    fn write_nbt(&self, nbt: &mut NbtCompound) {
++        let items = self
++            .items
++            .read()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        nbt.child_tags.remove("Items");
++        if let Some(opaque_items) = &self.opaque_items {
++            nbt.put("Items", opaque_items.clone());
++        } else {
++            sync_write_items_to_nbt(&*items, nbt);
++        }
++
++        nbt.child_tags.remove("HeldItem");
++        if let Some(opaque_held_item) = &self.opaque_held_item {
++            nbt.put_compound("HeldItem", opaque_held_item.clone());
++        } else if !items[0].is_empty() {
++            let mut held = NbtCompound::new();
++            held.put_float("Pos", 0.25);
++            held.put_float("PrevPos", 0.25);
++            held.put_float("Offset", 0.0);
++            held.put_float("PrevOffset", 0.0);
++            held.put_int("InSegment", 0);
++            held.put_int("Angle", 0);
++            held.put_int("InDirection", self.held_direction.load(Ordering::Relaxed));
++            let mut item = NbtCompound::new();
++            items[0].write_item_stack(&mut item);
++            held.put_compound("Item", item);
++            nbt.put_compound("HeldItem", held);
++        }
++
++        let output_buffer = self
++            .opaque_output_buffer
++            .clone()
++            .unwrap_or_else(|| output_buffer_nbt(&items[1..]));
++        nbt.put_compound("OutputBuffer", output_buffer);
++        nbt.child_tags.remove("DisplayItem");
++        nbt.child_tags.remove("DisplayCount");
++    }
++
++    fn chunk_data_nbt(&self) -> Option<NbtCompound> {
++        let mut nbt = NbtCompound::new();
++        self.write_nbt(&mut nbt);
++        Some(nbt)
++    }
++
++    fn get_inventory(self: Arc<Self>) -> Option<Arc<dyn Inventory>> {
++        // Do not expose generic hopper transfers; Create's empty-only adapters are out of scope.
++        None
++    }
++
++    fn on_block_replaced(self: Arc<Self>, world: &Arc<World>, position: &BlockPos) {
++        let inventory: Arc<dyn Inventory> = self;
++        world.scatter_inventory(position, &inventory);
++    }
++
++    fn is_dirty(&self) -> bool {
++        self.dirty.load(Ordering::Relaxed)
++    }
++
++    fn clear_dirty(&self) {
++        self.dirty.store(false, Ordering::Relaxed);
++    }
++
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++}
++
++impl CreateDepotBlockEntity {
++    pub const INVENTORY_SIZE: usize = 9;
++    pub const OUTPUT_BUFFER_SIZE: usize = 8;
++    pub const ID: &'static str = "create:depot";
++
++    #[must_use]
++    pub fn new(position: BlockPos) -> Self {
++        Self {
++            position,
++            items: RwLock::new(from_fn(|_| ItemStack::EMPTY.clone())),
++            dirty: AtomicBool::new(false),
++            held_direction: AtomicI32::new(3),
++            opaque_items: None,
++            opaque_held_item: None,
++            opaque_output_buffer: None,
++        }
++    }
++
++    #[must_use]
++    pub fn is_supported(&self) -> bool {
++        self.opaque_items.is_none()
++            && self.opaque_held_item.is_none()
++            && self.opaque_output_buffer.is_none()
++    }
++
++    pub fn swap_contents(&self, incoming: Option<ItemStack>, direction: i32) -> Vec<ItemStack> {
++        let mut items = self
++            .items
++            .write()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        let taken = items
++            .iter_mut()
++            .filter_map(|stack| {
++                if stack.is_empty() {
++                    None
++                } else {
++                    Some(std::mem::replace(stack, ItemStack::EMPTY.clone()))
++                }
++            })
++            .collect();
++        if let Some(stack) = incoming {
++            self.held_direction.store(direction, Ordering::Relaxed);
++            items[0] = stack;
++        }
++        self.mark_dirty();
++        taken
++    }
++}
++
++impl Inventory for CreateDepotBlockEntity {
++    fn size(&self) -> usize {
++        Self::INVENTORY_SIZE
++    }
++
++    fn is_empty(&self) -> bool {
++        self.items
++            .read()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .iter()
++            .all(ItemStack::is_empty)
++    }
++
++    fn get_stack(&self, slot: usize) -> ItemStack {
++        self.items
++            .read()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)[slot]
++            .clone()
++    }
++
++    fn remove_stack(&self, slot: usize) -> ItemStack {
++        let mut items = self
++            .items
++            .write()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        let removed = std::mem::replace(&mut items[slot], ItemStack::EMPTY.clone());
++        self.mark_dirty();
++        removed
++    }
++
++    fn remove_stack_specific(&self, slot: usize, amount: u8) -> ItemStack {
++        let mut items = self
++            .items
++            .write()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        let removed = if !items[slot].is_empty() && amount > 0 {
++            items[slot].split(amount)
++        } else {
++            ItemStack::EMPTY.clone()
++        };
++        self.mark_dirty();
++        removed
++    }
++
++    fn set_stack(&self, slot: usize, stack: ItemStack) {
++        self.items
++            .write()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)[slot] = stack;
++        self.mark_dirty();
++    }
++
++    fn get_max_count_per_stack(&self) -> u8 {
++        64
++    }
++
++    fn mark_dirty(&self) {
++        self.dirty.store(true, Ordering::Relaxed);
++    }
++
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++}
++
++impl Clearable for CreateDepotBlockEntity {
++    fn clear(&self) {
++        self.items
++            .write()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .fill_with(|| ItemStack::EMPTY.clone());
++        self.mark_dirty();
++    }
++}
++
++fn numeric_slot(compound: &NbtCompound) -> Option<i32> {
++    compound
++        .get_int("Slot")
++        .or_else(|| compound.get_byte("Slot").map(i32::from))
++}
++
++fn read_items_preserving_unknown(
++    nbt: &NbtCompound,
++    items: &mut [ItemStack; CreateDepotBlockEntity::INVENTORY_SIZE],
++) -> Option<NbtTag> {
++    let Some(list) = nbt.get_list("Items") else {
++        return nbt.child_tags.get("Items").cloned();
++    };
++    for entry in list {
++        let Some(compound) = entry.extract_compound() else {
++            return Some(NbtTag::List(list.to_vec()));
++        };
++        let Some(slot) = numeric_slot(compound) else {
++            return Some(NbtTag::List(list.to_vec()));
++        };
++        let Some(stack) = ItemStack::read_item_stack(compound) else {
++            return Some(NbtTag::List(list.to_vec()));
++        };
++        if !(0..CreateDepotBlockEntity::INVENTORY_SIZE as i32).contains(&slot) {
++            return Some(NbtTag::List(list.to_vec()));
++        }
++        items[slot as usize] = stack;
++    }
++    None
++}
++
++fn canonical_empty_output_buffer() -> NbtCompound {
++    let mut output_buffer = NbtCompound::new();
++    output_buffer.put_int("Size", CreateDepotBlockEntity::OUTPUT_BUFFER_SIZE as i32);
++    output_buffer.put_list("Items", Vec::new());
++    output_buffer
++}
++
++fn output_buffer_nbt(items: &[ItemStack]) -> NbtCompound {
++    let mut output_buffer = canonical_empty_output_buffer();
++    let output_items = items
++        .iter()
++        .enumerate()
++        .filter(|(_, stack)| !stack.is_empty())
++        .map(|(slot, stack)| {
++            let mut item = NbtCompound::new();
++            item.put_int("Slot", slot as i32);
++            stack.write_item_stack(&mut item);
++            NbtTag::Compound(item)
++        })
++        .collect();
++    output_buffer.put_list("Items", output_items);
++    output_buffer
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pumpkin_data::item::Item;
++
++    #[test]
++    fn writes_and_restores_depot_display_and_output_slots() {
++        let position = BlockPos::new(1, 2, 3);
++        let depot = CreateDepotBlockEntity::new(position);
++        assert!(
++            depot
++                .swap_contents(Some(ItemStack::new(3, &Item::DIAMOND)), 4)
++                .is_empty()
++        );
++        depot.set_stack(1, ItemStack::new(12, &Item::STONE));
++
++        let mut nbt = NbtCompound::new();
++        depot.write_nbt(&mut nbt);
++        let held = nbt.get_compound("HeldItem").unwrap();
++        assert_eq!(held.get_float("Pos"), Some(0.25));
++        assert_eq!(held.get_float("PrevPos"), Some(0.25));
++        assert_eq!(held.get_int("InDirection"), Some(4));
++        assert_eq!(held.get_compound("Item").unwrap().get_int("count"), Some(3));
++        let output = nbt.get_compound("OutputBuffer").unwrap();
++        assert_eq!(output.get_int("Size"), Some(8));
++        let entry = output.get_list("Items").unwrap()[0]
++            .extract_compound()
++            .unwrap();
++        assert_eq!(entry.get_int("Slot"), Some(0));
++        assert_eq!(entry.get_int("count"), Some(12));
++        assert!(!nbt.has("DisplayItem"));
++        assert!(!nbt.has("DisplayCount"));
++
++        let restored = CreateDepotBlockEntity::from_nbt(&nbt, position);
++        assert_eq!(restored.size(), 9);
++        assert_eq!(restored.get_stack(0).item_count, 3);
++        assert_eq!(restored.get_stack(1).item_count, 12);
++    }
++
++    #[test]
++    fn leaves_noncanonical_output_buffer_opaque() {
++        let position = BlockPos::new(0, 0, 0);
++        let mut nbt = NbtCompound::new();
++        let mut output = NbtCompound::new();
++        output.put_int("Size", 7);
++        output.put_string("FutureField", "preserve".into());
++        nbt.put_compound("OutputBuffer", output);
++        nbt.put_int("Items", 123);
++
++        let depot = CreateDepotBlockEntity::from_nbt(&nbt, position);
++        assert!(!depot.is_supported());
++        let mut written = NbtCompound::new();
++        depot.write_nbt(&mut written);
++        let output = written.get_compound("OutputBuffer").unwrap();
++        assert_eq!(output.get_int("Size"), Some(7));
++        assert_eq!(output.get_string("FutureField"), Some("preserve"));
++        assert_eq!(written.get_int("Items"), Some(123));
++    }
++}

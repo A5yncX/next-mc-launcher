@@ -1,0 +1,786 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_bearing.rs b/crates/pumpkin-core/src/block/entities/create_bearing.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_bearing.rs
+@@ -0,0 +1,566 @@
++use std::sync::{Arc, Mutex};
++
++use create_engine::{
++    contraption::{
++        Adhesion, Assembly, BlockRules, CaptureView, Cell, Rotation,
++        bearing::{Bearing, Mode},
++        plan_landing,
++    },
++    kinetics::Pos,
++    placement::Direction,
++};
++use pumpkin_data::{Block, BlockStateId};
++use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
++use pumpkin_util::{gamemode::GameMode, math::position::BlockPos};
++use pumpkin_world::chunk::ChunkDataEdit;
++
++use crate::{
++    block::registry::BlockRegistry,
++    entity::{EntityBase, player::Player},
++    net::create_scene::{GEOMETRY, NAMESPACE, POSES, SCENE},
++    world::World,
++};
++
++pub(crate) const ID: &str = "create:mechanical_bearing";
++const MAX_BLOCKS: usize = 32;
++const MAX_RECORDS: usize = 4; // Pinned Horizon's scene decoder limit.
++static EDIT: Mutex<()> = Mutex::new(());
++
++fn pos([x, y, z]: Pos) -> BlockPos {
++    BlockPos::new(x, y, z)
++}
++
++fn coords(p: BlockPos) -> Pos {
++    [p.0.x, p.0.y, p.0.z]
++}
++
++fn plus(a: Pos, b: Pos) -> Pos {
++    std::array::from_fn(|i| a[i] + b[i])
++}
++
++// shortcut: state-free vanilla cubes only; extend classification with block-entity capture.
++const PAYLOAD: &[(&str, Block, Adhesion)] = &[
++    ("minecraft:stone", Block::STONE, Adhesion::None),
++    ("minecraft:andesite", Block::ANDESITE, Adhesion::None),
++    ("minecraft:granite", Block::GRANITE, Adhesion::None),
++    ("minecraft:slime_block", Block::SLIME_BLOCK, Adhesion::Slime),
++    ("minecraft:honey_block", Block::HONEY_BLOCK, Adhesion::Honey),
++];
++
++fn payload(id: BlockStateId) -> Option<(&'static str, Adhesion)> {
++    PAYLOAD.iter().find_map(|&(name, ref block, adhesion)| {
++        (id == block.default_state.id).then_some((name, adhesion))
++    })
++}
++
++struct View<'a>(&'a World, BlockPos);
++
++impl CaptureView for View<'_> {
++    type Block = BlockStateId;
++
++    fn inspect(&self, p: Pos) -> Cell {
++        let p = pos(p);
++        if !self.0.is_in_build_limit(p) {
++            return Cell::OutsideWorld;
++        }
++        let Some(id) = self.0.get_block_state_id_if_loaded(&p) else {
++            return Cell::Unloaded;
++        };
++        if id == Block::AIR.default_state.id {
++            return Cell::Empty;
++        }
++        let Some((_, adhesion)) = payload(id) else {
++            return Cell::Block(BlockRules {
++                movable: false,
++                ..Default::default()
++            });
++        };
++        Cell::Block(BlockRules {
++            adhesion,
++            ..Default::default()
++        })
++    }
++
++    fn snapshot(&self, p: Pos) -> Option<BlockStateId> {
++        let p = pos(p);
++        (p.chunk_and_chunk_relative_position().0 == self.1.chunk_and_chunk_relative_position().0)
++            .then(|| self.0.get_block_state_id_if_loaded(&p))
++            .flatten()
++    }
++
++    fn glued(&self, _: Pos, _: Direction) -> bool {
++        false
++    }
++}
++
++fn vector(tag: &NbtCompound, key: &str) -> Option<Pos> {
++    tag.get_int_array(key)?.try_into().ok()
++}
++
++fn put_vector(tag: &mut NbtCompound, key: &str, value: Pos) {
++    tag.put(key, NbtTag::IntArray(value.to_vec().into()));
++}
++
++fn entry<'a>(scene: &'a NbtCompound, key: &str) -> Option<&'a [NbtTag]> {
++    scene.get_compound(key)?.get_list("Entries")
++}
++
++fn owner(entry: &NbtTag) -> Option<Pos> {
++    match entry {
++        NbtTag::Compound(entry) => vector(entry, "Controller"),
++        _ => None,
++    }
++}
++
++fn owned_entry<'a>(scene: &'a NbtCompound, key: &str, controller: Pos) -> Option<&'a NbtCompound> {
++    let mut entries = entry(scene, key)?
++        .iter()
++        .filter(|entry| owner(entry) == Some(controller));
++    let NbtTag::Compound(tag) = entries.next()? else {
++        return None;
++    };
++    entries.next().is_none().then_some(tag)
++}
++
++pub(crate) fn locks_controller(record: Option<NbtTag>, controller: BlockPos) -> bool {
++    let Some(NbtTag::Compound(scene)) = record else {
++        return false;
++    };
++    entry(&scene, GEOMETRY).is_some_and(|entries| {
++        entries
++            .iter()
++            .any(|entry| owner(entry) == Some(coords(controller)))
++    })
++}
++
++fn generation(scene: &NbtCompound) -> Option<i64> {
++    let geo = scene.get_compound(GEOMETRY)?;
++    let poses = scene.get_compound(POSES)?;
++    let generation = geo.get_long("Generation").filter(|&n| n > 0)?;
++    (geo.get_int("Version") == Some(2)
++        && poses.get_int("Version") == Some(1)
++        && poses.get_long("Generation") == Some(generation))
++    .then_some(generation)
++}
++
++struct Motion {
++    controller: Pos,
++    anchor: Pos,
++    axis: usize,
++    blocks: Vec<(Pos, BlockStateId)>,
++    angle: f32,
++    stalled: bool,
++}
++
++impl Motion {
++    fn read(scene: &NbtCompound, controller: Pos) -> Option<Self> {
++        generation(scene)?;
++        let geo = owned_entry(scene, GEOMETRY, controller)?;
++        let pose = owned_entry(scene, POSES, controller)?;
++        let anchor = vector(geo, "Anchor")?;
++        let axis = usize::try_from(geo.get_int("Axis")?).ok()?;
++        let angle = pose
++            .get_float("Angle")
++            .filter(|a| a.is_finite() && a.abs() < 360.0)?;
++        let data = geo.get_list("Blocks")?;
++        if !(1..=MAX_BLOCKS).contains(&data.len())
++            || axis > 2
++            || vector(pose, "Controller")? != controller
++        {
++            return None;
++        }
++        let mut blocks = Vec::with_capacity(data.len());
++        for block in data {
++            let NbtTag::Compound(block) = block else {
++                return None;
++            };
++            let local = vector(block, "Pos")?;
++            if local.iter().any(|p| p.unsigned_abs() > MAX_BLOCKS as u32)
++                || blocks.iter().any(|(p, _)| *p == local)
++            {
++                return None;
++            }
++            let name = block.get_compound("State")?.get_string("id")?;
++            let (_, kind, _) = PAYLOAD.iter().find(|(id, _, _)| *id == name)?;
++            blocks.push((local, kind.default_state.id));
++        }
++        if !blocks.iter().any(|(p, _)| *p == [0; 3]) {
++            return None;
++        }
++        Some(Self {
++            controller,
++            anchor,
++            axis,
++            blocks,
++            angle,
++            stalled: pose.get_bool("Stalled").unwrap_or(false),
++        })
++    }
++
++    fn write(
++        &self,
++        old: &NbtCompound,
++        generation: i64,
++        previous: f32,
++        rpm: f32,
++    ) -> Option<NbtCompound> {
++        let mut geo = NbtCompound::new();
++        put_vector(&mut geo, "Controller", self.controller);
++        put_vector(&mut geo, "Anchor", self.anchor);
++        geo.put_int("Axis", self.axis as i32);
++        geo.put_bool("ReturnHome", false);
++        geo.put_list(
++            "Blocks",
++            self.blocks
++                .iter()
++                .map(|&(p, id)| {
++                    let mut state = NbtCompound::new();
++                    state.put_string("id", payload(id).expect("validated bearing block").0.into());
++                    let mut block = NbtCompound::new();
++                    put_vector(&mut block, "Pos", p);
++                    block.put_compound("State", state);
++                    NbtTag::Compound(block)
++                })
++                .collect(),
++        );
++        let mut pose = NbtCompound::new();
++        put_vector(&mut pose, "Controller", self.controller);
++        pose.put_float("Angle", self.angle);
++        pose.put_float("PreviousAngle", previous);
++        pose.put_float("Speed", rpm);
++        pose.put_bool("Stalled", self.stalled);
++        scene(old, self.controller, generation, Some(geo), Some(pose))
++    }
++
++    fn matches(&self, controller: Pos, anchor: Pos, axis: usize) -> bool {
++        self.controller == controller && self.anchor == anchor && self.axis == axis
++    }
++}
++
++fn scene(
++    old: &NbtCompound,
++    controller: Pos,
++    generation: i64,
++    geometry: Option<NbtCompound>,
++    pose: Option<NbtCompound>,
++) -> Option<NbtCompound> {
++    let mut scene = old.clone();
++    for (key, version, data) in [(GEOMETRY, 2, geometry), (POSES, 1, pose)] {
++        let mut content = if old.is_empty() {
++            NbtCompound::new()
++        } else {
++            old.get_compound(key)?.clone()
++        };
++        let mut entries: Vec<_> = if content.is_empty() {
++            vec![]
++        } else {
++            content
++                .get_list("Entries")?
++                .iter()
++                .filter(|e| owner(e) != Some(controller))
++                .cloned()
++                .collect()
++        };
++        entries.extend(data.into_iter().map(NbtTag::Compound));
++        if entries.len() > MAX_RECORDS {
++            return None;
++        }
++        content.put_int("Version", version);
++        content.put_long("Generation", generation);
++        content.put_list("Entries", entries);
++        scene.put_compound(key, content);
++    }
++    Some(scene)
++}
++
++pub(super) fn tick(
++    world: &Arc<World>,
++    controller: BlockPos,
++    state: BlockStateId,
++    rpm: f32,
++    running: &std::sync::atomic::AtomicBool,
++) -> bool {
++    use std::sync::atomic::Ordering::Relaxed;
++    let _guard = EDIT
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner);
++    let (_, previous, motion) = read(world, controller, state).unwrap_or_default();
++    let Some(mut motion) = motion else {
++        return running.swap(false, Relaxed);
++    };
++    let changed = !running.swap(true, Relaxed);
++    let angle = motion.angle;
++    let rpm = if motion.stalled { 0.0 } else { rpm };
++    let mut bearing = Bearing::resume(angle);
++    bearing.tick(rpm, rpm, Mode::Place, motion.stalled, || false);
++    motion.angle = bearing.angle();
++    let previous_speed =
++        owned_entry(&previous, POSES, coords(controller)).and_then(|pose| pose.get_float("Speed"));
++    if (motion.angle != angle || previous_speed != Some(rpm))
++        && let Some(new) = motion.write(&previous, generation(&previous).unwrap(), angle, rpm)
++    {
++        commit(world, controller, state, Some(previous), new, &[]);
++    }
++    changed
++}
++
++fn read(
++    world: &World,
++    controller: BlockPos,
++    state: BlockStateId,
++) -> Option<(Option<NbtTag>, NbtCompound, Option<Motion>)> {
++    let previous = world
++        .level
++        .read_chunk_sync(&controller.chunk_and_chunk_relative_position().0, |chunk| {
++            chunk.get_custom_data(NAMESPACE, SCENE)
++        })?;
++    let scene = match &previous {
++        None => NbtCompound::new(),
++        Some(NbtTag::Compound(scene)) => scene.clone(),
++        Some(_) => return None,
++    };
++    let facing = facing(state)?;
++    let anchor = plus(coords(controller), facing.vector());
++    let motion = Motion::read(&scene, coords(controller))
++        .filter(|m| m.matches(coords(controller), anchor, facing.axis().index()));
++    Some((previous, scene, motion))
++}
++
++fn facing(state: BlockStateId) -> Option<Direction> {
++    let block = state.to_block();
++    if block.name != ID {
++        return None;
++    }
++    let facing = block
++        .properties(state)?
++        .to_props()
++        .into_iter()
++        .find(|p| p.key().to_str() == "facing")?
++        .value_str();
++    Direction::ALL.into_iter().find(|d| d.name() == facing)
++}
++
++fn commit(
++    world: &Arc<World>,
++    controller: BlockPos,
++    state: BlockStateId,
++    old: Option<NbtCompound>,
++    next: NbtCompound,
++    edits: &[(BlockPos, BlockStateId, BlockStateId)],
++) -> bool {
++    let mut changes = Vec::with_capacity(edits.len() + 1);
++    changes.push((controller, state, state));
++    changes.extend_from_slice(edits);
++    let expected = old.map(NbtTag::Compound);
++    world.commit_create_scene(
++        controller,
++        &changes,
++        ChunkDataEdit {
++            namespace: NAMESPACE,
++            key: SCENE,
++            expected: expected.as_ref(),
++            replacement: Some(NbtTag::Compound(next)),
++        },
++    )
++}
++
++pub(crate) fn interact(world: &Arc<World>, player: &Player, controller: BlockPos) -> bool {
++    let Some(state) = world.get_block_state_id_if_loaded(&controller) else {
++        return false;
++    };
++    let Some(facing) = facing(state) else {
++        return false;
++    };
++    if !matches!(
++        player.gamemode.load(),
++        GameMode::Survival | GameMode::Creative
++    ) || player.get_entity().is_sneaking()
++        || world.is_in_spawn_protection(player, &controller)
++    {
++        return false;
++    }
++    let _guard = EDIT
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner);
++    let Some((previous, old, motion)) = read(world, controller, state) else {
++        return true;
++    };
++    let current_generation = generation(&old).unwrap_or(0);
++    let Some(next_generation) = current_generation.checked_add(1) else {
++        return true;
++    };
++    let air = Block::AIR.default_state.id;
++    let anchor = plus(coords(controller), facing.vector());
++    let axis = facing.axis();
++    let in_scope = |p: BlockPos| {
++        p != controller
++            && p.chunk_and_chunk_relative_position().0
++                == controller.chunk_and_chunk_relative_position().0
++            && world.is_in_build_limit(p)
++            && !world.is_in_spawn_protection(player, &p)
++            && world.worldborder.lock().is_ok_and(|b| {
++                b.is_within_bounds(f64::from(p.0.x), f64::from(p.0.z), 0.0)
++                    && b.is_within_bounds(
++                        f64::from(p.0.x) + 0.99999,
++                        f64::from(p.0.z) + 0.99999,
++                        0.0,
++                    )
++            })
++    };
++    if let Some(mut motion) = motion {
++        let turn = Rotation::new(anchor, axis, motion.angle)
++            .expect("validated angle")
++            .snapped();
++        let plan = plan_landing(
++            &motion.blocks,
++            anchor,
++            turn,
++            |id, _| Some(*id),
++            |p, id| {
++                let p = pos(p);
++                in_scope(p)
++                    && world.get_block_state_id_if_loaded(&p) == Some(air)
++                    && id
++                        .to_state()
++                        .get_block_collision_shapes_at(&p)
++                        .all(|shape| {
++                            !BlockRegistry::has_blocking_entity_in_box(world, &shape.at_pos(p))
++                        })
++            },
++        );
++        if let Ok(plan) = plan
++            && let Some(cleared) = scene(&old, motion.controller, next_generation, None, None)
++        {
++            let edits: Vec<_> = plan.into_iter().map(|(p, id)| (pos(p), air, id)).collect();
++            if commit(world, controller, state, Some(old.clone()), cleared, &edits) {
++                return true;
++            }
++        }
++        motion.stalled = true;
++        if let Some(stalled) = motion.write(&old, current_generation, motion.angle, 0.0) {
++            commit(world, controller, state, Some(old), stalled, &[]);
++        }
++    } else if (previous.is_none()
++        || (current_generation > 0
++            && [GEOMETRY, POSES].into_iter().all(|key| {
++                entry(&old, key).is_some_and(|entries| {
++                    entries
++                        .iter()
++                        .all(|entry| owner(entry).is_some_and(|owner| owner != coords(controller)))
++                })
++            })))
++        && super::create_kinetic::rpm_at(world, &controller).is_some_and(|rpm| rpm != 0.0)
++        && let Ok(assembly) = Assembly::capture(
++            &View(world, controller),
++            anchor,
++            Some(coords(controller)),
++            None,
++            MAX_BLOCKS,
++        )
++        && !assembly.blocks().is_empty()
++    {
++        let blocks = assembly.blocks().to_vec();
++        let edits: Vec<_> = blocks
++            .iter()
++            .map(|&(local, id)| (pos(plus(anchor, local)), id, air))
++            .collect();
++        // A running assembly must be able to land at any snapped angle within this chunk.
++        if [0.0, 90.0, 180.0, 270.0].into_iter().all(|angle| {
++            let turn = Rotation::new(anchor, axis, angle)
++                .expect("finite quarter turn")
++                .snapped();
++            plan_landing(
++                &blocks,
++                anchor,
++                turn,
++                |id, _| Some(*id),
++                |p, _| in_scope(pos(p)),
++            )
++            .is_ok()
++        }) {
++            let motion = Motion {
++                controller: coords(controller),
++                anchor,
++                axis: axis.index(),
++                blocks,
++                angle: 0.0,
++                stalled: false,
++            };
++            if let Some(captured) = motion.write(&old, next_generation, 0.0, 0.0) {
++                commit(
++                    world,
++                    controller,
++                    state,
++                    previous.map(|_| old),
++                    captured,
++                    &edits,
++                );
++            }
++        }
++    }
++    true
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn motion_round_trips_exact_blocks_and_pose_without_owning_empty_scene() {
++        let motion = Motion {
++            controller: [-15, 5, -5],
++            anchor: [-15, 6, -5],
++            axis: 1,
++            blocks: vec![
++                ([0, 0, 0], Block::SLIME_BLOCK.default_state.id),
++                ([1, 0, 0], Block::STONE.default_state.id),
++            ],
++            angle: -90.0,
++            stalled: true,
++        };
++        let empty = NbtCompound::new();
++        let encoded = motion.write(&empty, 12, -87.0, 0.0).unwrap();
++        let loaded = Motion::read(&encoded, motion.controller).unwrap();
++        assert!(loaded.matches(motion.controller, motion.anchor, motion.axis));
++        assert_eq!(loaded.blocks, motion.blocks);
++        assert_eq!(loaded.angle, -90.0);
++        assert!(loaded.stalled);
++        assert!(locks_controller(
++            Some(NbtTag::Compound(encoded.clone())),
++            pos(motion.controller)
++        ));
++        assert!(!locks_controller(
++            Some(NbtTag::Compound(
++                scene(&encoded, motion.controller, 13, None, None).unwrap()
++            )),
++            pos(motion.controller)
++        ));
++    }
++
++    #[test]
++    fn edits_preserve_unrelated_scene_data_and_other_controllers() {
++        let mut scene_data = scene(&NbtCompound::new(), [0; 3], 1, None, None).unwrap();
++        scene_data.put_int("ServerOnly", 42);
++        for x in 0..MAX_RECORDS as i32 {
++            let motion = Motion {
++                controller: [x, 0, 0],
++                anchor: [x, 1, 0],
++                axis: 1,
++                blocks: vec![([0; 3], Block::STONE.default_state.id)],
++                angle: x as f32,
++                stalled: false,
++            };
++            scene_data = motion
++                .write(&scene_data, i64::from(x) + 2, 0.0, 32.0)
++                .unwrap();
++        }
++        let mut extra = Motion::read(&scene_data, [0; 3]).unwrap();
++        extra.controller = [9, 0, 0];
++        assert!(extra.write(&scene_data, 6, 0.0, 32.0).is_none());
++        let cleared = scene(&scene_data, [0; 3], 6, None, None).unwrap();
++        assert_eq!(cleared.get_int("ServerOnly"), Some(42));
++        assert!(Motion::read(&cleared, [0; 3]).is_none());
++        assert_eq!(Motion::read(&cleared, [1, 0, 0]).unwrap().angle, 1.0);
++        assert_eq!(generation(&cleared), Some(6));
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -156,6 +156,7 @@
+     crank_until: AtomicI64,
+     material: AtomicU16,
+     structure_ready: AtomicBool,
++    bearing_running: AtomicBool,
+     drill: Option<Box<drill::Drill>>,
+     saw_processing: Option<Box<Mutex<SawProcessing>>>,
+     mixer: Option<Box<Mutex<mixer::Mixer>>>,
+@@ -430,6 +431,7 @@
+             crank_until: AtomicI64::new(i64::MIN),
+             material: AtomicU16::new(Item::SPRUCE_PLANKS.id),
+             structure_ready: AtomicBool::new(false),
++            bearing_running: AtomicBool::new(false),
+             drill: matches!(id, drill::ID | saw::ID).then(|| Box::new(drill::Drill::new())),
+             saw_processing: (id == saw::ID).then(|| Box::new(Mutex::new(SawProcessing::default()))),
+             mixer: (id == mixer::ID).then(|| Box::new(Mutex::new(mixer::Mixer::default()))),
+@@ -665,6 +667,9 @@
+         let id = nbt.get_string("id").and_then(kinetic_id).unwrap_or(COG);
+         // The next tick recalculates the readings once the neighborhood is loaded.
+         let mut entity = Self::new(id, position);
++        if id == super::create_bearing::ID {
++            entity.bearing_running = AtomicBool::new(nbt.get_bool("Running").unwrap_or(false));
++        }
+         if id == belt::ID {
+             let segment = belt::Segment::read(nbt);
+             if let Some(controller) = segment.filter(|part| part.index == 0) {
+@@ -763,6 +768,9 @@
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
+         tag.put_float("Speed", readings.rpm);
++        if self.id == super::create_bearing::ID {
++            tag.put_bool("Running", self.bearing_running.load(Ordering::Relaxed));
++        }
+         let segment = *self
+             .belt
+             .lock()
+@@ -1148,6 +1156,7 @@
+                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                 .tick(world, self.position, next.rpm)
+         });
++        let bearing_rpm = next.rpm;
+         let (changed, changed_signal) = {
+             let mut readings = self
+                 .readings
+@@ -1186,7 +1195,9 @@
+             *readings = next;
+             (changed || press_changed, changed_signal)
+         };
+-        if (changed || built || worked || processed || mixed || conveyed)
++        let bearing = self.id == super::create_bearing::ID
++            && super::create_bearing::tick(world, self.position, state, bearing_rpm, &self.bearing_running);
++        if (changed || built || worked || processed || mixed || conveyed || bearing)
+             && let Some(entity) = world.get_block_entity(&self.position)
+             && entity
+                 .as_any()
+diff --git a/crates/pumpkin-core/src/block/entities/mod.rs b/crates/pumpkin-core/src/block/entities/mod.rs
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -22,6 +22,7 @@
+ pub mod command_block;
+ pub mod comparator;
+ pub(crate) mod create_basin;
++pub(crate) mod create_bearing;
+ pub(crate) mod create_chute;
+ pub(crate) mod create_crusher;
+ pub(crate) mod create_deployer;
+diff --git a/crates/pumpkin-core/src/block/registry.rs b/crates/pumpkin-core/src/block/registry.rs
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -639,7 +639,7 @@
+             || resource_name.ends_with("_raft")
+     }
+ 
+-    fn has_blocking_entity_in_box(world: &World, placed_box: &BoundingBox) -> bool {
++    pub(crate) fn has_blocking_entity_in_box(world: &World, placed_box: &BoundingBox) -> bool {
+         let players = world.players.load();
+         if players.iter().any(|player| {
+             Self::entity_blocks_block_placement(player.as_ref())
+diff --git a/crates/pumpkin-core/src/net/create_scene.rs b/crates/pumpkin-core/src/net/create_scene.rs
+--- a/crates/pumpkin-core/src/net/create_scene.rs
++++ b/crates/pumpkin-core/src/net/create_scene.rs
+@@ -3,10 +3,10 @@
+ use pumpkin_world::chunk::ChunkData;
+ 
+ pub(crate) const CHANNEL: &str = "horizon:attachment_sync";
+-const NAMESPACE: &str = "create";
+-const SCENE: &str = "contraption_scene";
+-const GEOMETRY: &str = "moving_structures";
+-const POSES: &str = "moving_structure_poses";
++pub(crate) const NAMESPACE: &str = "create";
++pub(crate) const SCENE: &str = "contraption_scene";
++pub(crate) const GEOMETRY: &str = "moving_structures";
++pub(crate) const POSES: &str = "moving_structure_poses";
+ const MAX_PAYLOAD: usize = 1_048_576;
+ 
+ pub(crate) fn snapshot(chunk: &ChunkData) -> Option<Vec<u8>> {
+@@ -16,7 +16,7 @@
+     encode(chunk.x, chunk.z, &scene)
+ }
+ 
+-fn encode(x: i32, z: i32, scene: &NbtCompound) -> Option<Vec<u8>> {
++pub(crate) fn encode(x: i32, z: i32, scene: &NbtCompound) -> Option<Vec<u8>> {
+     let geometry = scene.get_compound(GEOMETRY)?;
+     let poses = scene.get_compound(POSES)?;
+     let generation = geometry.get_long("Generation").filter(|&n| n > 0)?;
+diff --git a/crates/pumpkin-core/src/net/java/play/use_item_on.rs b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+--- a/crates/pumpkin-core/src/net/java/play/use_item_on.rs
++++ b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+@@ -125,7 +125,9 @@
+             return Ok(());
+         }
+ 
+-        if crate::block::blocks::create_belt::interact(&world, player, position, &mut item)
++        if (matches!(hand, Hand::Right) && held_item_empty && off_hand_item_empty
++            && crate::block::entities::create_bearing::interact(&world, player, position))
++            || crate::block::blocks::create_belt::interact(&world, player, position, &mut item)
+             || crate::block::blocks::create_material::interact(&world, player, position, &mut item)
+             || crate::block::entities::create_mechanical_crafter::interact(
+                 &world, player, position, face, &mut item,
+diff --git a/crates/pumpkin-core/src/net/mod.rs b/crates/pumpkin-core/src/net/mod.rs
+--- a/crates/pumpkin-core/src/net/mod.rs
++++ b/crates/pumpkin-core/src/net/mod.rs
+@@ -33,7 +33,7 @@
+ pub mod bedrock;
+ pub mod chat;
+ pub mod chunk_sender;
+-mod create_scene;
++pub(crate) mod create_scene;
+ pub use chunk_sender::ChunkSender;
+ pub mod java;
+ pub mod lan_broadcast;
+diff --git a/crates/pumpkin-core/src/world/mod.rs b/crates/pumpkin-core/src/world/mod.rs
+--- a/crates/pumpkin-core/src/world/mod.rs
++++ b/crates/pumpkin-core/src/world/mod.rs
+@@ -5502,9 +5502,9 @@
+         if !self.is_in_build_limit(*position) {
+             return Block::AIR.default_state.id;
+         }
+-        let replaced_block_state_id = self
+-            .write_block_state_if(position, block_state_id, |_| true)
+-            .unwrap_or(Block::AIR.default_state.id);
++        let Some(replaced_block_state_id) = self.write_block_state_if(position, block_state_id, |_| true) else {
++            return self.get_block_state_id_if_loaded(position).unwrap_or(Block::AIR.default_state.id);
++        }; 
+         self.on_block_state_set(position, replaced_block_state_id, block_state_id, flags)
+     }
+ 
+@@ -5541,7 +5541,12 @@
+                     relative.y,
+                     relative.z as usize,
+                     block_state_id,
+-                    &condition,
++                    |old| {
++                        use crate::{block::entities::create_bearing, net::create_scene};
++                        condition(old) && (old == block_state_id || old.to_block().name != create_bearing::ID
++                            || !create_bearing::locks_controller(
++                                chunk.get_custom_data(create_scene::NAMESPACE, create_scene::SCENE), *position))
++                    },
+                 )?;
+                 // Mark chunk dirty if it isn't already
+                 if replaced_block_state_id != block_state_id && !chunk.is_dirty() {
+@@ -5550,6 +5555,41 @@
+                 Some(replaced_block_state_id)
+             })
+             .flatten()
++    }
++
++    pub(crate) fn commit_create_scene(
++        self: &Arc<Self>,
++        controller: BlockPos,
++        edits: &[(BlockPos, BlockStateId, BlockStateId)],
++        record: pumpkin_world::chunk::ChunkDataEdit<'_>,
++    ) -> bool {
++        use crate::net::create_scene;
++        use pumpkin_protocol::java::client::play::CCustomPayload;
++        let (key, _) = controller.chunk_and_chunk_relative_position();
++        let Some(changes) = edits.iter().map(|&(p, before, after)| {
++            let (chunk, relative) = p.chunk_and_chunk_relative_position();
++            (chunk == key && self.is_in_build_limit(p))
++                .then_some((relative.x as usize, relative.y, relative.z as usize, before, after))
++        }).collect::<Option<Vec<_>>>() else { return false };
++        let Some(packet) = self.level.read_chunk_sync(&key, |chunk| {
++            // Build the packet before committing so serialization failure cannot hide the assembly.
++            let data = create_scene::encode(key.x, key.y, match record.replacement.as_ref()? {
++                pumpkin_nbt::tag::NbtTag::Compound(scene) => scene,
++                _ => return None,
++            })?;
++            chunk.compare_set_blocks(&changes, Some(pumpkin_world::chunk::ChunkDataEdit {
++                replacement: record.replacement.clone(),
++                ..record
++            }))?;
++            Some(data)
++        }).flatten() else { return false };
++        for &(pos, before, after) in edits {
++            if before != after {
++                self.on_block_state_set(&pos, before, after, BlockFlags::NOTIFY_ALL | BlockFlags::MOVED);
++            }
++        }
++        self.broadcast_to_chunk(key, &CCustomPayload::new(create_scene::CHANNEL, &packet));
++        true
+     }
+ 
+     /// Everything `set_block_state` does after the chunk write: callbacks, neighbour updates,
+@@ -5798,6 +5838,8 @@
+                 Block::AIR.default_state.id
+             }
+         };
++        let expected = expected.or_else(|| (broken_block.name == crate::block::entities::create_bearing::ID)
++            .then_some(broken_block_state.id));
+         let guarded_replacement = if let Some(expected) = expected {
+             let state = replacement();
+             self.set_block_state_if(position, state, flags, |id| id == expected)?;

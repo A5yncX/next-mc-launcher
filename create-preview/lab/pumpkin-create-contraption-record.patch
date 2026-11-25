@@ -1,0 +1,205 @@
+diff --git a/crates/pumpkin-world/src/chunk/mod.rs b/crates/pumpkin-world/src/chunk/mod.rs
+--- a/crates/pumpkin-world/src/chunk/mod.rs
++++ b/crates/pumpkin-world/src/chunk/mod.rs
+@@ -6,7 +6,7 @@
+ use pumpkin_data::fluid::Fluid;
+ use pumpkin_data::tag::Block::MINECRAFT_LEAVES;
+ use pumpkin_data::{Block, BlockState, BlockStateId};
+-use pumpkin_nbt::compound::NbtCompound;
++use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
+ use pumpkin_util::math::position::BlockPos;
+ use rustc_hash::{FxHashMap, FxHashSet};
+ 
+@@ -82,6 +82,13 @@
+     pub dirty: AtomicBool,
+     pub inhabited_time: AtomicU64,
+     pub custom_data: std::sync::Mutex<NbtCompound>,
++}
++
++pub struct ChunkDataEdit<'a> {
++    pub namespace: &'a str,
++    pub key: &'a str,
++    pub expected: Option<&'a NbtTag>,
++    pub replacement: Option<NbtTag>,
+ }
+ 
+ pub struct ChunkEntityData {
+@@ -706,15 +713,16 @@
+         &self,
+         updates: impl IntoIterator<Item = (usize, i32, usize, BlockStateId)>,
+     ) -> Vec<(usize, i32, usize, BlockStateId)> {
+-        self.set_blocks_batch_checked(updates, &[])
++        self.set_blocks_batch_checked(updates, &[], None)
+             .expect("unchecked batch")
+     }
+ 
+-    /// Compare every preimage under the same palette write lock before changing any block.
+-    /// Only covers one chunk's blocks; moving-structure records need a separate storage transaction.
++    /// Compare every block preimage and the optional namespaced record before committing.
++    /// Both chunk serializers take the palette lock before reading custom data.
+     pub fn compare_set_blocks(
+         &self,
+         edits: &[(usize, i32, usize, BlockStateId, BlockStateId)],
++        data: Option<ChunkDataEdit<'_>>,
+     ) -> Option<Vec<(usize, i32, usize, BlockStateId)>> {
+         let mut unique = FxHashSet::default();
+         if !edits
+@@ -728,13 +736,14 @@
+             .map(|&(x, y, z, before, _)| (x, y, z, before))
+             .collect();
+         let updates = edits.iter().map(|&(x, y, z, _, after)| (x, y, z, after));
+-        self.set_blocks_batch_checked(updates, &expected)
++        self.set_blocks_batch_checked(updates, &expected, data)
+     }
+ 
+     fn set_blocks_batch_checked(
+         &self,
+         updates: impl IntoIterator<Item = (usize, i32, usize, BlockStateId)>,
+         expected: &[(usize, i32, usize, BlockStateId)],
++        data: Option<ChunkDataEdit<'_>>,
+     ) -> Option<Vec<(usize, i32, usize, BlockStateId)>> {
+         let min_y = self.section.min_y;
+         let mut results = Vec::new();
+@@ -754,6 +763,29 @@
+                 return None;
+             }
+         }
++        let data_change = if let Some(edit) = data {
++            let custom = self
++                .custom_data
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++            let namespace = match custom.get(edit.namespace) {
++                Some(NbtTag::Compound(tag)) => Some(tag),
++                Some(_) => return None,
++                None => None,
++            };
++            if namespace.and_then(|tag| tag.get(edit.key)) != edit.expected {
++                return None;
++            }
++            let mut namespace = namespace.cloned().unwrap_or_default();
++            if let Some(replacement) = edit.replacement {
++                namespace.put(edit.key, replacement);
++            } else {
++                namespace.child_tags.remove(edit.key);
++            }
++            Some((custom, edit.namespace, namespace))
++        } else {
++            None
++        };
+         let mut random_tick_sections_guard = self
+             .section
+             .random_tick_sections
+@@ -826,6 +858,14 @@
+             }
+         }
+ 
++        if let Some((mut custom, name, namespace)) = data_change {
++            if namespace.is_empty() {
++                custom.child_tags.remove(name);
++            } else {
++                custom.put_compound(name, namespace);
++            }
++            modified = true;
++        }
+         if modified {
+             self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+         }
+@@ -1123,27 +1163,91 @@
+         let edits = [(1, 0, 1, stone, air), (1, 16, 1, air, stone)];
+         assert!(
+             chunk
+-                .compare_set_blocks(&[edits[0], (1, 16, 1, dirt, stone)])
++                .compare_set_blocks(&[edits[0], (1, 16, 1, dirt, stone)], None)
+                 .is_none()
+         );
+         assert!(
+             chunk
+-                .compare_set_blocks(&[edits[0], (16, 16, 1, air, stone)])
++                .compare_set_blocks(&[edits[0], (16, 16, 1, air, stone)], None)
+                 .is_none()
+         );
+         assert!(
+             chunk
+-                .compare_set_blocks(&[edits[0], (1, i32::MIN, 1, air, stone)])
++                .compare_set_blocks(&[edits[0], (1, i32::MIN, 1, air, stone)], None)
+                 .is_none()
+         );
+-        assert!(chunk.compare_set_blocks(&[edits[0], edits[0]]).is_none());
++        assert!(
++            chunk
++                .compare_set_blocks(&[edits[0], edits[0]], None)
++                .is_none()
++        );
+         assert_eq!(
+-            chunk.compare_set_blocks(&edits).unwrap(),
++            chunk.compare_set_blocks(&edits, None).unwrap(),
+             [(1, 0, 1, stone), (1, 16, 1, air)]
+         );
+-        assert!(chunk.compare_set_blocks(&edits).is_none());
++        assert!(chunk.compare_set_blocks(&edits, None).is_none());
+         assert_eq!(chunk.section.get_block_absolute_y(1, 0, 1), Some(air));
+         assert_eq!(chunk.section.get_block_absolute_y(1, 16, 1), Some(stone));
++    }
++
++    #[test]
++    fn assembly_ownership_and_blocks_round_trip_together() {
++        use pumpkin_nbt::tag::NbtTag;
++        use pumpkin_util::math::vector2::Vector2;
++        let chunk = super::ChunkData::empty(0, 0);
++        let stone = Block::STONE.default_state.id;
++        let air = Block::AIR.default_state.id;
++        let record = NbtTag::IntArray(vec![1, 0, 1].into());
++        let edit = |expected, replacement| super::ChunkDataEdit {
++            namespace: "create",
++            key: "assembly",
++            expected,
++            replacement,
++        };
++        chunk.set_block_absolute_y(1, 0, 1, stone);
++        chunk.set_custom_data("create", "other", NbtTag::Int(5));
++        assert!(
++            chunk
++                .compare_set_blocks(
++                    &[(1, 0, 1, air, stone)],
++                    Some(edit(None, Some(record.clone())))
++                )
++                .is_none()
++        );
++        assert!(
++            chunk
++                .compare_set_blocks(&[(1, 0, 1, stone, air)], Some(edit(Some(&record), None)))
++                .is_none()
++        );
++        assert_eq!(chunk.get_custom_data("create", "assembly"), None);
++        assert_eq!(chunk.section.get_block_absolute_y(1, 0, 1), Some(stone));
++        assert!(
++            chunk
++                .compare_set_blocks(
++                    &[(1, 0, 1, stone, air)],
++                    Some(edit(None, Some(record.clone())))
++                )
++                .is_some()
++        );
++        for bytes in [chunk.internal_to_bytes(), chunk.internal_to_pump_bytes()] {
++            let loaded = super::ChunkData::internal_from_bytes(&bytes, Vector2::new(0, 0)).unwrap();
++            assert_eq!(loaded.section.get_block_absolute_y(1, 0, 1), Some(air));
++            assert_eq!(
++                loaded.get_custom_data("create", "assembly").as_ref(),
++                Some(&record)
++            );
++            assert!(
++                loaded
++                    .compare_set_blocks(&[(1, 0, 1, air, stone)], Some(edit(Some(&record), None)))
++                    .is_some()
++            );
++            assert_eq!(loaded.section.get_block_absolute_y(1, 0, 1), Some(stone));
++            assert_eq!(loaded.get_custom_data("create", "assembly"), None);
++            assert_eq!(
++                loaded.get_custom_data("create", "other"),
++                Some(NbtTag::Int(5))
++            );
++        }
+     }
+ 
+     #[test]

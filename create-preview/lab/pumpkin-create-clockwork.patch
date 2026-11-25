@@ -1,0 +1,628 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_bearing.rs b/crates/pumpkin-core/src/block/entities/create_bearing.rs
+--- a/crates/pumpkin-core/src/block/entities/create_bearing.rs
++++ b/crates/pumpkin-core/src/block/entities/create_bearing.rs
+@@ -4,13 +4,14 @@
+     contraption::{
+         Adhesion, Assembly, BlockRules, CaptureView, Cell, QuarterTurn, Rotation,
+         bearing::{Bearing, Mode},
++        clockwork::{self, Angles, ClockTime, Mode as ClockMode},
+         plan_landing,
+         windmill::{Config, RESTORE_ANGLE, RotationDirection, Windmill},
+     },
+     kinetics::Pos,
+     placement::Direction,
+ };
+-use pumpkin_data::{Block, BlockStateId};
++use pumpkin_data::{Block, BlockStateId, dimension::Dimension};
+ use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
+ use pumpkin_util::{gamemode::GameMode, math::position::BlockPos};
+ use pumpkin_world::chunk::ChunkDataEdit;
+@@ -27,12 +28,13 @@
+ 
+ pub(crate) const ID: &str = "create:mechanical_bearing";
+ pub(crate) const WINDMILL: &str = "create:windmill_bearing";
++pub(crate) const CLOCKWORK: &str = "create:clockwork_bearing";
+ const MAX_BLOCKS: usize = 32;
+ // shortcut: pinned explicit scene format caps directional sail assemblies at 64.
+ const MAX_WINDMILL_BLOCKS: usize = 64;
+ 
+ pub(crate) fn is_bearing(name: &str) -> bool {
+-    matches!(name, ID | WINDMILL)
++    matches!(name, ID | WINDMILL | CLOCKWORK)
+ }
+ const MAX_RECORDS: usize = 4; // Pinned Horizon's scene decoder limit.
+ static EDIT: Mutex<()> = Mutex::new(());
+@@ -177,12 +179,24 @@
+ }
+ 
+ fn owned_entry<'a>(scene: &'a NbtCompound, key: &str, controller: Pos) -> Option<&'a NbtCompound> {
+-    let mut entries = entry(scene, key)?
+-        .iter()
+-        .filter(|entry| owner(entry) == Some(controller));
+-    let NbtTag::Compound(tag) = entries.next()? else {
+-        return None;
+-    };
++    owned_hand(scene, key, controller, None)
++}
++
++fn owned_hand<'a>(
++    scene: &'a NbtCompound,
++    key: &str,
++    controller: Pos,
++    hand: Option<i8>,
++) -> Option<&'a NbtCompound> {
++    let mut entries = entry(scene, key)?.iter().filter_map(|entry| match entry {
++        NbtTag::Compound(tag)
++            if owner(entry) == Some(controller) && tag.get_byte("ClockHand") == hand =>
++        {
++            Some(tag)
++        }
++        _ => None,
++    });
++    let tag = entries.next()?;
+     entries.next().is_none().then_some(tag)
+ }
+ 
+@@ -215,20 +229,29 @@
+     angle: f32,
+     stalled: bool,
+     windmill: bool,
++    hand: Option<i8>,
+ }
+ 
+ impl Motion {
+     fn read(scene: &NbtCompound, controller: Pos) -> Option<Self> {
++        Self::read_hand(scene, controller, None)
++    }
++
++    fn read_hand(scene: &NbtCompound, controller: Pos, hand: Option<i8>) -> Option<Self> {
+         generation(scene)?;
+-        let geo = owned_entry(scene, GEOMETRY, controller)?;
+-        let pose = owned_entry(scene, POSES, controller)?;
++        let geo = owned_hand(scene, GEOMETRY, controller, hand)?;
++        let pose = owned_hand(scene, POSES, controller, hand)?;
+         let anchor = vector(geo, "Anchor")?;
+         let axis = usize::try_from(geo.get_int("Axis")?).ok()?;
+         let angle = pose
+             .get_float("Angle")
+             .filter(|a| a.is_finite() && a.abs() < 360.0)?;
+-        let windmill = geo.get_bool("ReturnHome")?;
+-        let limit = if windmill {
++        let home = geo.get_bool("ReturnHome")?;
++        if hand.is_some() && !home {
++            return None;
++        }
++        let windmill = home && hand.is_none();
++        let limit = if home {
+             MAX_WINDMILL_BLOCKS
+         } else {
+             MAX_BLOCKS
+@@ -246,7 +269,8 @@
+                 return None;
+             };
+             let local = vector(block, "Pos")?;
+-            if local.iter().any(|p| p.unsigned_abs() > limit as u32)
++            let max_offset = if hand.is_some() { 15 } else { limit as u32 };
++            if local.iter().any(|p| p.unsigned_abs() > max_offset)
+                 || blocks.iter().any(|(p, _)| *p == local)
+             {
+                 return None;
+@@ -266,6 +290,7 @@
+             angle,
+             stalled: pose.get_bool("Stalled").unwrap_or(false),
+             windmill,
++            hand,
+         })
+     }
+ 
+@@ -276,11 +301,20 @@
+         previous: f32,
+         rpm: f32,
+     ) -> Option<NbtCompound> {
++        scene(
++            old,
++            self.controller,
++            generation,
++            [self.entries(previous, rpm)],
++        )
++    }
++
++    fn entries(&self, previous: f32, rpm: f32) -> (NbtCompound, NbtCompound) {
+         let mut geo = NbtCompound::new();
+         put_vector(&mut geo, "Controller", self.controller);
+         put_vector(&mut geo, "Anchor", self.anchor);
+         geo.put_int("Axis", self.axis as i32);
+-        geo.put_bool("ReturnHome", self.windmill);
++        geo.put_bool("ReturnHome", self.windmill || self.hand.is_some());
+         if self.windmill {
+             geo.put_int("WindmillSails", sail_count(&self.blocks) as i32);
+         }
+@@ -315,7 +349,11 @@
+         pose.put_float("PreviousAngle", previous);
+         pose.put_float("Speed", rpm);
+         pose.put_bool("Stalled", self.stalled);
+-        scene(old, self.controller, generation, Some(geo), Some(pose))
++        if let Some(hand) = self.hand {
++            geo.put_byte("ClockHand", hand);
++            pose.put_byte("ClockHand", hand);
++        }
++        (geo, pose)
+     }
+ 
+     fn matches(&self, controller: Pos, anchor: Pos, axis: usize) -> bool {
+@@ -327,11 +365,11 @@
+     old: &NbtCompound,
+     controller: Pos,
+     generation: i64,
+-    geometry: Option<NbtCompound>,
+-    pose: Option<NbtCompound>,
++    records: impl IntoIterator<Item = (NbtCompound, NbtCompound)>,
+ ) -> Option<NbtCompound> {
++    let (geometry, poses): (Vec<_>, Vec<_>) = records.into_iter().unzip();
+     let mut scene = old.clone();
+-    for (key, version, data) in [(GEOMETRY, 2, geometry), (POSES, 1, pose)] {
++    for (key, version, data) in [(GEOMETRY, 2, geometry), (POSES, 1, poses)] {
+         let mut content = if old.is_empty() {
+             NbtCompound::new()
+         } else {
+@@ -388,12 +426,17 @@
+     state: BlockStateId,
+     rpm: f32,
+     generated_rpm: f32,
++    setting: i32,
+     running: &std::sync::atomic::AtomicBool,
+ ) -> bool {
+     use std::sync::atomic::Ordering::Relaxed;
+     let _guard = EDIT
+         .lock()
+         .unwrap_or_else(std::sync::PoisonError::into_inner);
++    if state.to_block().name == CLOCKWORK {
++        let active = tick_clockwork(world, controller, state, rpm, setting);
++        return running.swap(active, Relaxed) != active;
++    }
+     let (_, previous, motion) = read(world, controller, state).unwrap_or_default();
+     let Some(mut motion) = motion else {
+         return running.swap(false, Relaxed);
+@@ -488,6 +531,216 @@
+     )
+ }
+ 
++fn clock_hands(scene: &NbtCompound, controller: Pos, facing: Direction) -> Option<Vec<Motion>> {
++    let mut hands = Vec::new();
++    for hand in [0, 1] {
++        if let Some(motion) = Motion::read_hand(scene, controller, Some(hand)) {
++            let axis = facing.axis().index();
++            let valid = (if hand == 0 { 1..=1 } else { 2..=16 }).any(|n| {
++                motion.matches(
++                    controller,
++                    plus(controller, facing.vector().map(|v| v * n)),
++                    axis,
++                )
++            });
++            if !valid || usize::from(hand as u8) != hands.len() {
++                return None;
++            }
++            hands.push(motion);
++        }
++    }
++    for key in [GEOMETRY, POSES] {
++        let count = entry(scene, key)
++            .unwrap_or_default()
++            .iter()
++            .filter(|tag| owner(tag) == Some(controller))
++            .count();
++        if count != hands.len() {
++            return None;
++        }
++    }
++    Some(hands)
++}
++
++fn tick_clockwork(
++    world: &Arc<World>,
++    controller: BlockPos,
++    state: BlockStateId,
++    rpm: f32,
++    setting: i32,
++) -> bool {
++    let Some((_, old, _)) = read(world, controller, state) else {
++        return false;
++    };
++    let Some(facing) = facing(state) else {
++        return false;
++    };
++    let Some(mut hands) =
++        clock_hands(&old, coords(controller), facing).filter(|hands| !hands.is_empty())
++    else {
++        return false;
++    };
++    let before = Angles {
++        hour: hands[0].angle,
++        minute: hands.get(1).map_or(0.0, |hand| hand.angle),
++    };
++    let target = ClockTime {
++        day_time: world.get_time_of_day(),
++        natural_dimension: world.dimension == Dimension::OVERWORLD,
++        facing,
++    }
++    .targets(ClockMode::from_scroll_value(setting).unwrap_or_default());
++    let after = before.advance(
++        target,
++        rpm,
++        [
++            hands[0].stalled,
++            hands.get(1).is_some_and(|hand| hand.stalled),
++        ],
++    );
++    let mut changed = false;
++    let records = hands
++        .iter_mut()
++        .zip([after.hour, after.minute])
++        .map(|(hand, angle)| {
++            let speed = if hand.stalled { 0.0 } else { rpm };
++            let previous = hand.angle;
++            let last = owned_hand(&old, POSES, hand.controller, hand.hand).unwrap();
++            changed |= previous != angle
++                || last.get_float("Speed") != Some(speed)
++                || last.get_float("PreviousAngle") != Some(previous);
++            hand.angle = angle;
++            hand.entries(previous, speed)
++        })
++        .collect::<Vec<_>>();
++    if changed
++        && let Some(next) = scene(&old, coords(controller), generation(&old).unwrap(), records)
++    {
++        commit(world, controller, state, Some(old), next, &[]);
++    }
++    true
++}
++
++// shortcut: manual activation only; process power-edge requests after their permissions are defined.
++fn interact_clockwork(
++    world: &Arc<World>,
++    controller: BlockPos,
++    state: BlockStateId,
++    facing: Direction,
++    previous: Option<NbtTag>,
++    old: NbtCompound,
++    in_scope: impl Fn(BlockPos) -> bool,
++) -> Option<()> {
++    let owner = coords(controller);
++    let mut hands = clock_hands(&old, owner, facing)?;
++    let current = generation(&old).unwrap_or(0);
++    if previous.is_some() && current == 0 {
++        return None;
++    }
++    let next = current.checked_add(1)?;
++    let air = Block::AIR.default_state.id;
++    let axis = facing.axis();
++    let mut edits = Vec::new();
++    if hands.is_empty() {
++        let captured = clockwork::capture(
++            &View(world, controller, false),
++            owner,
++            facing,
++            MAX_WINDMILL_BLOCKS,
++        )
++        .ok()??;
++        for (hand, assembly) in [Some(captured.hour), captured.minute]
++            .into_iter()
++            .enumerate()
++        {
++            let Some(assembly) = assembly else { continue };
++            let anchor = assembly.anchor();
++            let blocks = assembly.blocks().to_vec();
++            // Unlike a single bearing, the clock hands share a controller but keep separate pivots.
++            for angle in [0.0, 90.0, 180.0, 270.0] {
++                let turn = Rotation::new(anchor, axis, angle)?.snapped();
++                for &(local, id) in &blocks {
++                    if local.iter().any(|v| v.unsigned_abs() > 15) {
++                        return None;
++                    }
++                    let p = pos(turn.place(anchor, local)?);
++                    if !in_scope(p) {
++                        return None;
++                    }
++                    if angle == 0.0 {
++                        edits.push((p, id, air));
++                    }
++                }
++            }
++            hands.push(Motion {
++                controller: owner,
++                anchor,
++                axis: axis.index(),
++                blocks,
++                angle: 0.0,
++                stalled: false,
++                windmill: false,
++                hand: Some(hand as i8),
++            });
++        }
++        let records = hands.iter().map(|hand| hand.entries(0.0, 0.0));
++        let captured = scene(&old, owner, next, records)?;
++        commit(
++            world,
++            controller,
++            state,
++            previous.map(|_| old),
++            captured,
++            &edits,
++        );
++    } else {
++        for hand in &hands {
++            let plan = plan_landing(
++                &hand.blocks,
++                hand.anchor,
++                Rotation::new(hand.anchor, axis, clockwork::RESTORE_ANGLE)?.snapped(),
++                |id, turn| transformed(*id, turn),
++                |p, id| {
++                    let p = pos(p);
++                    in_scope(p)
++                        && world.get_block_state_id_if_loaded(&p) == Some(air)
++                        && id
++                            .to_state()
++                            .get_block_collision_shapes_at(&p)
++                            .all(|shape| {
++                                !BlockRegistry::has_blocking_entity_in_box(world, &shape.at_pos(p))
++                            })
++                },
++            );
++            if let Ok(plan) = plan {
++                edits.extend(plan.into_iter().map(|(p, id)| (pos(p), air, id)));
++            } else {
++                edits.clear();
++                break;
++            }
++        }
++        if !edits.is_empty()
++            && let Some(cleared) = scene(&old, owner, next, [])
++            && commit(world, controller, state, Some(old.clone()), cleared, &edits)
++        {
++            return Some(());
++        }
++        // Both hands remain owned even when only one destination is blocked.
++        for hand in &mut hands {
++            hand.stalled = true;
++        }
++        if let Some(stalled) = scene(
++            &old,
++            owner,
++            current,
++            hands.iter().map(|hand| hand.entries(hand.angle, 0.0)),
++        ) {
++            commit(world, controller, state, Some(old), stalled, &[]);
++        }
++    }
++    Some(())
++}
++
+ pub(crate) fn interact(world: &Arc<World>, player: &Player, controller: BlockPos) -> bool {
+     let Some(state) = world.get_block_state_id_if_loaded(&controller) else {
+         return false;
+@@ -532,6 +785,10 @@
+                     )
+             })
+     };
++    if state.to_block().name == CLOCKWORK {
++        interact_clockwork(world, controller, state, facing, previous, old, in_scope);
++        return true;
++    }
+     if let Some(mut motion) = motion {
+         let land_angle = if windmill {
+             RESTORE_ANGLE
+@@ -559,7 +816,7 @@
+             },
+         );
+         if let Ok(plan) = plan
+-            && let Some(cleared) = scene(&old, motion.controller, next_generation, None, None)
++            && let Some(cleared) = scene(&old, motion.controller, next_generation, [])
+         {
+             let edits: Vec<_> = plan.into_iter().map(|(p, id)| (pos(p), air, id)).collect();
+             if commit(world, controller, state, Some(old.clone()), cleared, &edits) {
+@@ -631,6 +888,7 @@
+                 angle: 0.0,
+                 stalled: false,
+                 windmill,
++                hand: None,
+             };
+             if let Some(captured) = motion.write(&old, next_generation, 0.0, 0.0) {
+                 commit(
+@@ -664,6 +922,7 @@
+             angle: -90.0,
+             stalled: true,
+             windmill: false,
++            hand: None,
+         };
+         let empty = NbtCompound::new();
+         let encoded = motion.write(&empty, 12, -87.0, 0.0).unwrap();
+@@ -678,7 +937,7 @@
+         ));
+         assert!(!locks_controller(
+             Some(NbtTag::Compound(
+-                scene(&encoded, motion.controller, 13, None, None).unwrap()
++                scene(&encoded, motion.controller, 13, []).unwrap()
+             )),
+             pos(motion.controller)
+         ));
+@@ -710,6 +969,7 @@
+             angle: 1.5,
+             stalled: false,
+             windmill: true,
++            hand: None,
+         };
+         assert_eq!(sail_count(&motion.blocks), 8);
+         let raw = motion.write(&NbtCompound::new(), 1, 0.0, 1.0).unwrap();
+@@ -723,8 +983,48 @@
+     }
+ 
+     #[test]
++    fn clockwork_binds_both_hands_to_their_own_pose() {
++        let controller = [3, 4, 5];
++        let hand = |hand: i8, z, angle| {
++            Motion {
++                controller,
++                anchor: [3, 4, z],
++                axis: 2,
++                blocks: vec![([0; 3], Block::STONE.default_state.id)],
++                angle,
++                stalled: false,
++                windmill: false,
++                hand: Some(hand),
++            }
++            .entries(0.0, 32.0)
++        };
++        let empty = NbtCompound::new();
++        let minute_only = scene(&empty, controller, 1, [hand(1, 7, -90.0)]).unwrap();
++        assert!(clock_hands(&minute_only, controller, Direction::South).is_none());
++        let two = scene(
++            &empty,
++            controller,
++            1,
++            [hand(0, 6, -30.0), hand(1, 7, -90.0)],
++        )
++        .unwrap();
++        let decoded = clock_hands(&two, controller, Direction::South).unwrap();
++        assert_eq!(
++            decoded.iter().map(|h| h.angle).collect::<Vec<_>>(),
++            [-30.0, -90.0]
++        );
++        assert!(clock_hands(&two, controller, Direction::North).is_none());
++        let cleared = scene(&two, controller, 2, []).unwrap();
++        assert!(
++            clock_hands(&cleared, controller, Direction::South)
++                .unwrap()
++                .is_empty()
++        );
++    }
++
++    #[test]
+     fn edits_preserve_unrelated_scene_data_and_other_controllers() {
+-        let mut scene_data = scene(&NbtCompound::new(), [0; 3], 1, None, None).unwrap();
++        let mut scene_data = scene(&NbtCompound::new(), [0; 3], 1, []).unwrap();
+         scene_data.put_int("ServerOnly", 42);
+         for x in 0..MAX_RECORDS as i32 {
+             let motion = Motion {
+@@ -735,6 +1035,7 @@
+                 angle: x as f32,
+                 stalled: false,
+                 windmill: false,
++                hand: None,
+             };
+             scene_data = motion
+                 .write(&scene_data, i64::from(x) + 2, 0.0, 32.0)
+@@ -743,7 +1044,7 @@
+         let mut extra = Motion::read(&scene_data, [0; 3]).unwrap();
+         extra.controller = [9, 0, 0];
+         assert!(extra.write(&scene_data, 6, 0.0, 32.0).is_none());
+-        let cleared = scene(&scene_data, [0; 3], 6, None, None).unwrap();
++        let cleared = scene(&scene_data, [0; 3], 6, []).unwrap();
+         assert_eq!(cleared.get_int("ServerOnly"), Some(42));
+         assert!(Motion::read(&cleared, [0; 3]).is_none());
+         assert_eq!(Motion::read(&cleared, [1, 0, 0]).unwrap().angle, 1.0);
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -119,7 +119,7 @@
+     Some((BlockPos::new(x, y, z), value))
+ }
+ 
+-fn windmill_setting(payload: &[u8]) -> Option<(BlockPos, i32)> {
++fn motion_setting(payload: &[u8]) -> Option<(&'static str, (BlockPos, i32))> {
+     let ([x, y, z, mode, value], []) = payload
+         .strip_prefix(b"\x16create:motion_settings\x14")?
+         .as_chunks::<4>()
+@@ -127,15 +127,18 @@
+         return None;
+     };
+     let [x, y, z, mode, value] = [*x, *y, *z, *mode, *value].map(i32::from_be_bytes);
+-    (mode == 1 && (0..=1).contains(&value)).then_some((BlockPos::new(x, y, z), value))
++    let id = match mode {
++        1 if (0..=1).contains(&value) => super::create_bearing::WINDMILL,
++        2 if (0..=2).contains(&value) => super::create_bearing::CLOCKWORK,
++        _ => return None,
++    };
++    Some((id, (BlockPos::new(x, y, z), value)))
+ }
+ 
+ pub(crate) fn apply_settings(player: &Player, payload: &[u8]) {
+     let Some((id, (pos, value))) = motor_setting(payload)
+         .map(|setting| (MOTOR, setting))
+-        .or_else(|| {
+-            windmill_setting(payload).map(|setting| (super::create_bearing::WINDMILL, setting))
+-        })
++        .or_else(|| motion_setting(payload))
+     else {
+         return;
+     };
+@@ -788,6 +791,7 @@
+         if let Some(setting) = nbt.get_int("ScrollValue").filter(|n| match id {
+             MOTOR => *n != 0 && (-256..=256).contains(n),
+             super::create_bearing::WINDMILL => (0..=1).contains(n),
++            super::create_bearing::CLOCKWORK => (0..=2).contains(n),
+             _ => false,
+         }) {
+             entity.setting.store(setting, Ordering::Relaxed);
+@@ -808,8 +812,8 @@
+                     "LastGenerated",
+                     self.windmill_generated.load(Ordering::Relaxed) as f32,
+                 );
+-                tag.put_int("ScrollValue", self.setting.load(Ordering::Relaxed));
+-            }
++            }
++            tag.put_int("ScrollValue", self.setting.load(Ordering::Relaxed));
+         }
+         let segment = *self
+             .belt
+@@ -1252,6 +1256,7 @@
+                 state,
+                 bearing_rpm,
+                 self.windmill_generated.load(Ordering::Relaxed) as f32,
++                self.setting.load(Ordering::Relaxed),
+                 &self.bearing_running,
+             );
+         let bearing = bearing || windmill_changed;
+@@ -1332,26 +1337,30 @@
+     }
+ 
+     #[test]
+-    fn windmill_settings_validate_and_persist() {
++    fn motion_settings_validate_and_persist() {
++        use super::super::create_bearing::{CLOCKWORK, WINDMILL};
+         let mut payload = b"\x16create:motion_settings\x14".to_vec();
+         payload.extend([2i32, 3, -4, 1, 1].into_iter().flat_map(i32::to_be_bytes));
+         let pos = BlockPos::new(2, 3, -4);
+-        assert_eq!(windmill_setting(&payload), Some((pos, 1)));
++        assert_eq!(motion_setting(&payload), Some((WINDMILL, (pos, 1))));
+         let end = payload.len() - 1;
+         payload[end] = 2;
+-        assert!(windmill_setting(&payload).is_none());
+-        payload[end] = 0;
++        assert!(motion_setting(&payload).is_none());
+         payload[end - 4] = 2;
+-        assert!(windmill_setting(&payload).is_none());
++        assert_eq!(motion_setting(&payload), Some((CLOCKWORK, (pos, 2))));
++        payload[end] = 3;
++        assert!(motion_setting(&payload).is_none());
+         let mut nbt = NbtCompound::new();
+-        nbt.put_string("id", super::super::create_bearing::WINDMILL.into());
+-        for (stored, expected) in [(1, 1), (0, 0), (-1, 0), (42, 0)] {
+-            nbt.put_int("ScrollValue", stored);
+-            let windmill = CreateKinetic::from_nbt(&nbt, pos);
+-            assert_eq!(
+-                windmill.chunk_data_nbt().unwrap().get_int("ScrollValue"),
+-                Some(expected)
+-            );
++        for (id, max) in [(WINDMILL, 1), (CLOCKWORK, 2)] {
++            nbt.put_string("id", id.into());
++            for (stored, expected) in [(max, max), (0, 0), (-1, 0), (42, 0)] {
++                nbt.put_int("ScrollValue", stored);
++                let bearing = CreateKinetic::from_nbt(&nbt, pos);
++                assert_eq!(
++                    bearing.chunk_data_nbt().unwrap().get_int("ScrollValue"),
++                    Some(expected)
++                );
++            }
+         }
+     }
+ 

@@ -1,0 +1,83 @@
+diff --git a/crates/pumpkin-core/src/block/blocks/create_material.rs b/crates/pumpkin-core/src/block/blocks/create_material.rs
+--- a/crates/pumpkin-core/src/block/blocks/create_material.rs
++++ b/crates/pumpkin-core/src/block/blocks/create_material.rs
+@@ -4,12 +4,16 @@
+ };
+ 
+ use pumpkin_data::{Block, BlockId, item::Item, item_stack::ItemStack};
++use pumpkin_inventory::screen_handler::InventoryPlayer;
+ use pumpkin_util::{GameMode, math::position::BlockPos};
+ use pumpkin_world::world::BlockFlags;
+ 
+ use crate::{
+     entity::{EntityBase, player::Player},
+-    world::World,
++    world::{
++        World,
++        loot::{LootContextParameters, generate_loot_from_handle},
++    },
+ };
+ 
+ type Recipes = HashMap<(BlockId, u16), (&'static Block, bool)>;
+@@ -39,7 +43,6 @@
+     let mode = player.gamemode.load();
+     if held.is_empty()
+         || !matches!(mode, GameMode::Survival | GameMode::Creative)
+-        || player.get_entity().is_sneaking()
+         || world.is_in_spawn_protection(player, &pos)
+     {
+         return false;
+@@ -47,7 +50,52 @@
+     let Some(old) = world.get_block_state_id_if_loaded(&pos) else {
+         return false;
+     };
+-    let Some(&(result, consume)) = RECIPES.get(&(old.to_block().id, held.get_item().id)) else {
++    let block = old.to_block();
++    if player.get_entity().is_sneaking() {
++        if held.get_item().registry_key != "create:wrench"
++            || !matches!(
++                block.name,
++                "create:industrial_iron_block" | "create:weathered_iron_block"
++            )
++        {
++            return false;
++        }
++        let drops = if mode == GameMode::Survival {
++            let Some(table) = block.loot_table.and_then(|key| world.get_loot_table(key)) else {
++                return true;
++            };
++            Some(table)
++        } else {
++            None
++        };
++        if world
++            .set_block_state_if(
++                &pos,
++                Block::AIR.default_state.id,
++                BlockFlags::NOTIFY_ALL,
++                |current| current == old,
++            )
++            .is_some()
++            && let Some(table) = drops
++        {
++            let context = LootContextParameters {
++                world: Some(world),
++                tool: Some(held.clone()),
++                block_state: Some(old.to_state()),
++                position: Some(pos.to_f64()),
++                killed_by_player: Some(true),
++                ..Default::default()
++            };
++            for mut stack in generate_loot_from_handle(&table, rand::random(), &context) {
++                player.inventory().insert_stack_anywhere(&mut stack);
++                if !stack.is_empty() {
++                    world.drop_stack(&pos, stack);
++                }
++            }
++        }
++        return true;
++    }
++    let Some(&(result, consume)) = RECIPES.get(&(block.id, held.get_item().id)) else {
+         return false;
+     };
+     if world

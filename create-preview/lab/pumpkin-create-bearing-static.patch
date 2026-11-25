@@ -1,0 +1,62 @@
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -72,6 +72,8 @@
+     actuator::PULLEY,
+     super::create_deployer::ID,
+     super::create_mechanical_crafter::ID,
++    "create:mechanical_bearing",
++    "create:clockwork_bearing",
+     wheel::SMALL,
+     wheel::LARGE,
+     "create:large_cogwheel",
+@@ -567,6 +569,8 @@
+                     | drill::ID
+                     | saw::ID
+                     | super::create_mechanical_crafter::ID
++                    | "create:mechanical_bearing"
++                    | "create:clockwork_bearing"
+             )
+         {
+             "facing"
+@@ -625,7 +629,11 @@
+         actuator::PISTON | actuator::STICKY | actuator::PULLEY | super::create_deployer::ID => {
+             Kind::LinearActuator
+         }
+-        fan::ID | drill::ID | saw::ID => Kind::Consumer {
++        fan::ID
++        | drill::ID
++        | saw::ID
++        | "create:mechanical_bearing"
++        | "create:clockwork_bearing" => Kind::Consumer {
+             facing: Direction::ALL
+                 .into_iter()
+                 .find(|d| d.name() == value)?
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -1285,6 +1285,16 @@
+                 let state = Self::set_create_facing(placed_block, state_id, facing);
+                 crate::block::blocks::create_sticker::placed_state(world, &position, state)
+             }
++            "create:mechanical_bearing"
++            | "create:clockwork_bearing"
++            | "create:windmill_bearing" => {
++                let facing = if sneaking {
++                    look
++                } else {
++                    placement::preferred(ports).unwrap_or(look).opposite()
++                };
++                Self::set_create_facing(placed_block, state_id, facing)
++            }
+             pipe::PIPE => pipe::shape(world, position, state_id, look, None),
+             pipe::VALVE => {
+                 let yaw = f64::from(player.get_entity().yaw.load());
+--- a/crates/pumpkin-core/src/net/java/play/use_item_on.rs
++++ b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+@@ -484,6 +484,7 @@
+                 crate::block::blocks::create_pipe::PIPE
+                     | crate::block::blocks::create_sticker::ID
+                     | crate::block::blocks::create_actuator::POLE
++                    | "create:windmill_bearing"
+             )
+             || crate::block::blocks::create_chassis::id(block.name).is_some()
+         {

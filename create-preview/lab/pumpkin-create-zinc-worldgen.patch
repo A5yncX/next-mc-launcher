@@ -1,0 +1,77 @@
+diff --git a/crates/pumpkin-world/src/generation/feature_order.rs b/crates/pumpkin-world/src/generation/feature_order.rs
+--- a/crates/pumpkin-world/src/generation/feature_order.rs
++++ b/crates/pumpkin-world/src/generation/feature_order.rs
+@@ -2,7 +2,7 @@
+ use std::sync::LazyLock;
+ 
+ use pumpkin_data::chunk::Biome;
+-use pumpkin_data::placed_feature::PlacedFeature;
++use pumpkin_data::{placed_feature::PlacedFeature, structures::GenerationStep};
+ 
+ // The order of biomes in this array is used by FeatureSorter to break ties between otherwise independent features.
+ const OVERWORLD_BIOMES: &[&Biome] = &[
+@@ -129,12 +129,22 @@
+     } else if biome_ids.iter().any(|b| END_BIOME_IDS.contains(b)) {
+         select_features_for_dimension(biome_ids, step, &END_BIOME_IDS, &END_FEATURES_PER_STEP)
+     } else {
+-        select_features_for_dimension(
++        let mut selected = select_features_for_dimension(
+             biome_ids,
+             step,
+             &OVERWORLD_BIOME_IDS,
+             &OVERWORLD_FEATURES_PER_STEP,
+-        )
++        );
++        if step == GenerationStep::UndergroundOres.ordinal()
++            && biome_ids.iter().any(|b| OVERWORLD_BIOME_IDS.contains(b))
++        {
++            // Append after the global vanilla indices so their decorator seeds stay unchanged.
++            selected.push((
++                OVERWORLD_FEATURES_PER_STEP[step].len(),
++                PlacedFeature::NextmcCreateZincOre,
++            ));
++        }
++        selected
+     }
+ }
+ 
+@@ -283,6 +293,39 @@
+     }
+ 
+     #[test]
++    fn zinc_only_extends_the_overworld_ore_step() {
++        let step = GenerationStep::UndergroundOres.ordinal();
++        let biomes = [Biome::PLAINS.id, Biome::DEEP_DARK.id];
++        let mut selected = select_features(&biomes, step);
++        let zinc = PlacedFeature::NextmcCreateZincOre;
++        assert_eq!(
++            selected.pop(),
++            Some((OVERWORLD_FEATURES_PER_STEP[step].len(), zinc))
++        );
++        assert_eq!(
++            selected,
++            select_features_for_dimension(
++                &biomes,
++                step,
++                &OVERWORLD_BIOME_IDS,
++                &OVERWORLD_FEATURES_PER_STEP,
++            )
++        );
++        for biomes in [&[Biome::NETHER_WASTES.id][..], &[Biome::THE_END.id], &[]] {
++            assert!(
++                select_features(biomes, step)
++                    .iter()
++                    .all(|(_, feature)| *feature != zinc)
++            );
++        }
++        assert!(
++            select_features(&[Biome::PLAINS.id], step + 1)
++                .iter()
++                .all(|(_, feature)| *feature != zinc)
++        );
++    }
++
++    #[test]
+     fn non_overworld_selection_preserves_local_indexing() {
+         let selected = select_features(&[Biome::NETHER_WASTES.id], 9);
+         assert!(!selected.is_empty());

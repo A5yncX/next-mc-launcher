@@ -1,0 +1,80 @@
+--- a/tools/pumpkin-codegen/src/recipes.rs
++++ b/tools/pumpkin-codegen/src/recipes.rs
+@@ -133,8 +133,8 @@
+     result: RecipeResultStruct,
+ }
+ 
+-impl ToTokens for StonecuttingRecipeStruct {
+-    fn to_tokens(&self, tokens: &mut TokenStream) {
++impl StonecuttingRecipeStruct {
++    fn to_tokens_with_id(&self, tokens: &mut TokenStream, recipe_id: &str) {
+         let group = if let Some(group) = &self.group {
+             quote! { Some(#group) }
+         } else {
+@@ -145,6 +145,7 @@
+ 
+         tokens.extend(quote! {
+             StonecutterRecipe {
++                recipe_id: #recipe_id,
+                 group: #group,
+                 ingredient: #ingredient,
+                 result: #result,
+@@ -671,7 +672,9 @@
+                 cooking_recipes.push(smoking_token);
+             }
+             RecipeTypes::Stonecutting(recipe) => {
+-                stonecutting_recipes.push(recipe.to_token_stream());
++                let mut token = TokenStream::new();
++                recipe.to_tokens_with_id(&mut token, &recipe_id);
++                stonecutting_recipes.push(token);
+             }
+             RecipeTypes::CraftingSpecial
+             | RecipeTypes::CraftingSpecialBannerDuplicate
+@@ -785,6 +788,7 @@
+ 
+         #[derive(Clone, Debug, Serialize)]
+         pub struct StonecutterRecipe {
++            pub recipe_id: &'static str,
+             pub group: Option<&'static str>,
+             pub ingredient: RecipeIngredientTypes,
+             pub result: RecipeResultStruct,
+--- a/crates/pumpkin-inventory/src/stonecutter_screen_handler.rs
++++ b/crates/pumpkin-inventory/src/stonecutter_screen_handler.rs
+@@ -18,6 +18,7 @@
+ use pumpkin_protocol::java::server::play::SlotActionType;
+ 
+ pub struct StonecutterRecipeChoice {
++    recipe_id: String,
+     pub result_id: String,
+     pub count: u8,
+ }
+@@ -103,6 +104,7 @@
+         for r in RECIPES_STONECUTTING {
+             if r.ingredient.match_item(item) {
+                 results.push(StonecutterRecipeChoice {
++                    recipe_id: r.recipe_id.to_string(),
+                     result_id: r.result.id.to_string(),
+                     count: r.result.count,
+                 });
+@@ -114,12 +116,21 @@
+                     && r.ingredient.match_item(item)
+                 {
+                     results.push(StonecutterRecipeChoice {
++                        recipe_id: r.recipe_id,
+                         result_id: r.result.item_id,
+                         count: r.result.count,
+                     });
+                 }
+             }
+         }
++        // The Java buttons index recipe resource files by path, then namespace.
++        results.sort_by_cached_key(|r| {
++            let (namespace, path) = r
++                .recipe_id
++                .split_once(':')
++                .unwrap_or(("minecraft", &r.recipe_id));
++            (format!("{path}.json"), namespace.to_owned())
++        });
+         results
+     }
+ }

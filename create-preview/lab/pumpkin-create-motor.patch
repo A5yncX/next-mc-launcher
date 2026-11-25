@@ -1,0 +1,234 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -2,26 +2,80 @@
+     any::Any,
+     sync::{
+         Arc,
+-        atomic::{AtomicU32, Ordering},
++        atomic::{AtomicI32, AtomicU32, Ordering},
+     },
+ };
+ 
+ use create_engine::kinetics::{Axis, Kind, Node, Pos, solve};
+ use pumpkin_data::{Block, BlockStateId};
+ use pumpkin_nbt::compound::NbtCompound;
+-use pumpkin_util::math::position::BlockPos;
++use pumpkin_util::{GameMode, math::position::BlockPos};
+ 
+ use super::BlockEntity;
+-use crate::world::World;
++use crate::{
++    entity::{EntityBase, player::Player},
++    world::World,
++};
+ 
+ pub(super) const MOTOR: &str = "create:creative_motor";
+ pub(super) const SHAFT: &str = "create:shaft";
+ pub(super) const COG: &str = "create:cogwheel";
++const DEFAULT_MOTOR_SETTING: i32 = 32;
++pub(crate) const MOD_NET_CHANNEL: &str = "horizon:mod_net";
++
++// Both lengths fit in one VarInt: the inner channel has 24 bytes and its body has five i32s.
++const MOTOR_SETTINGS_HEADER: &[u8] = b"\x18create:motor_settings_v2\x14";
++
++fn motor_setting(payload: &[u8]) -> Option<(BlockPos, i32)> {
++    let ([x, y, z, row, raw], []) = payload
++        .strip_prefix(MOTOR_SETTINGS_HEADER)?
++        .as_chunks::<4>()
++    else {
++        return None;
++    };
++    let [x, y, z, row, raw] = [*x, *y, *z, *row, *raw].map(i32::from_be_bytes);
++    let value = match (row, raw) {
++        (0, 0..=256) => -raw.max(1),
++        (1, 0..=256) => raw.max(1),
++        _ => return None,
++    };
++    Some((BlockPos::new(x, y, z), value))
++}
++
++pub(crate) fn apply_motor_setting(player: &Player, payload: &[u8]) {
++    let Some((pos, value)) = motor_setting(payload) else {
++        return;
++    };
++    if !matches!(
++        player.gamemode.load(),
++        GameMode::Survival | GameMode::Creative
++    ) || !player.living_entity.is_alive()
++        || !player.can_interact_with_block_at(&pos, 1.0)
++    {
++        return;
++    }
++    let world = player.get_entity().world.load_full();
++    if world.is_in_spawn_protection(player, &pos)
++        || !world
++            .get_block_state_id_if_loaded(&pos)
++            .is_some_and(|id| Block::from_state_id(id).name == MOTOR)
++    {
++        return;
++    }
++    if let Some(entity) = world.get_block_entity(&pos)
++        && let Some(motor) = entity.as_any().downcast_ref::<CreateKinetic>()
++        && motor.id == MOTOR
++        && motor.setting.swap(value, Ordering::Relaxed) != value
++    {
++        world.update_block_entity(&entity);
++    }
++}
+ 
+ pub(super) struct CreateKinetic {
+     id: &'static str,
+     position: BlockPos,
+     rpm: AtomicU32,
++    setting: AtomicI32,
+ }
+ 
+ impl CreateKinetic {
+@@ -30,6 +84,7 @@
+             id,
+             position,
+             rpm: AtomicU32::new(0),
++            setting: AtomicI32::new(DEFAULT_MOTOR_SETTING),
+         }
+     }
+ }
+@@ -63,7 +118,7 @@
+             };
+             Kind::Motor {
+                 facing,
+-                rpm: 32.0,
++                rpm: (DEFAULT_MOTOR_SETTING * facing[axis.index()]) as f32,
+                 capacity: 1024.0,
+             }
+         }
+@@ -87,11 +142,21 @@
+             .filter(|rpm| rpm.is_finite())
+             .unwrap_or(0.0);
+         entity.rpm.store(rpm.to_bits(), Ordering::Relaxed);
++        if id == MOTOR
++            && let Some(setting) = nbt
++                .get_int("ScrollValue")
++                .filter(|n| *n != 0 && (-256..=256).contains(n))
++        {
++            entity.setting.store(setting, Ordering::Relaxed);
++        }
+         entity
+     }
+ 
+     fn write_nbt(&self, tag: &mut NbtCompound) {
+         tag.put_float("Speed", f32::from_bits(self.rpm.load(Ordering::Relaxed)));
++        if self.id == MOTOR {
++            tag.put_int("ScrollValue", self.setting.load(Ordering::Relaxed));
++        }
+     }
+ 
+     fn resource_location(&self) -> &'static str {
+@@ -113,7 +178,14 @@
+     fn tick(&self, world: &Arc<World>) {
+         let read = |[x, y, z]: Pos| {
+             let pos = BlockPos::new(x, y, z);
+-            node(world.get_block_state_id_if_loaded(&pos)?, [x, y, z])
++            let mut node = node(world.get_block_state_id_if_loaded(&pos)?, [x, y, z])?;
++            if let Kind::Motor { facing, rpm, .. } = &mut node.kind
++                && let Some(entity) = world.get_block_entity(&pos)
++                && let Some(motor) = entity.as_any().downcast_ref::<Self>()
++            {
++                *rpm = (motor.setting.load(Ordering::Relaxed) * facing[node.axis.index()]) as f32;
++            }
++            Some(node)
+         };
+         let pos = [self.position.0.x, self.position.0.y, self.position.0.z];
+         let Some(start) = read(pos) else { return };
+@@ -146,6 +218,39 @@
+     use super::*;
+ 
+     #[test]
++    fn motor_settings_validate_and_persist() {
++        let packet = |row: i32, raw: i32| {
++            let mut data = MOTOR_SETTINGS_HEADER.to_vec();
++            data.extend([-4, 80, 9, row, raw].into_iter().flat_map(i32::to_be_bytes));
++            data
++        };
++        assert_eq!(
++            motor_setting(&packet(0, 64)),
++            Some((BlockPos::new(-4, 80, 9), -64))
++        );
++        assert_eq!(
++            motor_setting(&packet(1, 0)),
++            Some((BlockPos::new(-4, 80, 9), 1))
++        );
++        for (row, raw) in [(2, 32), (0, -1), (1, 257)] {
++            assert_eq!(motor_setting(&packet(row, raw)), None);
++        }
++        let mut trailing = packet(1, 32);
++        trailing.push(0);
++        assert_eq!(motor_setting(&trailing), None);
++        let mut nbt = NbtCompound::new();
++        nbt.put_string("id", MOTOR.to_owned());
++        for (stored, expected) in [(-64, -64), (0, 32), (257, 32)] {
++            nbt.put_int("ScrollValue", stored);
++            let motor = CreateKinetic::from_nbt(&nbt, BlockPos::new(-4, 80, 9));
++            assert_eq!(
++                motor.chunk_data_nbt().unwrap().get_int("ScrollValue"),
++                Some(expected)
++            );
++        }
++    }
++
++    #[test]
+     fn server_blocks_feed_the_create_solver() {
+         let states = [36349, 37744, 36344].map(|id| BlockStateId::new(id).unwrap());
+         let nodes = states
+diff --git a/crates/pumpkin-core/src/block/entities/mod.rs b/crates/pumpkin-core/src/block/entities/mod.rs
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -21,7 +21,7 @@
+ pub mod chiseled_bookshelf;
+ pub mod command_block;
+ pub mod comparator;
+-mod create_kinetic;
++pub(crate) mod create_kinetic;
+ pub(crate) fn create_kinetic_node(
+     state: BlockStateId,
+     pos: create_engine::kinetics::Pos,
+diff --git a/crates/pumpkin-core/src/net/java/login/login_acknowledged.rs b/crates/pumpkin-core/src/net/java/login/login_acknowledged.rs
+--- a/crates/pumpkin-core/src/net/java/login/login_acknowledged.rs
++++ b/crates/pumpkin-core/src/net/java/login/login_acknowledged.rs
+@@ -28,6 +28,14 @@
+             &pumpkin_protocol::java::client::config::CPluginMessage::new(
+                 crate::net::java::pending::CREATE_CHANNEL,
+                 crate::net::java::pending::CREATE_IDENTITY,
++            ),
++        )
++        .await;
++
++        self.send_packet_now(
++            &pumpkin_protocol::java::client::config::CPluginMessage::new(
++                crate::block::entities::create_kinetic::MOD_NET_CHANNEL,
++                &[],
+             ),
+         )
+         .await;
+diff --git a/crates/pumpkin-core/src/net/java/mod.rs b/crates/pumpkin-core/src/net/java/mod.rs
+--- a/crates/pumpkin-core/src/net/java/mod.rs
++++ b/crates/pumpkin-core/src/net/java/mod.rs
+@@ -71,6 +71,7 @@
+ use arc_swap::ArcSwap;
+ use pending::PendingConnection;
+ 
++use crate::block::entities::create_kinetic::{MOD_NET_CHANNEL, apply_motor_setting};
+ use crate::entity::player::Player;
+ use crate::net::{
+     ClientPlatform, GameProfile, MAX_PENDING_BYTES, PacketRateLimiter, PlayerConfig,
+@@ -1095,6 +1096,10 @@
+             }
+             id if id == SCustomPayload::to_id(version) => {
+                 let payload = SCustomPayload::read(&mut payload, &version)?;
++                if payload.channel == MOD_NET_CHANNEL {
++                    apply_motor_setting(player, payload.data);
++                    return Ok(());
++                }
+                 let channel_str = payload.channel.to_string();
+                 let mut event = PlayerCustomPayloadEvent::new(
+                     player.clone(),

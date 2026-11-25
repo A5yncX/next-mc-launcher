@@ -1,0 +1,306 @@
+--- a/crates/pumpkin-core/src/block/blocks/create_belt.rs
++++ b/crates/pumpkin-core/src/block/blocks/create_belt.rs
+@@ -6,6 +6,7 @@
+ use create_engine::{
+     kinetics::{Axis, Kind, Node, Pos},
+     placement::Direction,
++    pressing::BeltDecision,
+     transport::{
+         self, Belt, Ending, Hooks, Inventory, Part, ProcessingResult, ProcessingUpdate, Pulley,
+         Slope, Space, Stack, Transported, TransportedResult,
+@@ -29,7 +30,7 @@
+         entities::{
+             BlockEntity,
+             create_deployer::{self, CreateDeployerBlockEntity, TransportAction},
+-            create_kinetic,
++            create_kinetic, create_press,
+         },
+     },
+     entity::{Entity, EntityBase, item::ItemEntity, player::Player},
+@@ -639,15 +640,13 @@
+ }
+ 
+ impl Outlet<'_> {
+-    fn deployer(
+-        &self,
+-        index: i32,
+-    ) -> Option<(BlockPos, Arc<dyn crate::block::entities::BlockEntity>)> {
++    fn machine(&self, index: i32) -> Option<(BlockPos, Arc<dyn BlockEntity>)> {
+         let [x, y, z] = std::array::from_fn(|i| self.origin[i] + self.step[i] * index);
+         let p = BlockPos::new(x, y + 2, z);
+         let state = self.world.get_block_state_id_if_loaded(&p)?;
+-        if state.to_block().name != create_deployer::ID
+-            || property(state, "facing") != Some("down")
++        if !(state.to_block().name == create_press::ID
++            || state.to_block().name == create_deployer::ID
++                && property(state, "facing") == Some("down"))
+             || !self
+                 .world
+                 .get_block_state_id_if_loaded(&BlockPos::new(x, y + 1, z))?
+@@ -665,24 +664,39 @@
+         index: i32,
+         held: bool,
+     ) -> ProcessingUpdate<Payload> {
+-        let Some((pos, entity)) = self.deployer(index) else {
++        let Some((pos, entity)) = self.machine(index) else {
+             return ProcessingResult::Pass.into();
+         };
+-        let Some(machine) = entity.as_any().downcast_ref::<CreateDeployerBlockEntity>() else {
+-            return ProcessingResult::Pass.into();
+-        };
+-        if machine.rpm() == 0.0 {
+-            return ProcessingResult::Pass.into();
+-        }
+         let mut input = full_stack(&item.stack);
+-        let action = machine.transport(
+-            &mut input,
+-            held,
+-            block_receives_redstone_power(self.world, &pos),
+-            0.875,
+-            self.world.get_world_age(),
+-        );
+-        if machine.is_dirty() {
++        let (action, changed) =
++            if let Some(deployer) = entity.as_any().downcast_ref::<CreateDeployerBlockEntity>() {
++                if deployer.rpm() == 0.0 {
++                    return ProcessingResult::Pass.into();
++                }
++                let action = deployer.transport(
++                    &mut input,
++                    held,
++                    block_receives_redstone_power(self.world, &pos),
++                    0.875,
++                    self.world.get_world_age(),
++                );
++                (action, deployer.is_dirty())
++            } else if let Some((decision, result, changed)) =
++                create_kinetic::press_belt(&*entity, &input, held)
++            {
++                let action = if let Some(result) = result {
++                    input.item_count -= 1;
++                    TransportAction::Apply(ItemStack::new(1, result))
++                } else if decision == BeltDecision::Hold {
++                    TransportAction::Hold
++                } else {
++                    TransportAction::Pass
++                };
++                (action, changed)
++            } else {
++                return ProcessingResult::Pass.into();
++            };
++        if changed {
+             self.world.update_block_entity(&entity);
+         }
+         match action {
+@@ -729,11 +743,12 @@
+     }
+ 
+     fn processor(&mut self, index: i32) -> Option<bool> {
+-        Some(self.deployer(index).is_some_and(|(_, entity)| {
++        Some(self.machine(index).is_some_and(|(_, entity)| {
+             entity
+                 .as_any()
+                 .downcast_ref::<CreateDeployerBlockEntity>()
+                 .is_some_and(|d| d.rpm() != 0.0)
++                || entity.resource_location() == create_press::ID
+         }))
+     }
+ 
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -11,7 +11,9 @@
+     placement::{self, Direction},
+     visual, waterwheel,
+ };
+-use pumpkin_data::{Block, BlockStateId, block_properties::Property, item::Item};
++use pumpkin_data::{
++    Block, BlockStateId, block_properties::Property, item::Item, item_stack::ItemStack,
++};
+ use pumpkin_nbt::compound::NbtCompound;
+ use pumpkin_util::{GameMode, math::position::BlockPos};
+ use pumpkin_world::world::BlockFlags;
+@@ -30,7 +32,7 @@
+     entity::{EntityBase, player::Player},
+     world::World,
+ };
+-use create_engine::pressing::{self, Action, PressCycle, PressMode};
++use create_engine::pressing::{self, Action, BeltDecision, PressCycle, PressMode};
+ 
+ pub(super) const MOTOR: &str = "create:creative_motor";
+ pub(super) const SHAFT: &str = "create:shaft";
+@@ -225,6 +227,7 @@
+     press: PressCycle,
+     press_finished: bool,
+     press_mode: PressMode,
++    press_belt: Option<bool>,
+     valve: Option<[f32; 3]>,
+     air_current: Option<Vec<i32>>,
+ }
+@@ -346,6 +349,19 @@
+     true
+ }
+ 
++pub(crate) fn press_belt(
++    entity: &dyn BlockEntity,
++    input: &ItemStack,
++    held: bool,
++) -> Option<(BeltDecision, Option<&'static Item>, bool)> {
++    Some(
++        entity
++            .as_any()
++            .downcast_ref::<CreateKinetic>()?
++            .press_belt(input, held),
++    )
++}
++
+ fn nbt_speed(tag: &NbtCompound, key: &str) -> f32 {
+     tag.get_float(key)
+         .filter(|rpm| rpm.is_finite())
+@@ -358,6 +374,48 @@
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner)
+             .rpm
++    }
++
++    fn press_belt(
++        &self,
++        input: &ItemStack,
++        held: bool,
++    ) -> (BeltDecision, Option<&'static Item>, bool) {
++        let mut r = self
++            .readings
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        let rpm = r.rpm;
++        if self.id != press::ID || rpm == 0.0 {
++            return (BeltDecision::Pass, None, false);
++        }
++        if !held {
++            let entry =
++                pressing::belt_received(&mut r.press, rpm, || press::result(input).is_some());
++            if entry.started {
++                r.press_mode = PressMode::Belt;
++                r.press_belt = Some(false);
++            }
++            return (entry.decision, None, entry.started);
++        }
++        if !r.press.running {
++            return (BeltDecision::Pass, None, false);
++        }
++        // Either block entity may tick first; claim the strike only once after midpoint.
++        if r.press_belt == Some(false) && r.press.applied {
++            let result = press::result(input);
++            r.press_belt = Some(true);
++            return (
++                if result.is_some() {
++                    BeltDecision::Hold
++                } else {
++                    BeltDecision::Pass
++                },
++                result,
++                true,
++            );
++        }
++        (BeltDecision::Hold, None, false)
+     }
+ 
+     pub(super) fn new(id: &'static str, position: BlockPos) -> Self {
+@@ -637,6 +695,9 @@
+                 .get_int("Mode")
+                 .and_then(PressMode::from_index)
+                 .unwrap_or_default();
++            if readings.press.running && readings.press_mode == PressMode::Belt {
++                readings.press_belt = nbt.get_bool("NextMcBeltStrike");
++            }
+         }
+         if id == pipe::VALVE
+             && let Some(tag) = nbt.get_compound("Pointer")
+@@ -737,6 +798,9 @@
+             tag.put_int("Applied", i32::from(readings.press.applied));
+             tag.put_bool("Finished", readings.press_finished);
+             tag.put_int("Mode", readings.press_mode as i32);
++            if let Some(struck) = readings.press_belt {
++                tag.put_bool("NextMcBeltStrike", struck);
++            }
+         }
+         if let Some([value, target, speed]) = readings.valve {
+             let mut pointer = NbtCompound::new();
+@@ -1090,13 +1154,21 @@
+             if self.id == press::ID {
+                 let mut cycle = readings.press;
+                 next.press_mode = readings.press_mode;
+-                let action = press::tick(
+-                    &mut cycle,
+-                    &mut next.press_mode,
+-                    world,
+-                    self.position,
+-                    next.rpm,
+-                );
++                let action = if cycle.running && readings.press_belt.is_some() {
++                    let action = cycle.tick(next.rpm, false);
++                    if cycle.running {
++                        next.press_belt = readings.press_belt;
++                    }
++                    action
++                } else {
++                    press::tick(
++                        &mut cycle,
++                        &mut next.press_mode,
++                        world,
++                        self.position,
++                        next.rpm,
++                    )
++                };
+                 next.press = cycle;
+                 next.press_finished = readings.press_finished || action == Action::Finished;
+                 press_changed = action != Action::None;
+@@ -1124,6 +1196,30 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++
++    #[test]
++    fn restarted_belt_press_strikes_at_most_once() {
++        let pos = BlockPos::new(0, 80, 0);
++        let press = CreateKinetic::new(press::ID, pos);
++        press.readings.lock().unwrap().rpm = 32.0;
++        let input = ItemStack::new(2, &Item::IRON_INGOT);
++        assert_eq!(press.press_belt(&input, false).0, BeltDecision::Hold);
++        assert_eq!(press.press_belt(&input, true).0, BeltDecision::Hold);
++        assert!(press.press_belt(&input, true).1.is_none());
++        press.readings.lock().unwrap().press.applied = true;
++        let reload = |press: &CreateKinetic| {
++            let mut nbt = press.chunk_data_nbt().unwrap();
++            nbt.put_string("id", press::ID.to_owned());
++            CreateKinetic::from_nbt(&nbt, pos)
++        };
++        let resumed = reload(&press);
++        assert_eq!(
++            resumed.press_belt(&input, true).1.unwrap().id,
++            Item::CREATE_IRON_SHEET.id
++        );
++        let struck = reload(&resumed);
++        assert!(struck.press_belt(&input, true).1.is_none());
++    }
+ 
+     #[test]
+     fn motor_settings_validate_and_persist() {
+--- a/crates/pumpkin-core/src/block/entities/create_press.rs
++++ b/crates/pumpkin-core/src/block/entities/create_press.rs
+@@ -11,7 +11,7 @@
+ pub(crate) const ID: &str = "create:mechanical_press";
+ 
+ // shortcut: pinned recipes have singleton input tags, load recipe packs when custom processing is supported.
+-fn result(stack: &ItemStack) -> Option<&'static Item> {
++pub(super) fn result(stack: &ItemStack) -> Option<&'static Item> {
+     if stack.is_empty() {
+         return None;
+     }
+@@ -42,7 +42,6 @@
+         })
+ }
+ 
+-// shortcut: belt callbacks need their own held-item transaction.
+ pub(super) fn tick(
+     cycle: &mut PressCycle,
+     mode: &mut PressMode,

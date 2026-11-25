@@ -1,0 +1,1057 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index aa52b9b..5fa1257 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -920,6 +920,10 @@ dependencies = [
+  "cfg-if",
+ ]
+ 
++[[package]]
++name = "create-engine"
++version = "0.9.0"
++
+ [[package]]
+ name = "criterion"
+ version = "0.8.2"
+@@ -3043,6 +3047,7 @@ dependencies = [
+  "bitflags 2.13.2",
+  "bytes",
+  "colored",
++ "create-engine",
+  "crossbeam",
+  "dashmap",
+  "ed25519-dalek",
+diff --git a/crates/pumpkin-command/src/argument_types/block.rs b/crates/pumpkin-command/src/argument_types/block.rs
+index 61526e1..b32fe53 100644
+--- a/crates/pumpkin-command/src/argument_types/block.rs
++++ b/crates/pumpkin-command/src/argument_types/block.rs
+@@ -6,7 +6,7 @@ use crate::{
+     string_reader::StringReader,
+     suggestion::suggestions::{Suggestions, SuggestionsBuilder},
+ };
+-use pumpkin_data::{Block, translation};
++use pumpkin_data::{Block, BlockStateId, Property, translation};
+ use pumpkin_util::text::TextComponent;
+ 
+ pub const INVALID_BLOCK_ERROR_TYPE: CommandErrorType<1> = CommandErrorType::new(
+@@ -53,6 +53,53 @@ impl<S: crate::source::CommandSource> ArgumentType<S> for BlockArgumentType {
+     }
+ }
+ 
++#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
++pub struct BlockStateArgumentType;
++
++impl<S: crate::source::CommandSource> ArgumentType<S> for BlockStateArgumentType {
++    type Item = BlockStateId;
++
++    fn parse(&self, reader: &mut StringReader) -> Result<Self::Item, CommandSyntaxError> {
++        let block = <BlockArgumentType as ArgumentType<S>>::parse(&BlockArgumentType, reader)?;
++        if reader.peek() != Some('[') {
++            return Ok(block.default_state.id);
++        }
++        let start = reader.cursor();
++        reader.read_until_space();
++        let token = &reader.string()[start..reader.cursor()];
++        let invalid = || {
++            INVALID_BLOCK_ERROR_TYPE.create(
++                reader,
++                TextComponent::text(format!("{}{token}", block.name)),
++            )
++        };
++        let fields = token
++            .strip_prefix('[')
++            .and_then(|s| s.strip_suffix(']'))
++            .ok_or_else(invalid)?;
++        if fields.is_empty() {
++            return Ok(block.default_state.id);
++        }
++        let mut properties: Vec<Property> = Vec::new();
++        for field in fields.split(',') {
++            let (key, value) = field.split_once('=').ok_or_else(invalid)?;
++            if properties.iter().any(|p| p.key_str() == key) {
++                return Err(invalid());
++            }
++            properties.push(Property::from_str_pair(key, value).ok_or_else(invalid)?);
++        }
++        let result = block.from_properties(&properties);
++        if !properties.iter().all(|p| result.to_props().contains(p)) {
++            return Err(invalid());
++        }
++        Ok(result.to_state_id(block))
++    }
++
++    fn client_side_parser(&self) -> JavaClientArgumentType {
++        JavaClientArgumentType::BlockState
++    }
++}
++
+ impl BlockArgumentType {
+     pub fn get<S: crate::source::CommandSource>(
+         context: &CommandContext<S>,
+diff --git a/crates/pumpkin-core/Cargo.toml b/crates/pumpkin-core/Cargo.toml
+index 14c7a72..9eba2c2 100644
+--- a/crates/pumpkin-core/Cargo.toml
++++ b/crates/pumpkin-core/Cargo.toml
+@@ -21,6 +21,7 @@ pumpkin-config.workspace = true
+ pumpkin-command.workspace = true
+ pumpkin-inventory.workspace = true
+ pumpkin-world.workspace = true
++create-engine = { path = "../../../../../research_create_rust/.create-lab-build/stage/native-crates/create/engine" }
+ pumpkin-data = { workspace = true, features = ["default"] }
+ pumpkin-protocol = { workspace = true, features = ["default"] }
+ pumpkin-macros.workspace = true
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+new file mode 100644
+index 0000000..27642d1
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -0,0 +1,169 @@
++use std::{
++    any::Any,
++    sync::{
++        Arc,
++        atomic::{AtomicU32, Ordering},
++    },
++};
++
++use create_engine::kinetics::{Axis, Kind, Node, Pos, solve};
++use pumpkin_data::{Block, BlockStateId};
++use pumpkin_nbt::compound::NbtCompound;
++use pumpkin_util::math::position::BlockPos;
++
++use super::BlockEntity;
++use crate::world::World;
++
++pub(super) const MOTOR: &str = "create:creative_motor";
++pub(super) const SHAFT: &str = "create:shaft";
++pub(super) const COG: &str = "create:cogwheel";
++
++pub(super) struct CreateKinetic {
++    id: &'static str,
++    position: BlockPos,
++    rpm: AtomicU32,
++}
++
++impl CreateKinetic {
++    pub(super) fn new(id: &'static str, position: BlockPos) -> Self {
++        Self {
++            id,
++            position,
++            rpm: AtomicU32::new(0),
++        }
++    }
++}
++
++fn node(state: BlockStateId, pos: Pos) -> Option<Node> {
++    let block = Block::from_state_id(state);
++    let property = match block.name {
++        MOTOR => "facing",
++        SHAFT | COG => "axis",
++        _ => return None,
++    };
++    let value = block
++        .properties(state)?
++        .to_props()
++        .into_iter()
++        .find(|entry| entry.key_str() == property)?
++        .value_str();
++    let axis = match value {
++        "x" | "east" | "west" => Axis::X,
++        "y" | "up" | "down" => Axis::Y,
++        "z" | "south" | "north" => Axis::Z,
++        _ => return None,
++    };
++    let kind = match block.name {
++        MOTOR => {
++            let mut facing = [0; 3];
++            facing[axis.index()] = if matches!(value, "west" | "down" | "north") {
++                -1
++            } else {
++                1
++            };
++            Kind::Motor {
++                facing,
++                rpm: 32.0,
++                capacity: 1024.0,
++            }
++        }
++        SHAFT => Kind::Shaft,
++        _ => Kind::Cog { large: false },
++    };
++    Some(Node { pos, axis, kind })
++}
++
++impl BlockEntity for CreateKinetic {
++    fn from_nbt(nbt: &NbtCompound, position: BlockPos) -> Self {
++        let id = match nbt.get_string("id") {
++            Some(MOTOR) => MOTOR,
++            Some(SHAFT) => SHAFT,
++            _ => COG,
++        };
++        // This is a derived value. The next tick recalculates it from loaded blocks.
++        let entity = Self::new(id, position);
++        let rpm = nbt
++            .get_float("Speed")
++            .filter(|rpm| rpm.is_finite())
++            .unwrap_or(0.0);
++        entity.rpm.store(rpm.to_bits(), Ordering::Relaxed);
++        entity
++    }
++
++    fn write_nbt(&self, tag: &mut NbtCompound) {
++        tag.put_float("Speed", f32::from_bits(self.rpm.load(Ordering::Relaxed)));
++    }
++
++    fn resource_location(&self) -> &'static str {
++        self.id
++    }
++    fn get_position(&self) -> BlockPos {
++        self.position
++    }
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++
++    fn chunk_data_nbt(&self) -> Option<NbtCompound> {
++        let mut tag = NbtCompound::new();
++        self.write_nbt(&mut tag);
++        Some(tag)
++    }
++
++    fn tick(&self, world: &Arc<World>) {
++        let read = |[x, y, z]: Pos| {
++            let pos = BlockPos::new(x, y, z);
++            node(world.get_block_state_id_if_loaded(&pos)?, [x, y, z])
++        };
++        let pos = [self.position.0.x, self.position.0.y, self.position.0.z];
++        let Some(start) = read(pos) else { return };
++        // shortcut: independent loaded-neighborhood solves for the three-block lab; cache connected components before scaling up.
++        let mut exhausted = false;
++        let mut budget = 512usize;
++        let network = solve(start, |pos| {
++            let Some(left) = budget.checked_sub(1) else {
++                exhausted = true;
++                return None;
++            };
++            budget = left;
++            read(pos)
++        });
++        let rpm = if exhausted { 0.0 } else { network.speed(pos) };
++        if self.rpm.swap(rpm.to_bits(), Ordering::Relaxed) != rpm.to_bits()
++            && let Some(entity) = world.get_block_entity(&self.position)
++            && entity
++                .as_any()
++                .downcast_ref::<Self>()
++                .is_some_and(|live| std::ptr::eq(live, self))
++        {
++            world.update_block_entity(&entity);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn server_blocks_feed_the_create_solver() {
++        let states = [36349, 37744, 36344].map(|id| BlockStateId::new(id).unwrap());
++        let nodes = states
++            .into_iter()
++            .enumerate()
++            .map(|(x, state)| node(state, [x as i32, 80, 0]).unwrap())
++            .collect::<Vec<_>>();
++        let cog = nodes[2];
++        let rpm = |shaft| {
++            solve(cog, |pos| {
++                nodes
++                    .iter()
++                    .copied()
++                    .find(|n| n.pos == pos && (shaft || n.pos != [1, 80, 0]))
++            })
++            .speed(cog.pos)
++        };
++        assert_eq!(rpm(true), 32.0);
++        assert_eq!(rpm(false), 0.0);
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/entities/mod.rs b/crates/pumpkin-core/src/block/entities/mod.rs
+index d843338..072b11e 100644
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -21,6 +21,7 @@ pub mod chest_like_block_entity;
+ pub mod chiseled_bookshelf;
+ pub mod command_block;
+ pub mod comparator;
++mod create_kinetic;
+ pub mod daylight_detector;
+ pub mod dropper;
+ pub mod end_portal;
+@@ -185,6 +186,9 @@ pub fn block_entity_from_nbt(nbt: &NbtCompound) -> Option<Arc<dyn BlockEntity>>
+     let z = nbt.get_int("z")?;
+     let pos = BlockPos::new(x, y, z);
+     match id {
++        create_kinetic::MOTOR | create_kinetic::SHAFT | create_kinetic::COG => {
++            Some(Arc::new(create_kinetic::CreateKinetic::from_nbt(nbt, pos)))
++        }
+         barrel::BarrelBlockEntity::ID => {
+             Some(Arc::new(barrel::BarrelBlockEntity::from_nbt(nbt, pos)))
+         }
+@@ -329,6 +333,10 @@ pub fn block_entity_from_nbt(nbt: &NbtCompound) -> Option<Arc<dyn BlockEntity>>
+ #[must_use]
+ pub fn has_block_block_entity(block: &Block) -> bool {
+     BLOCK_ENTITY_TYPES.contains(&block.name)
++        || matches!(
++            block.name,
++            create_kinetic::MOTOR | create_kinetic::SHAFT | create_kinetic::COG
++        )
+ }
+ 
+ #[must_use]
+@@ -343,6 +351,18 @@ pub fn create_block_entity(
+     }
+     let name = BLOCK_ENTITY_TYPES.get(block_entity_type_id as usize)?;
+     match *name {
++        "creative_motor" => Some(Arc::new(create_kinetic::CreateKinetic::new(
++            create_kinetic::MOTOR,
++            position,
++        ))),
++        "shaft" => Some(Arc::new(create_kinetic::CreateKinetic::new(
++            create_kinetic::SHAFT,
++            position,
++        ))),
++        "cogwheel" => Some(Arc::new(create_kinetic::CreateKinetic::new(
++            create_kinetic::COG,
++            position,
++        ))),
+         "furnace" => Some(Arc::new(furnace::FurnaceBlockEntity::new(position))),
+         "chest" => Some(Arc::new(chest::ChestBlockEntity::new(position))),
+         "trapped_chest" => Some(Arc::new(trapped_chest::TrappedChestBlockEntity::new(
+diff --git a/crates/pumpkin-core/src/command/commands/setblock.rs b/crates/pumpkin-core/src/command/commands/setblock.rs
+index 082f81e..ed1ac39 100644
+--- a/crates/pumpkin-core/src/command/commands/setblock.rs
++++ b/crates/pumpkin-core/src/command/commands/setblock.rs
+@@ -1,11 +1,11 @@
+-use pumpkin_data::translation;
++use pumpkin_data::{BlockStateId, translation};
+ use pumpkin_util::PermissionLvl;
+ use pumpkin_util::permission::{Permission, PermissionDefault, PermissionRegistry};
+ use pumpkin_util::text::TextComponent;
+ use pumpkin_world::world::BlockFlags;
+ 
+ use crate::command::argument_builder::{ArgumentBuilder, argument, command, literal};
+-use crate::command::argument_types::block::BlockArgumentType;
++use crate::command::argument_types::block::BlockStateArgumentType;
+ use crate::command::argument_types::coordinates::block_pos::BlockPosArgumentType;
+ use crate::command::context::command_context::CommandContext;
+ use crate::command::errors::error_types::CommandErrorType;
+@@ -39,8 +39,7 @@ struct SetBlockExecutor(Mode);
+ 
+ impl CommandExecutor for SetBlockExecutor {
+     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+-        let block = BlockArgumentType::get(context, "block")?;
+-        let block_state_id = block.default_state.id;
++        let block_state_id = *context.get_argument::<BlockStateId>("block")?;
+         let mode = self.0;
+         let world = context.source.world();
+         let pos = BlockPosArgumentType::get_loaded_block_pos(context, "pos")?;
+@@ -123,7 +122,7 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistr
+     dispatcher.register(
+         command("setblock", DESCRIPTION).requires(PERMISSION).then(
+             argument("pos", BlockPosArgumentType).then(
+-                argument("block", BlockArgumentType)
++                argument("block", BlockStateArgumentType)
+                     .executes(SetBlockExecutor(Mode::Replace))
+                     .then(literal("destroy").executes(SetBlockExecutor(Mode::Destroy)))
+                     .then(literal("keep").executes(SetBlockExecutor(Mode::Keep)))
+diff --git a/crates/pumpkin-core/src/net/java/login/login_acknowledged.rs b/crates/pumpkin-core/src/net/java/login/login_acknowledged.rs
+index 970de06..a4eae2c 100644
+--- a/crates/pumpkin-core/src/net/java/login/login_acknowledged.rs
++++ b/crates/pumpkin-core/src/net/java/login/login_acknowledged.rs
+@@ -16,7 +16,21 @@ impl PendingConnection {
+             return Some(PacketHandlerResult::Stop);
+         }
+         self.connection_state.store(ConnectionState::Config);
++        if self.version.load() != CURRENT_MC_VERSION || !self.address.ip().is_loopback() {
++            self.kick(TextComponent::text(
++                "This Create lab accepts localhost Java 26.3 only",
++            ))
++            .await;
++            return Some(PacketHandlerResult::Stop);
++        }
+         self.send_packet_now(&server.get_branding()).await;
++        self.send_packet_now(
++            &pumpkin_protocol::java::client::config::CPluginMessage::new(
++                crate::net::java::pending::CREATE_CHANNEL,
++                crate::net::java::pending::CREATE_IDENTITY,
++            ),
++        )
++        .await;
+ 
+         if server.advanced_config.server_links.enabled {
+             let mut links: Vec<Link> = Vec::new();
+diff --git a/crates/pumpkin-core/src/net/java/pending.rs b/crates/pumpkin-core/src/net/java/pending.rs
+index febad02..c383148 100644
+--- a/crates/pumpkin-core/src/net/java/pending.rs
++++ b/crates/pumpkin-core/src/net/java/pending.rs
+@@ -46,6 +46,9 @@ use crate::{
+ use super::{JavaClient, JavaReadHalf, JavaWriteHalf};
+ 
+ const BRAND_CHANNEL_PREFIX: &str = "minecraft:brand";
++pub(super) const CREATE_CHANNEL: &str = "horizon:block_registry";
++pub(super) const CREATE_IDENTITY: &[u8; 32] =
++    include_bytes!("../../../../../assets/nextmc-create-identity.bin");
+ 
+ /// How long a connection may stay silent before login finishes.
+ ///
+@@ -69,6 +72,7 @@ pub struct PendingConnection {
+     pub gameprofile: Option<GameProfile>,
+     pub config: Option<PlayerConfig>,
+     pub brand: Option<String>,
++    create_verified: bool,
+     pub packet_limiter: PacketRateLimiter,
+     pub verify_token: Option<[u8; 4]>,
+     pub vine_challenge: Option<[u8; 16]>,
+@@ -124,6 +128,7 @@ impl PendingConnection {
+             gameprofile: None,
+             config: None,
+             brand: None,
++            create_verified: false,
+             packet_limiter,
+             login_started: false,
+             login_success_sent: false,
+@@ -529,6 +534,9 @@ impl PendingConnection {
+                 Ok(None)
+             }
+             id if id == SAcknowledgeFinishConfig::to_id(version) => {
++                if !self.create_verified {
++                    return Ok(Some(PacketHandlerResult::Stop));
++                }
+                 let Some(profile) = self.gameprofile.clone() else {
+                     return Ok(Some(PacketHandlerResult::Stop));
+                 };
+@@ -542,6 +550,13 @@ impl PendingConnection {
+                 }
+             }
+             id if id == SKnownPacks::to_id(version) => {
++                if !self.create_verified {
++                    self.kick(TextComponent::text(
++                        "This lab requires the pinned Horizon client with Create enabled",
++                    ))
++                    .await;
++                    return Ok(Some(PacketHandlerResult::Stop));
++                }
+                 self.handle_known_packs(server).await;
+                 Ok(None)
+             }
+@@ -611,7 +626,9 @@ impl PendingConnection {
+ 
+     pub async fn handle_plugin_message(&mut self, plugin_message: SPluginMessage<'_>) {
+         debug!("Handling plugin message");
+-        if plugin_message.channel.starts_with(BRAND_CHANNEL_PREFIX) {
++        if plugin_message.channel == CREATE_CHANNEL {
++            self.create_verified = plugin_message.data == CREATE_IDENTITY;
++        } else if plugin_message.channel.starts_with(BRAND_CHANNEL_PREFIX) {
+             debug!("Got a client brand");
+             match core::str::from_utf8(plugin_message.data) {
+                 Ok(brand) => self.brand = Some(brand.to_string()),
+diff --git a/crates/pumpkin-data/src/block_state.rs b/crates/pumpkin-data/src/block_state.rs
+index 61b21bc..cf3dca2 100644
+--- a/crates/pumpkin-data/src/block_state.rs
++++ b/crates/pumpkin-data/src/block_state.rs
+@@ -288,7 +288,7 @@ impl BlockStateId {
+     // depends on generated impl:
+     // pub(crate) const STATE_COUNT: u16;
+ 
+-    /// The total count of all registered block states.
++    /// One greater than the largest registered state ID.
+     pub const COUNT: u16 = Self::STATE_COUNT;
+ 
+     // SAFETY: There must never be a BlockStateId where self.0 >= BlockStateId::STATE_COUNT
+@@ -296,7 +296,7 @@ impl BlockStateId {
+     #[inline]
+     #[must_use]
+     pub const fn new(inner: u16) -> Option<Self> {
+-        if inner < Self::STATE_COUNT {
++        if Self::is_valid_raw_id(inner) {
+             return Some(Self(inner));
+         }
+         None
+@@ -305,7 +305,7 @@ impl BlockStateId {
+     #[inline]
+     #[must_use]
+     pub const fn new_or_air(inner: u16) -> Self {
+-        if inner < Self::STATE_COUNT {
++        if Self::is_valid_raw_id(inner) {
+             return Self(inner);
+         }
+         Self::AIR
+diff --git a/crates/pumpkin-data/src/blocks.rs b/crates/pumpkin-data/src/blocks.rs
+index a6f7d64..6382219 100644
+--- a/crates/pumpkin-data/src/blocks.rs
++++ b/crates/pumpkin-data/src/blocks.rs
+@@ -328,7 +328,7 @@ impl BlockId {
+     // depends on generated impl:
+     // pub(crate) const BLOCK_COUNT: u16;
+ 
+-    /// The total count of all registered blocks.
++    /// One greater than the largest registered block ID.
+     pub const COUNT: u16 = Self::BLOCK_COUNT;
+ 
+     // SAFETY: There must never be a BlockId where self.0 >= BlockId::BLOCK_COUNT
+@@ -336,7 +336,7 @@ impl BlockId {
+     #[inline]
+     #[must_use]
+     pub const fn new(inner: u16) -> Option<Self> {
+-        if inner < Self::BLOCK_COUNT {
++        if Self::is_valid_raw_id(inner) {
+             return Some(Self(inner));
+         }
+         None
+@@ -345,7 +345,7 @@ impl BlockId {
+     #[inline]
+     #[must_use]
+     pub const fn new_or_air(inner: u16) -> Self {
+-        if inner < Self::BLOCK_COUNT {
++        if Self::is_valid_raw_id(inner) {
+             return Self(inner);
+         }
+         Self::AIR
+@@ -430,7 +430,10 @@ mod tests {
+         let mut xyz = 0;
+ 
+         for raw_id in 0..BlockId::BLOCK_COUNT {
+-            match Block::from_id(BlockId::new(raw_id).unwrap())
++            let Some(block_id) = BlockId::new(raw_id) else {
++                continue;
++            };
++            match Block::from_id(block_id)
+                 .shape_offset()
+                 .map(|offset| offset.offset_type)
+             {
+diff --git a/crates/pumpkin-protocol/src/java/client/config/config_disconnect.rs b/crates/pumpkin-protocol/src/java/client/config/config_disconnect.rs
+index 8581679..b5c2c08 100644
+--- a/crates/pumpkin-protocol/src/java/client/config/config_disconnect.rs
++++ b/crates/pumpkin-protocol/src/java/client/config/config_disconnect.rs
+@@ -3,7 +3,7 @@ use pumpkin_macros::java_packet;
+ 
+ use crate::ClientPacket;
+ use crate::ser::NetworkWriteExt;
+-use pumpkin_util::version::JavaMinecraftVersion;
++use pumpkin_util::{text::TextComponent, version::JavaMinecraftVersion};
+ 
+ #[java_packet(DISCONNECT)]
+ pub struct CConfigDisconnect<'a> {
+@@ -21,9 +21,8 @@ impl ClientPacket for CConfigDisconnect<'_> {
+     fn write_packet_data(
+         &self,
+         mut write: impl std::io::Write,
+-        _version: &JavaMinecraftVersion,
++        version: &JavaMinecraftVersion,
+     ) -> Result<(), crate::ser::WritingError> {
+-        write.write_string(self.reason)?;
+-        Ok(())
++        write.write_component(&TextComponent::text(self.reason.to_owned()), version)
+     }
+ }
+diff --git a/crates/pumpkin-world/src/block/mod.rs b/crates/pumpkin-world/src/block/mod.rs
+index ae0a618..2a433f8 100644
+--- a/crates/pumpkin-world/src/block/mod.rs
++++ b/crates/pumpkin-world/src/block/mod.rs
+@@ -66,7 +66,12 @@ impl BlockStateCodec {
+     pub fn state_to_nbt(state_id: BlockStateId) -> NbtCompound {
+         let block = Block::from_state_id(state_id);
+         let mut nbt = NbtCompound::new();
+-        nbt.put_string("Name", format!("minecraft:{}", block.name));
++        let name = if block.name.contains(':') {
++            block.name.to_owned()
++        } else {
++            format!("minecraft:{}", block.name)
++        };
++        nbt.put_string("Name", name);
+         if let Some(properties) = block.properties(state_id) {
+             let properties = properties.to_props();
+             if !properties.is_empty() {
+diff --git a/crates/pumpkin-world/src/chunk/format/mod.rs b/crates/pumpkin-world/src/chunk/format/mod.rs
+index ec64a88..c20b00d 100644
+--- a/crates/pumpkin-world/src/chunk/format/mod.rs
++++ b/crates/pumpkin-world/src/chunk/format/mod.rs
+@@ -585,7 +585,7 @@ impl ChunkData {
+                 .map(|&id| {
+                     let block = Block::from_state_id(id);
+                     let mut comp = NbtCompound::new();
+-                    let name = if block.name.starts_with("minecraft:") {
++                    let name = if block.name.contains(':') {
+                         block.name.to_string()
+                     } else {
+                         format!("minecraft:{}", block.name)
+diff --git a/crates/pumpkin/src/main.rs b/crates/pumpkin/src/main.rs
+index df51068..c5993f5 100644
+--- a/crates/pumpkin/src/main.rs
++++ b/crates/pumpkin/src/main.rs
+@@ -76,6 +76,18 @@ async fn main() {
+ 
+     pumpkin_core::init_logger(&config.advanced);
+ 
++    let net = &config.advanced.networking;
++    if !net.java.enabled
++        || !net.java.address.ip().is_loopback()
++        || net.bedrock.enabled
++        || config.basic.default_level_name != "create-lab"
++    {
++        tracing::error!(
++            "The Create core lab requires Java loopback only, Bedrock off, and default_level_name = create-lab"
++        );
++        exit(1);
++    }
++
+     if let Some(target_arg) = parse_convert_world_arg(std::env::args().skip(1)) {
+         let anvil_default = match &config.advanced.world.chunk {
+             pumpkin_config::chunk::ChunkConfig::Anvil(cfg) => cfg.clone(),
+diff --git a/tools/pumpkin-codegen/src/block.rs b/tools/pumpkin-codegen/src/block.rs
+index a18c76f..cd38ba6 100644
+--- a/tools/pumpkin-codegen/src/block.rs
++++ b/tools/pumpkin-codegen/src/block.rs
+@@ -14,35 +14,58 @@ use syn::{Ident, LitInt, LitStr};
+ 
+ use crate::bitsets::{Bitset, gen_u16_bitset};
+ 
+-/// Converts a sparse index-value list into a dense array, filling gaps with `None` tokens.
++/// Converts a sparse index-value list into a dense array with the supplied safe default for gaps.
+ ///
+ /// # Arguments
+ /// – `array` – pairs of `(index, value)` where `index` is the position in the output array.
+-fn fill_array<T: Clone + ToTokens>(array: Vec<(u16, T)>) -> Vec<TokenStream> {
++fn fill_array<T: Clone + ToTokens>(array: Vec<(u16, T)>, default: TokenStream) -> Vec<TokenStream> {
+     let max_index = array.iter().map(|(index, _)| index).max().unwrap();
+-    let mut raw_id_from_state_id_ordered = vec![quote! { None }; (max_index + 1) as usize];
++    let mut ordered = vec![default; (max_index + 1) as usize];
+ 
+-    for (state_id, id_lit) in array {
+-        raw_id_from_state_id_ordered[state_id as usize] = quote! { #id_lit };
++    for (index, value) in array {
++        ordered[index as usize] = quote! { #value };
+     }
+ 
+-    raw_id_from_state_id_ordered
++    ordered
+ }
+ 
+-/// Converts a sparse `(block_ident, state_index, state_id)` list into a dense `TokenStream` array.
++/// Converts a sparse state mapping into a dense array with the supplied safe default for gaps.
+ ///
+ /// # Arguments
+ /// – `array` – triples of `(block_ident, state_index, state_id)` mapping each state ID to the block constant and local index.
+-fn fill_state_array(array: Vec<(Ident, usize, u16)>) -> Vec<TokenStream> {
++fn fill_state_array(array: Vec<(Ident, usize, u16)>, default: TokenStream) -> Vec<TokenStream> {
+     let max_index = array.iter().map(|(_, _, index)| index).max().unwrap();
+-    let mut ret = vec![quote! { Missed State }; (max_index + 1) as usize];
++    let mut ordered = vec![default; (max_index + 1) as usize];
+ 
+     for (block, index, state_id) in array {
+         let index_lit = LitInt::new(&index.to_string(), Span::call_site());
+-        ret[state_id as usize] = quote! { &Block::#block.states[#index_lit] };
++        ordered[state_id as usize] = quote! { &Block::#block.states[#index_lit] };
+     }
+ 
+-    ret
++    ordered
++}
++
++// Compact raw-ID validity checks so sparse protocol IDs do not create huge match expressions.
++fn compress_id_ranges(mut ids: Vec<u16>) -> Vec<(u16, u16)> {
++    ids.sort_unstable();
++    ids.dedup();
++    let Some(mut start) = ids.first().copied() else {
++        return Vec::new();
++    };
++    let mut end = start;
++    let mut ranges = Vec::new();
++
++    for id in ids.into_iter().skip(1) {
++        if end.checked_add(1) == Some(id) {
++            end = id;
++        } else {
++            ranges.push((start, end));
++            start = id;
++            end = id;
++        }
++    }
++    ranges.push((start, end));
++    ranges
+ }
+ 
+ /// Converts a block registry name into the SCREAMING_SNAKE_CASE constant identifier.
+@@ -124,6 +147,13 @@ struct PropertyCollectionData {
+     variant_mappings: Vec<PropertyVariantMapping>,
+     /// All blocks (by name and numeric ID) that belong to this property group.
+     blocks: Vec<(String, u16)>,
++    /// Blocks whose state property ordering differs from the property registry ordering.
++    explicit_states: Vec<ExplicitStateProperties>,
++}
++
++struct ExplicitStateProperties {
++    block_name: String,
++    states: Vec<(u16, BTreeMap<String, String>)>,
+ }
+ 
+ impl PropertyCollectionData {
+@@ -132,8 +162,17 @@ impl PropertyCollectionData {
+     /// # Arguments
+     /// – `block_name` – the registry name of the block.
+     /// – `block_id` – the numeric block ID.
+-    pub fn add_block(&mut self, block_name: String, block_id: u16) {
+-        self.blocks.push((block_name, block_id));
++    pub fn add_block(
++        &mut self,
++        block_name: String,
++        block_id: u16,
++        states: Vec<(u16, BTreeMap<String, String>)>,
++    ) {
++        self.blocks.push((block_name.clone(), block_id));
++        if !states.is_empty() {
++            self.explicit_states
++                .push(ExplicitStateProperties { block_name, states });
++        }
+     }
+ 
+     /// Creates a new `PropertyCollectionData` from an ordered list of property mappings with no blocks yet registered.
+@@ -144,6 +183,7 @@ impl PropertyCollectionData {
+         Self {
+             variant_mappings,
+             blocks: Vec::new(),
++            explicit_states: Vec::new(),
+         }
+     }
+ 
+@@ -249,6 +289,36 @@ struct BlockPropertyStruct {
+     aliases: Vec<Ident>,
+ }
+ 
++fn explicit_property_value(mapping: &PropertyVariantMapping, raw: &str) -> TokenStream {
++    match &mapping.property_type {
++        PropertyType::Bool => match raw {
++            "true" => quote! { true },
++            "false" => quote! { false },
++            _ => panic!("Invalid boolean block property value: {raw}"),
++        },
++        PropertyType::Int { min, max } => {
++            let value = raw
++                .parse::<u8>()
++                .expect("Invalid integer block property value");
++            assert!(
++                (*min..=*max).contains(&value),
++                "Integer block property value out of range: {raw}"
++            );
++            let value = LitInt::new(&value.to_string(), Span::call_site());
++            quote! { #value }
++        }
++        PropertyType::Enum { name, values, .. } => {
++            assert!(
++                values.iter().any(|value| value == raw),
++                "Unknown block property enum value: {raw}"
++            );
++            let enum_name = Ident::new(name, Span::call_site());
++            let variant = Ident::new(&raw.to_upper_camel_case(), Span::call_site());
++            quote! { #enum_name::#variant }
++        }
++    }
++}
++
+ impl ToTokens for BlockPropertyStruct {
+     fn to_tokens(&self, tokens: &mut TokenStream) {
+         let struct_name = property_group_name_from_derived_name(&self.data.derive_name());
+@@ -271,6 +341,106 @@ impl ToTokens for BlockPropertyStruct {
+             Ident::new(&const_block_name_from_block_name(name), Span::call_site())
+         });
+ 
++        let mut explicit_from_state_arms = Vec::new();
++        let mut explicit_to_state_arms = Vec::new();
++        let to_state_fields: Vec<_> = self
++            .data
++            .variant_mappings
++            .iter()
++            .map(|entry| {
++                let field = Ident::new_raw(&entry.original_name, Span::call_site());
++                quote! { self.#field }
++            })
++            .collect();
++        for explicit_block in &self.data.explicit_states {
++            let block = Ident::new(
++                &const_block_name_from_block_name(&explicit_block.block_name),
++                Span::call_site(),
++            );
++            for (state_id, values) in &explicit_block.states {
++                let state_id_lit = LitInt::new(&state_id.to_string(), Span::call_site());
++                let fields: Vec<_> = self
++                    .data
++                    .variant_mappings
++                    .iter()
++                    .map(|mapping| {
++                        let field = Ident::new_raw(&mapping.original_name, Span::call_site());
++                        let value = values.get(&mapping.original_name).unwrap_or_else(|| {
++                            panic!(
++                                "Explicit block state is missing property {}",
++                                mapping.original_name
++                            )
++                        });
++                        let value = explicit_property_value(mapping, value);
++                        quote! { #field: #value }
++                    })
++                    .collect();
++                let values: Vec<_> = self
++                    .data
++                    .variant_mappings
++                    .iter()
++                    .map(|mapping| {
++                        let value = values.get(&mapping.original_name).unwrap_or_else(|| {
++                            panic!(
++                                "Explicit block state is missing property {}",
++                                mapping.original_name
++                            )
++                        });
++                        explicit_property_value(mapping, value)
++                    })
++                    .collect();
++                explicit_from_state_arms.push(quote! {
++                    (BlockId::#block, #state_id_lit) => Self { #(#fields),* },
++                });
++                explicit_to_state_arms.push(quote! {
++                    (BlockId::#block, #(#values),*) => BlockStateId::new(#state_id_lit).unwrap(),
++                });
++            }
++        }
++
++        let from_state_id_body = if explicit_from_state_arms.is_empty() {
++            quote! {
++                let min_id = block.states[0].id.as_u16();
++                let max_id = block.states.last().map(|state| state.id.as_u16()).unwrap_or(min_id);
++                if (min_id..=max_id).contains(&id.as_u16()) {
++                    Self::from_index(id.as_u16() - min_id)
++                } else {
++                    #[cfg(debug_assertions)]
++                    panic!("State ID {} does not exist for {}", id, block.name);
++                    #[cfg(not(debug_assertions))]
++                    Self::from_index(0)
++                }
++            }
++        } else {
++            quote! {
++                match (block.id, id.as_u16()) {
++                    #(#explicit_from_state_arms)*
++                    _ => {
++                        let min_id = block.states[0].id.as_u16();
++                        let max_id = block.states.last().map(|state| state.id.as_u16()).unwrap_or(min_id);
++                        if (min_id..=max_id).contains(&id.as_u16()) {
++                            Self::from_index(id.as_u16() - min_id)
++                        } else {
++                            #[cfg(debug_assertions)]
++                            panic!("State ID {} does not exist for {}", id, block.name);
++                            #[cfg(not(debug_assertions))]
++                            Self::from_index(0)
++                        }
++                    }
++                }
++            }
++        };
++        let to_state_id_body = if explicit_to_state_arms.is_empty() {
++            quote! { block.states[self.to_index() as usize].id }
++        } else {
++            quote! {
++                match (block.id, #(#to_state_fields),*) {
++                    #(#explicit_to_state_arms)*
++                    _ => block.states[self.to_index() as usize].id,
++                }
++            }
++        };
++
+         let to_index_logic = self.data.variant_mappings.iter().rev().map(|entry| {
+             let field = Ident::new_raw(&entry.original_name, Span::call_site());
+             match &entry.property_type {
+@@ -465,8 +635,7 @@ impl ToTokens for BlockPropertyStruct {
+                 #[must_use]
+                 pub fn from_state_id(id: BlockStateId) -> Self {
+                     let block = Block::from_state_id(id);
+-                    let min_id = block.states[0].id.as_u16();
+-                    Self::from_index(id.as_u16() - min_id)
++                    <Self as BlockProperties>::from_state_id(id, block)
+                 }
+ 
+                 #[inline]
+@@ -505,7 +674,7 @@ impl ToTokens for BlockPropertyStruct {
+                     if !Self::handles_block_id(block.id) {
+                         panic!("{} is not a valid block for {}", block.name, #struct_name);
+                     }
+-                    block.states[self.to_index() as usize].id
++                    #to_state_id_body
+                 }
+ 
+                 fn from_state_id(id: BlockStateId, block: &Block) -> Self {
+@@ -514,18 +683,7 @@ impl ToTokens for BlockPropertyStruct {
+                         "{} is not a valid block for {}", block.name, #struct_name
+                     );
+ 
+-                    let min_id = block.states[0].id.as_u16();
+-                    let max_id = block.states.last().map(|s| s.id.as_u16()).unwrap_or(min_id);
+-
+-                    if (min_id..=max_id).contains(&id.as_u16()) {
+-                        Self::from_index(id.as_u16() - min_id)
+-                    } else {
+-                        #[cfg(debug_assertions)]
+-                        panic!("State ID {} does not exist for {}", id, block.name);
+-
+-                        #[cfg(not(debug_assertions))]
+-                        Self::from_index(0)
+-                    }
++                    #from_state_id_body
+                 }
+ 
+                 fn default(block: &Block) -> Self {
+@@ -647,6 +805,9 @@ pub struct BlockState {
+     pub sound_type: u8,
+     /// Associated block-entity type ID, if any.
+     pub block_entity_type: Option<u16>,
++    /// Serialized property values for registries whose state order is not a simple Cartesian product.
++    #[serde(default)]
++    pub properties: Option<BTreeMap<String, String>>,
+ }
+ 
+ /// Describes how a piston interacts with a block.
+@@ -1512,10 +1673,41 @@ pub fn build() -> TokenStream {
+             let mut property_collection_vec: Vec<i32> = property_collection.into_iter().collect();
+             property_collection_vec.sort_unstable();
+ 
++            let explicit_states = if block.states.iter().any(|state| state.properties.is_some()) {
++                assert!(
++                    block.states.iter().all(|state| state.properties.is_some()),
++                    "Block {} must provide property values for every state or none",
++                    block.name
++                );
++                let expected_keys: HashSet<_> = property_mapping
++                    .iter()
++                    .map(|mapping| mapping.original_name.as_str())
++                    .collect();
++                block
++                    .states
++                    .iter()
++                    .map(|state| {
++                        let properties = state.properties.as_ref().unwrap();
++                        assert_eq!(
++                            properties
++                                .keys()
++                                .map(String::as_str)
++                                .collect::<HashSet<_>>(),
++                            expected_keys,
++                            "Block {} state {} property set does not match its block",
++                            block.name,
++                            state.id.0
++                        );
++                        (state.id.0, properties.clone())
++                    })
++                    .collect()
++            } else {
++                Vec::new()
++            };
+             property_collection_map
+                 .entry(property_collection_vec)
+                 .or_insert_with(|| PropertyCollectionData::from_mappings(property_mapping))
+-                .add_block(block.name.clone(), block.id.0);
++                .add_block(block.name.clone(), block.id.0, explicit_states);
+         }
+ 
+         if existing_item_ids.insert(item_id) {
+@@ -1590,7 +1782,39 @@ pub fn build() -> TokenStream {
+         .iter()
+         .map(|entity_type| LitStr::new(entity_type, Span::call_site()));
+ 
+-    let raw_id_from_state_id_ordered = fill_array(raw_id_from_state_id_array);
++    let block_id_valid_patterns =
++        compress_id_ranges(type_from_raw_id_array.iter().map(|(id, _)| *id).collect())
++            .into_iter()
++            .map(|(start, end)| {
++                let start_lit = LitInt::new(&start.to_string(), Span::call_site());
++                if start == end {
++                    quote! { #start_lit }
++                } else {
++                    let end_lit = LitInt::new(&end.to_string(), Span::call_site());
++                    quote! { #start_lit..=#end_lit }
++                }
++            })
++            .collect::<Vec<_>>();
++    let state_id_valid_patterns = compress_id_ranges(
++        state_from_state_id_array
++            .iter()
++            .map(|(_, _, id)| *id)
++            .collect(),
++    )
++    .into_iter()
++    .map(|(start, end)| {
++        let start_lit = LitInt::new(&start.to_string(), Span::call_site());
++        if start == end {
++            quote! { #start_lit }
++        } else {
++            let end_lit = LitInt::new(&end.to_string(), Span::call_site());
++            quote! { #start_lit..=#end_lit }
++        }
++    })
++    .collect::<Vec<_>>();
++
++    let raw_id_from_state_id_ordered =
++        fill_array(raw_id_from_state_id_array, quote! { BlockId::AIR });
+     let max_state_id = raw_id_from_state_id_ordered.len();
+     let raw_id_from_state_id = quote! { #(#raw_id_from_state_id_ordered),* };
+ 
+@@ -1606,11 +1830,12 @@ pub fn build() -> TokenStream {
+     }
+     let block_state_to_bedrock_t = quote! { #(#state_to_bedrock_tokens),* };
+ 
+-    let type_from_raw_id_vec = fill_array(type_from_raw_id_array);
++    let type_from_raw_id_vec = fill_array(type_from_raw_id_array, quote! { &Block::AIR });
+     let max_type_id = type_from_raw_id_vec.len();
+     let type_from_raw_id_items = quote! { #(#type_from_raw_id_vec),* };
+ 
+-    let state_from_state_id_vec = fill_state_array(state_from_state_id_array);
++    let state_from_state_id_vec =
++        fill_state_array(state_from_state_id_array, quote! { &Block::AIR.states[0] });
+     let max_state_id_2 = state_from_state_id_vec.len();
+     let state_from_state_id = quote! { #(#state_from_state_id_vec),* };
+ 
+@@ -1840,6 +2065,10 @@ pub fn build() -> TokenStream {
+             pub const AIR: Self = Block::AIR.default_state.id;
+ 
+             pub(crate) const STATE_COUNT: u16 = mappings::STATE_FROM_STATE_ID.len() as u16;
++
++            pub(crate) const fn is_valid_raw_id(id: u16) -> bool {
++                matches!(id, #(#state_id_valid_patterns)|*)
++            }
+         }
+ 
+         mod mappings {
+@@ -1961,6 +2190,10 @@ pub fn build() -> TokenStream {
+ 
+             pub(crate) const BLOCK_COUNT: u16 = mappings::TYPE_FROM_RAW_ID.len() as u16;
+ 
++            pub(crate) const fn is_valid_raw_id(id: u16) -> bool {
++                matches!(id, #(#block_id_valid_patterns)|*)
++            }
++
+             /// Get a [`BlockId`] from a [`BlockStateId`]
+             #[inline]
+             #[must_use]
+@@ -2200,3 +2433,16 @@ fn parse_geyser_entry(
+ 
+     (bedrock_identifier, properties)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::compress_id_ranges;
++
++    #[test]
++    fn compresses_sparse_id_runs_without_filling_gaps() {
++        assert_eq!(
++            compress_id_ranges(vec![9, 2, 5, 1, 8, 0, 2]),
++            vec![(0, 2), (5, 5), (8, 9)]
++        );
++    }
++}

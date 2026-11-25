@@ -1,0 +1,247 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -224,7 +224,7 @@
+     chain_signal: u8,
+     press: PressCycle,
+     press_finished: bool,
+-    press_basin: bool,
++    press_mode: PressMode,
+     valve: Option<[f32; 3]>,
+     air_current: Option<Vec<i32>>,
+ }
+@@ -633,7 +633,10 @@
+                 applied: ticks > pressing::CYCLE / 2 || nbt.get_int("Applied") == Some(1),
+             };
+             readings.press_finished = nbt.get_bool("Finished").unwrap_or(false);
+-            readings.press_basin = nbt.get_int("Mode") == Some(PressMode::Basin as i32);
++            readings.press_mode = nbt
++                .get_int("Mode")
++                .and_then(PressMode::from_index)
++                .unwrap_or_default();
+         }
+         if id == pipe::VALVE
+             && let Some(tag) = nbt.get_compound("Pointer")
+@@ -733,14 +736,7 @@
+             tag.put_int("Ticks", readings.press.ticks);
+             tag.put_int("Applied", i32::from(readings.press.applied));
+             tag.put_bool("Finished", readings.press_finished);
+-            tag.put_int(
+-                "Mode",
+-                if readings.press_basin {
+-                    PressMode::Basin
+-                } else {
+-                    PressMode::Belt
+-                } as i32,
+-            );
++            tag.put_int("Mode", readings.press_mode as i32);
+         }
+         if let Some([value, target, speed]) = readings.valve {
+             let mut pointer = NbtCompound::new();
+@@ -1093,10 +1089,10 @@
+             let mut press_changed = false;
+             if self.id == press::ID {
+                 let mut cycle = readings.press;
+-                next.press_basin = readings.press_basin;
++                next.press_mode = readings.press_mode;
+                 let action = press::tick(
+                     &mut cycle,
+-                    &mut next.press_basin,
++                    &mut next.press_mode,
+                     world,
+                     self.position,
+                     next.rpm,
+diff --git a/crates/pumpkin-core/src/block/entities/create_press.rs b/crates/pumpkin-core/src/block/entities/create_press.rs
+--- a/crates/pumpkin-core/src/block/entities/create_press.rs
++++ b/crates/pumpkin-core/src/block/entities/create_press.rs
+@@ -1,12 +1,12 @@
+-use std::sync::{Arc, PoisonError};
++use std::sync::{Arc, PoisonError, atomic::Ordering};
+ 
+-use create_engine::pressing::{Action, PressCycle};
++use create_engine::pressing::{Action, PressCycle, PressMode};
+ use pumpkin_data::{item::Item, item_stack::ItemStack};
+ use pumpkin_inventory::Inventory;
+-use pumpkin_util::math::position::BlockPos;
++use pumpkin_util::math::{boundingbox::BoundingBox, position::BlockPos};
+ 
+ use super::{create_depot::CreateDepotBlockEntity, create_mixer as mixer};
+-use crate::world::World;
++use crate::{entity::EntityBase, world::World};
+ 
+ pub(crate) const ID: &str = "create:mechanical_press";
+ 
+@@ -24,24 +24,50 @@
+     })
+ }
+ 
+-// shortcut: loose entities and belts need separate ownership hooks.
++fn grounded_items(
++    world: &World,
++    gap: BlockPos,
++    margin: f64,
++) -> impl Iterator<Item = Arc<dyn EntityBase>> {
++    let corner = [gap.0.x, gap.0.y, gap.0.z].map(f64::from);
++    let bounds =
++        BoundingBox::new_array(corner.map(|v| v + margin), corner.map(|v| v + 1.0 - margin));
++    world
++        .get_entities_at_box(&bounds)
++        .into_iter()
++        .filter(|entity| {
++            entity.get_item_entity().is_some()
++                && entity.get_entity().is_alive()
++                && entity.get_entity().on_ground.load(Ordering::Relaxed)
++        })
++}
++
++// shortcut: belt callbacks need their own held-item transaction.
+ pub(super) fn tick(
+     cycle: &mut PressCycle,
+-    basin_mode: &mut bool,
++    mode: &mut PressMode,
+     world: &Arc<World>,
+     pos: BlockPos,
+     rpm: f32,
+ ) -> Action {
+     let gap = BlockPos::new(pos.0.x, pos.0.y - 1, pos.0.z);
+     let target = BlockPos::new(pos.0.x, pos.0.y - 2, pos.0.z);
+-    let entity = world.get_block_entity(&target).filter(|_| {
+-        world.get_block_state_id_if_loaded(&gap).is_some_and(|id| {
+-            id.to_state()
+-                .get_block_collision_shapes_at(&gap)
+-                .next()
+-                .is_none()
+-        })
++    let open = world.get_block_state_id_if_loaded(&gap).is_some_and(|id| {
++        id.to_state()
++            .get_block_collision_shapes_at(&gap)
++            .next()
++            .is_none()
+     });
++    let entity = open.then(|| world.get_block_entity(&target)).flatten();
++    let world_mode = open
++        && world
++            .get_block_state_id_if_loaded(&target)
++            .is_some_and(|id| {
++                !matches!(
++                    id.to_block().name,
++                    "create:belt" | "create:depot" | "create:basin"
++                )
++            });
+     let depot = entity.as_ref().and_then(|entity| {
+         entity
+             .as_any()
+@@ -54,25 +80,54 @@
+             .iter()
+             .find(|recipe| recipe.matches(&**basin, world))
+     };
+-    let can_compact = !cycle.running && basin.as_ref().and_then(recipe).is_some();
+-    let action = cycle.tick(
+-        rpm,
+-        can_compact || (!cycle.running && depot.is_some_and(|d| result(&d.get_stack(0)).is_some())),
+-    );
++    let ready = if cycle.running || rpm == 0.0 {
++        None
++    } else if basin.as_ref().and_then(recipe).is_some() {
++        Some(PressMode::Basin)
++    } else if depot.is_some_and(|d| result(&d.get_stack(0)).is_some()) {
++        Some(PressMode::Belt)
++    } else if world_mode
++        && world.get_world_age() % 10 == 0
++        && grounded_items(world, gap, 0.125).any(|entity| {
++            let stack = entity
++                .get_item_entity()
++                .unwrap()
++                .get_item_stack()
++                .lock()
++                .unwrap_or_else(PoisonError::into_inner);
++            result(&stack).is_some()
++        })
++    {
++        Some(PressMode::World)
++    } else {
++        None
++    };
++    let action = cycle.tick(rpm, ready.is_some());
+     if action == Action::Started {
+-        *basin_mode = can_compact;
++        *mode = ready.expect("started from a ready input");
+     }
+     if action == Action::Press {
+-        if *basin_mode {
+-            if let Some(basin) = &basin
+-                && let Some(recipe) = recipe(basin)
+-            {
+-                recipe.apply(basin, world);
++        match *mode {
++            PressMode::Basin => {
++                if let Some(basin) = &basin
++                    && let Some(recipe) = recipe(basin)
++                {
++                    recipe.apply(basin, world);
++                }
+             }
+-        } else if let (Some(depot), Some(entity)) = (depot, entity.as_ref())
+-            && process(depot)
+-        {
+-            world.update_block_entity(entity);
++            PressMode::Belt => {
++                if let (Some(depot), Some(entity)) = (depot, entity.as_ref())
++                    && process(depot)
++                {
++                    world.update_block_entity(entity);
++                }
++            }
++            PressMode::World if world_mode => {
++                if let Some(entity) = grounded_items(world, gap, 0.0).next() {
++                    entity.get_item_entity().unwrap().apply_create_press(result);
++                }
++            }
++            PressMode::World => {}
+         }
+     }
+     action
+diff --git a/crates/pumpkin-core/src/entity/item.rs b/crates/pumpkin-core/src/entity/item.rs
+--- a/crates/pumpkin-core/src/entity/item.rs
++++ b/crates/pumpkin-core/src/entity/item.rs
+@@ -166,6 +166,40 @@
+ 
+     pub const fn get_item_stack(&self) -> &Mutex<ItemStack> {
+         &self.item_stack
++    }
++
++    pub(crate) fn apply_create_press(
++        &self,
++        result: impl FnOnce(&ItemStack) -> Option<&'static pumpkin_data::item::Item>,
++    ) {
++        let mut stack = self
++            .item_stack
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if !self.entity.is_alive() || !self.entity.on_ground.load(Relaxed) {
++            return;
++        }
++        let Some(result) = result(&stack) else { return };
++        let output = ItemStack::new(1, result);
++        let split = stack.item_count > 1;
++        if split {
++            stack.item_count -= 1;
++        } else {
++            *stack = output.clone();
++            Self::update_fire_immune(&self.entity, &stack);
++        }
++        drop(stack);
++        self.on_count_changed();
++        if split {
++            let world = self.entity.world.load_full();
++            let entity = Entity::new(world.clone(), self.entity.pos.load(), &EntityType::ITEM);
++            world.spawn_entity(Arc::new(Self::new_with_velocity(
++                entity,
++                output,
++                self.entity.velocity.load(),
++                0,
++            )));
++        }
+     }
+ 
+     pub(crate) fn apply_create_fan<F>(

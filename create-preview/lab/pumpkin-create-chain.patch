@@ -1,0 +1,372 @@
+diff --git a/crates/pumpkin-core/src/block/blocks/mod.rs b/crates/pumpkin-core/src/block/blocks/mod.rs
+--- a/crates/pumpkin-core/src/block/blocks/mod.rs
++++ b/crates/pumpkin-core/src/block/blocks/mod.rs
+@@ -118,6 +118,7 @@
+ pub mod cake;
+ pub mod cauldron;
+ pub mod composter;
++pub(crate) mod create_chain;
+ pub(crate) mod create_depot;
+ pub(crate) mod create_gauge;
+ pub(crate) mod create_hand_crank;
+diff --git a/crates/pumpkin-core/src/block/blocks/create_chain.rs b/crates/pumpkin-core/src/block/blocks/create_chain.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/blocks/create_chain.rs
+@@ -0,0 +1,188 @@
++use create_engine::{
++    chain_drive::{Part, State},
++    kinetics::Axis,
++    placement::Direction,
++};
++use pumpkin_data::{Block, BlockDirection, BlockStateId, block_properties::Property};
++use pumpkin_macros::pumpkin_block;
++use pumpkin_util::math::position::BlockPos;
++use pumpkin_world::world::BlockFlags;
++
++use crate::{
++    block::{
++        BlockActionResult, BlockBehaviour, GetStateForNeighborUpdateArgs, UseWithItemArgs,
++        blocks::redstone,
++    },
++    world::World,
++};
++
++pub(crate) const DRIVE: &str = "create:encased_chain_drive";
++pub(crate) const ADJUSTABLE: &str = "create:adjustable_chain_gearshift";
++
++pub(crate) fn read(id: BlockStateId) -> Option<State> {
++    let block = id.to_block();
++    if !matches!(block.name, DRIVE | ADJUSTABLE) {
++        return None;
++    }
++    let props = block.properties(id)?.to_props();
++    let get = |k| {
++        props
++            .iter()
++            .find(|p| p.key_str() == k)
++            .map(|p| p.value_str())
++    };
++    Some(State {
++        axis: match get("axis")? {
++            "x" => Axis::X,
++            "y" => Axis::Y,
++            "z" => Axis::Z,
++            _ => return None,
++        },
++        first: get("axis_along_first")? == "true",
++        part: match get("part")? {
++            "start" => Part::Start,
++            "middle" => Part::Middle,
++            "end" => Part::End,
++            "none" => Part::None,
++            _ => return None,
++        },
++    })
++}
++
++pub(crate) fn write(
++    block: &Block,
++    id: BlockStateId,
++    chain: State,
++    power: Option<u8>,
++) -> BlockStateId {
++    let Some(mut props) = block.properties(id).map(|p| p.to_props()) else {
++        return id;
++    };
++    for prop in &mut props {
++        let value = match prop.key_str() {
++            "axis" => match chain.axis {
++                Axis::X => "x",
++                Axis::Y => "y",
++                Axis::Z => "z",
++            },
++            "axis_along_first" => {
++                if chain.first {
++                    "true"
++                } else {
++                    "false"
++                }
++            }
++            "part" => match chain.part {
++                Part::Start => "start",
++                Part::Middle => "middle",
++                Part::End => "end",
++                Part::None => "none",
++            },
++            "powered" if power.is_some() => {
++                if power.unwrap_or_default() > 0 {
++                    "true"
++                } else {
++                    "false"
++                }
++            }
++            _ => continue,
++        };
++        if let Some(new) = Property::from_str_pair(prop.key_str(), value) {
++            *prop = new;
++        }
++    }
++    block.from_properties(&props).to_state_id(block)
++}
++
++pub(crate) fn neighbors(world: &World, pos: BlockPos) -> [Option<State>; 6] {
++    Direction::ALL.map(|d| {
++        let [x, y, z] = d.vector();
++        world
++            .get_block_state_id_if_loaded(&BlockPos::new(pos.0.x + x, pos.0.y + y, pos.0.z + z))
++            .and_then(read)
++    })
++}
++
++pub(crate) fn signal(world: &World, pos: &BlockPos) -> u8 {
++    BlockDirection::all()
++        .into_iter()
++        .map(|side| {
++            let pos = pos.offset(side.to_offset());
++            world.get_block_state_id_if_loaded(&pos).map_or(0, |id| {
++                redstone::get_redstone_power(id.to_block(), id.to_state(), world, &pos, side)
++            })
++        })
++        .max()
++        .unwrap_or(0)
++        .min(15)
++}
++
++fn reshape(args: GetStateForNeighborUpdateArgs<'_>) -> BlockStateId {
++    let Some(current) = read(args.state_id) else {
++        return args.state_id;
++    };
++    let face = crate::block::registry::BlockRegistry::create_direction(args.direction);
++    write(
++        args.block,
++        args.state_id,
++        current.update(face, read(args.neighbor_state_id)),
++        None,
++    )
++}
++
++fn wrench(args: UseWithItemArgs<'_>) -> BlockActionResult {
++    if args.item_stack.get_item().registry_key != "create:wrench"
++        || args
++            .world
++            .is_in_spawn_protection(args.player, args.position)
++    {
++        return BlockActionResult::PassToDefaultBlockAction;
++    }
++    let Some(old) = args.world.get_block_state_id_if_loaded(args.position) else {
++        return BlockActionResult::PassToDefaultBlockAction;
++    };
++    let Some(chain) = read(old) else {
++        return BlockActionResult::PassToDefaultBlockAction;
++    };
++    let face = crate::block::registry::BlockRegistry::create_direction(*args.hit.face);
++    args.world.set_block_state_if(
++        args.position,
++        write(
++            old.to_block(),
++            old,
++            chain.wrenched(face, neighbors(args.world, *args.position)),
++            None,
++        ),
++        BlockFlags::NOTIFY_ALL,
++        |current| current == old,
++    );
++    BlockActionResult::SuccessServer
++}
++
++#[pumpkin_block("create:encased_chain_drive")]
++pub struct EncasedChainDrive;
++#[pumpkin_block("create:adjustable_chain_gearshift")]
++pub struct AdjustableChainGearshift;
++
++impl BlockBehaviour for EncasedChainDrive {
++    fn get_state_for_neighbor_update(
++        &self,
++        args: GetStateForNeighborUpdateArgs<'_>,
++    ) -> BlockStateId {
++        reshape(args)
++    }
++    fn use_with_item(&self, args: UseWithItemArgs<'_>) -> BlockActionResult {
++        wrench(args)
++    }
++}
++impl BlockBehaviour for AdjustableChainGearshift {
++    fn get_state_for_neighbor_update(
++        &self,
++        args: GetStateForNeighborUpdateArgs<'_>,
++    ) -> BlockStateId {
++        reshape(args)
++    }
++    fn use_with_item(&self, args: UseWithItemArgs<'_>) -> BlockActionResult {
++        wrench(args)
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -18,7 +18,9 @@
+ 
+ use super::BlockEntity;
+ use crate::{
+-    block::blocks::{create_water_wheel as wheel, redstone::block_receives_redstone_power},
++    block::blocks::{
++        create_chain as chain, create_water_wheel as wheel, redstone::block_receives_redstone_power,
++    },
+     entity::{EntityBase, player::Player},
+     world::World,
+ };
+@@ -42,6 +44,8 @@
+     SPEEDOMETER,
+     STRESSOMETER,
+     CRANK,
++    chain::DRIVE,
++    chain::ADJUSTABLE,
+     wheel::SMALL,
+     wheel::LARGE,
+     "create:large_cogwheel",
+@@ -150,6 +154,7 @@
+     flow_score: i32,
+     gauge: Gauge,
+     crank: i8,
++    chain_signal: u8,
+ }
+ 
+ #[derive(Default, PartialEq)]
+@@ -346,6 +351,13 @@
+ pub(super) fn node(state: BlockStateId, pos: Pos) -> Option<Node> {
+     let block = Block::from_state_id(state);
+     let id = kinetic_id(block.name)?;
++    if let Some(state) = chain::read(state) {
++        return Some(Node {
++            pos,
++            axis: state.axis,
++            kind: Kind::Chain { state, signal: 0 },
++        });
++    }
+     let properties = block.properties(state)?.to_props();
+     let get = |key| {
+         properties
+@@ -432,6 +444,9 @@
+         if id != CRANK {
+             readings.rpm = nbt_speed(nbt, "Speed");
+         }
++        if id == chain::ADJUSTABLE {
++            readings.chain_signal = nbt.get_int("Signal").unwrap_or(0).clamp(0, 15) as u8;
++        }
+         if matches!(id, SPEEDOMETER | STRESSOMETER) {
+             readings.gauge.dial = nbt_speed(nbt, "Value");
+             readings.gauge.color = nbt.get_int("Color").unwrap_or_default();
+@@ -476,6 +491,9 @@
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
+         tag.put_float("Speed", readings.rpm);
++        if self.id == chain::ADJUSTABLE {
++            tag.put_int("Signal", i32::from(readings.chain_signal));
++        }
+         if self.id == CRANK {
+             tag.put_int("InUse", if readings.crank != 0 { 10 } else { 0 });
+             tag.put_byte("Backwards", i8::from(readings.crank < 0));
+@@ -557,6 +575,26 @@
+                 Some(true) => {}
+             }
+         }
++        let chain_signal = if self.id == chain::ADJUSTABLE {
++            let signal = chain::signal(world, &self.position);
++            if let Kind::Chain {
++                state: geometry, ..
++            } = start.kind
++            {
++                let updated = chain::write(state.to_block(), state, geometry, Some(signal));
++                if updated != state {
++                    world.set_block_state_if(
++                        &self.position,
++                        updated,
++                        BlockFlags::NOTIFY_LISTENERS | BlockFlags::UPDATE_KNOWN_SHAPE,
++                        |current| current == state,
++                    );
++                }
++            }
++            signal
++        } else {
++            0
++        };
+         let large = self.id == wheel::LARGE;
+         let flow_score = if let Kind::WaterWheel { rpm, .. } = &mut start.kind {
+             let Some(score) = wheel::score(world, self.position, start.axis, large) else {
+@@ -589,6 +627,7 @@
+                 Kind::Motor { .. }
+                     | Kind::Clutch { .. }
+                     | Kind::Gearshift { .. }
++                    | Kind::Chain { .. }
+                     | Kind::WaterWheel { .. }
+             ) && let Some(entity) = world.get_block_entity(&pos)
+                 && let Some(kinetic) = entity.as_any().downcast_ref::<Self>()
+@@ -611,6 +650,18 @@
+                             .flow_score
+                     };
+                     *rpm = waterwheel::rpm(score, kinetic.id == wheel::LARGE);
++                } else if let Kind::Chain { signal, .. } = &mut node.kind {
++                    if kinetic.id == chain::ADJUSTABLE {
++                        *signal = if std::ptr::eq(kinetic, self) {
++                            chain_signal
++                        } else {
++                            kinetic
++                                .readings
++                                .lock()
++                                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                                .chain_signal
++                        };
++                    }
+                 } else if kinetic.detached_at.load(Ordering::Relaxed) == tick {
+                     node.kind = Kind::Clutch { powered: true };
+                 }
+@@ -667,6 +718,7 @@
+         if self.id == CRANK {
+             next.crank = self.crank_direction(tick);
+         }
++        next.chain_signal = chain_signal;
+         let (changed, changed_signal) = {
+             let mut readings = self
+                 .readings
+diff --git a/crates/pumpkin-core/src/block/registry.rs b/crates/pumpkin-core/src/block/registry.rs
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -253,6 +253,8 @@
+     let mut manager = BlockRegistry::default();
+ 
+     // Blocks
++    manager.register(crate::block::blocks::create_chain::EncasedChainDrive);
++    manager.register(crate::block::blocks::create_chain::AdjustableChainGearshift);
+     manager.register(crate::block::blocks::create_depot::CreateDepotBlock);
+     manager.register(crate::block::blocks::create_gauge::CreateSpeedometer);
+     manager.register(crate::block::blocks::create_gauge::CreateStressometer);
+@@ -1149,7 +1151,19 @@
+         let clicked = Self::create_direction(clicked);
+         let sneaking = player.get_entity().is_sneaking();
+ 
++        use crate::block::blocks::create_chain as chain;
+         match placed_block.name {
++            chain::DRIVE | chain::ADJUSTABLE => chain::write(
++                placed_block,
++                state_id,
++                create_engine::chain_drive::placement(
++                    look,
++                    sneaking,
++                    ports,
++                    chain::neighbors(world, position),
++                ),
++                None,
++            ),
+             "create:shaft"
+             | "create:flywheel"
+             | "create:clutch"
+@@ -1255,7 +1269,7 @@
+         }
+     }
+ 
+-    fn create_direction(direction: BlockDirection) -> CreateDirection {
++    pub(crate) fn create_direction(direction: BlockDirection) -> CreateDirection {
+         match direction {
+             BlockDirection::Down => CreateDirection::Down,
+             BlockDirection::Up => CreateDirection::Up,

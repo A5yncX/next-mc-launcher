@@ -1,0 +1,12 @@
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -42513,7 +42513,7 @@
+     }
+     pub(super) fn right_click(game: &mut Game<'_>, pos: Pos) -> bool {
+         let block = game.native_block(pos);
+-        if !is_bearing(&block) || !game.native_on("create") || game.held().is_some()
++        if game.remote.is_some() || !is_bearing(&block) || !game.native_on("create") || game.held().is_some()
+             || game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft)
+             || !game.may_build()
+         {

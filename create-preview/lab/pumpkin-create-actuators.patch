@@ -1,0 +1,327 @@
+--- a/crates/pumpkin-core/src/block/blocks/mod.rs
++++ b/crates/pumpkin-core/src/block/blocks/mod.rs
+@@ -118,7 +118,11 @@
+ pub mod cake;
+ pub mod cauldron;
+ pub mod composter;
++pub(crate) mod create_actuator;
++pub(crate) mod create_belt;
++pub(crate) mod create_burner;
+ pub(crate) mod create_chain;
++pub(crate) mod create_chassis;
+ pub(crate) mod create_chute;
+ pub(crate) mod create_depot;
+ pub(crate) mod create_drain;
+@@ -133,9 +137,6 @@
+ pub(crate) mod create_pipe;
+ pub(crate) mod create_pump;
+ pub(crate) mod create_sail;
+-pub(crate) mod create_belt;
+-pub(crate) mod create_burner;
+-pub(crate) mod create_chassis;
+ pub(crate) mod create_sticker;
+ pub(crate) mod create_water_wheel;
+ pub mod dried_ghast;
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -1038,11 +1038,23 @@
+             new_state = Self::set_create_facing(placed_block, new_state, facing);
+         }
+         use crate::block::blocks::{create_burner as burner, create_pipe as pipe};
+-        if placed_block.name == burner::ID && let Some(ref stack) = held_stack {
++        if placed_block.name == burner::ID
++            && let Some(ref stack) = held_stack
++        {
+             let yaw = f64::from(player.get_entity().yaw.load()).to_radians();
+-            let facing = Self::create_direction(BlockDirection::get_nearest(-yaw.sin(), 0.0, yaw.cos())).opposite();
+-            let heat = if stack.get_item().registry_key == burner::ID { "smouldering" } else { "none" };
+-            new_state = pipe::with_property(Self::set_create_facing(placed_block, new_state, facing), "blaze", heat);
++            let facing =
++                Self::create_direction(BlockDirection::get_nearest(-yaw.sin(), 0.0, yaw.cos()))
++                    .opposite();
++            let heat = if stack.get_item().registry_key == burner::ID {
++                "smouldering"
++            } else {
++                "none"
++            };
++            new_state = pipe::with_property(
++                Self::set_create_facing(placed_block, new_state, facing),
++                "blaze",
++                heat,
++            );
+         }
+         if let PlacementMode::Create(assist) = mode {
+             new_state = self.create_placement_state(
+@@ -1059,7 +1071,12 @@
+                 entities::create_kinetic::{CRANK, crank_support},
+             };
+             if placed_block.name == gantry::CARRIAGE {
+-                let Some(state) = gantry::carriage_placement(&world, final_block_pos, new_state, Self::create_direction(face)) else {
++                let Some(state) = gantry::carriage_placement(
++                    &world,
++                    final_block_pos,
++                    new_state,
++                    Self::create_direction(face),
++                ) else {
+                     return Ok(None);
+                 };
+                 new_state = state;
+@@ -1219,9 +1236,20 @@
+         let clicked = Self::create_direction(clicked);
+         let sneaking = player.get_entity().is_sneaking();
+ 
+-        use crate::block::blocks::{create_chain as chain, create_chassis as chassis, create_gantry as gantry, create_pipe as pipe};
++        use crate::block::blocks::{
++            create_actuator as actuator, create_chain as chain, create_chassis as chassis,
++            create_gantry as gantry, create_pipe as pipe,
++        };
+         match placed_block.name {
+-            gantry::SHAFT => gantry::shaft_placement(world, position, state_id, clicked.opposite(), look, sneaking, ports),
++            gantry::SHAFT => gantry::shaft_placement(
++                world,
++                position,
++                state_id,
++                clicked.opposite(),
++                look,
++                sneaking,
++                ports,
++            ),
+             name if chassis::id(name).is_some() => {
+                 chassis::placement(world, position, state_id, clicked, look, sneaking)
+             }
+@@ -1359,7 +1387,20 @@
+                     .from_properties(&properties)
+                     .to_state_id(placed_block)
+             }
+-            "create:mechanical_saw" => {
++            actuator::POLE => Self::set_create_facing(placed_block, state_id, clicked),
++            actuator::PULLEY => {
++                let yaw = f64::from(player.get_entity().yaw.load()).to_radians();
++                let horizontal =
++                    Self::create_direction(BlockDirection::get_nearest(-yaw.sin(), 0.0, yaw.cos()));
++                let horizontal_ports =
++                    CreateDirection::ALL.map(|d| d.axis() != KineticAxis::Y && ports[d as usize]);
++                let axis = placement::preferred(horizontal_ports).map_or_else(
++                    || horizontal.clockwise(KineticAxis::Y).axis(),
++                    CreateDirection::axis,
++                );
++                Self::set_create_axis(placed_block, state_id, axis)
++            }
++            "create:mechanical_saw" | actuator::PISTON | actuator::STICKY => {
+                 let facing = if sneaking { look } else { look.opposite() };
+                 let yaw = f64::from(player.get_entity().yaw.load());
+                 let horizontal = [
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -23,8 +23,9 @@
+ };
+ use crate::{
+     block::blocks::{
+-        create_belt as belt, create_chain as chain, create_gantry as gantry, create_pipe as pipe,
+-        create_pump as pump, create_water_wheel as wheel, redstone::block_receives_redstone_power,
++        create_actuator as actuator, create_belt as belt, create_chain as chain,
++        create_gantry as gantry, create_pipe as pipe, create_pump as pump,
++        create_water_wheel as wheel, redstone::block_receives_redstone_power,
+     },
+     entity::{EntityBase, player::Player},
+     world::World,
+@@ -64,6 +65,9 @@
+     belt::ID,
+     gantry::SHAFT,
+     gantry::CARRIAGE,
++    actuator::PISTON,
++    actuator::STICKY,
++    actuator::PULLEY,
+     wheel::SMALL,
+     wheel::LARGE,
+     "create:large_cogwheel",
+@@ -482,9 +486,12 @@
+         };
+         return Some(Node { pos, axis, kind });
+     }
+-    let gauge = matches!(id, SPEEDOMETER | STRESSOMETER);
++    let directional_axis = matches!(
++        id,
++        SPEEDOMETER | STRESSOMETER | actuator::PISTON | actuator::STICKY
++    );
+     let value = get(
+-        if gauge
++        if directional_axis
+             || matches!(
+                 id,
+                 MOTOR | CRANK | wheel::SMALL | press::ID | pump::ID | fan::ID | drill::ID | saw::ID
+@@ -496,7 +503,7 @@
+         },
+     )?;
+     let vertical_saw = id == saw::ID && matches!(value, "up" | "down");
+-    let axis = if gauge || vertical_saw {
++    let axis = if directional_axis || vertical_saw {
+         let facing = Direction::ALL.into_iter().find(|d| d.name() == value)?;
+         placement::gauge_axis(facing, get("axis_along_first")? == "true")
+     } else {
+@@ -542,6 +549,7 @@
+         press::ID => Kind::Press,
+         pump::ID => Kind::Pump,
+         saw::ID if vertical_saw => Kind::LinearActuator,
++        actuator::PISTON | actuator::STICKY | actuator::PULLEY => Kind::LinearActuator,
+         fan::ID | drill::ID | saw::ID => Kind::Consumer {
+             facing: Direction::ALL
+                 .into_iter()
+--- a/crates/pumpkin-core/src/net/java/play/use_item_on.rs
++++ b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+@@ -127,6 +127,9 @@
+ 
+         if crate::block::blocks::create_belt::interact(&world, player, position, &mut item)
+             || crate::block::blocks::create_material::interact(&world, player, position, &mut item)
++            || crate::block::blocks::create_actuator::interact(
++                &world, player, position, face, &mut item,
++            )
+         {
+             inventory.set_stack_in_hand(hand, item);
+             player.sync_inventory_to_client();
+@@ -242,7 +245,9 @@
+                     face,
+                     assist,
+                 )?;
+-                if !should_try_decrement && block.name == crate::block::blocks::create_gantry::CARRIAGE {
++                if !should_try_decrement
++                    && block.name == crate::block::blocks::create_gantry::CARRIAGE
++                {
+                     // Horizon predicts the item cost before the server validates the rail mount.
+                     player.sync_hand_slot(slot_index, item.clone());
+                 }
+@@ -466,7 +471,9 @@
+         let placement = if is_create_kinetic_block(block)
+             || matches!(
+                 block.name,
+-                crate::block::blocks::create_pipe::PIPE | crate::block::blocks::create_sticker::ID
++                crate::block::blocks::create_pipe::PIPE
++                    | crate::block::blocks::create_sticker::ID
++                    | crate::block::blocks::create_actuator::POLE
+             )
+             || crate::block::blocks::create_chassis::id(block.name).is_some()
+         {
+diff --git a/crates/pumpkin-core/src/block/blocks/create_actuator.rs b/crates/pumpkin-core/src/block/blocks/create_actuator.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/blocks/create_actuator.rs
+@@ -0,0 +1,119 @@
++use std::sync::Arc;
++
++use create_engine::{kinetics::Axis, placement::Direction};
++use pumpkin_data::{Block, BlockDirection, BlockStateId, item::Item, item_stack::ItemStack};
++use pumpkin_util::{GameMode, math::position::BlockPos};
++use pumpkin_world::world::BlockFlags;
++
++use super::{
++    create_pipe::{property, with_property},
++    create_pump::front,
++};
++use crate::{
++    block::registry::BlockRegistry,
++    entity::{EntityBase, player::Player},
++    world::World,
++};
++
++pub(crate) const PISTON: &str = "create:mechanical_piston";
++pub(crate) const STICKY: &str = "create:sticky_mechanical_piston";
++pub(crate) const POLE: &str = "create:piston_extension_pole";
++pub(crate) const PULLEY: &str = "create:rope_pulley";
++
++fn sticky(state: BlockStateId) -> Option<BlockStateId> {
++    let target = Block::from_registry_key(STICKY)?;
++    let mut next = target.default_state.id;
++    for key in ["facing", "axis_along_first", "state"] {
++        next = with_property(next, key, property(state, key)?);
++    }
++    Some(next)
++}
++
++fn rotate(state: BlockStateId, facing: Direction, face: Direction) -> BlockStateId {
++    let axis = face.axis();
++    let mut updated = state;
++    if facing.axis() != axis {
++        updated = with_property(updated, "facing", facing.clockwise(axis).name());
++    }
++    if facing.axis() == axis || axis == Axis::Y {
++        let first = property(state, "axis_along_first") == Some("true");
++        updated = with_property(
++            updated,
++            "axis_along_first",
++            if first { "false" } else { "true" },
++        );
++    }
++    updated
++}
++
++pub(crate) fn interact(
++    world: &Arc<World>,
++    player: &Player,
++    pos: BlockPos,
++    face: BlockDirection,
++    item: &mut ItemStack,
++) -> bool {
++    let mode = player.gamemode.load();
++    if !matches!(mode, GameMode::Survival | GameMode::Creative)
++        || player.get_entity().is_sneaking()
++        || world.is_in_spawn_protection(player, &pos)
++    {
++        return false;
++    }
++    let Some(state) = world.get_block_state_id_if_loaded(&pos) else {
++        return false;
++    };
++    if !matches!(state.to_block().name, PISTON | STICKY)
++        || property(state, "state") != Some("retracted")
++    {
++        return false;
++    }
++    let Some(facing) = front(state) else {
++        return false;
++    };
++    let face = BlockRegistry::create_direction(face);
++    let next = if item.item.registry_key == "create:wrench" {
++        rotate(state, facing, face)
++    } else if state.to_block().name == PISTON && item.item == &Item::SLIME_BALL && face == facing {
++        let Some(next) = sticky(state) else {
++            return false;
++        };
++        next
++    } else {
++        return false;
++    };
++    if world
++        .set_block_state_if(&pos, next, BlockFlags::NOTIFY_ALL, |old| old == state)
++        .is_some()
++        && next.to_block().name != state.to_block().name
++        && mode == GameMode::Survival
++    {
++        item.decrement(1);
++    }
++    true
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn sticky_and_wrench_keep_the_pinned_directional_state() {
++        let base = Block::from_registry_key(PISTON).unwrap().default_state.id;
++        let base = with_property(
++            with_property(base, "facing", "north"),
++            "axis_along_first",
++            "true",
++        );
++        let converted = sticky(base).unwrap();
++        assert_eq!(converted.to_block().name, STICKY);
++        assert_eq!(property(converted, "facing"), Some("north"));
++        assert_eq!(property(converted, "axis_along_first"), Some("true"));
++        let axial = rotate(converted, Direction::North, Direction::North);
++        assert_eq!(property(axial, "facing"), Some("north"));
++        assert_eq!(property(axial, "axis_along_first"), Some("false"));
++        let top = rotate(converted, Direction::North, Direction::Up);
++        assert_eq!(property(top, "facing"), Some("east"));
++        assert_eq!(property(top, "axis_along_first"), Some("false"));
++    }
++}

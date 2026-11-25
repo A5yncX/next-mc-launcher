@@ -1,0 +1,459 @@
+diff --git a/crates/pumpkin-core/src/block/blocks/mod.rs b/crates/pumpkin-core/src/block/blocks/mod.rs
+--- a/crates/pumpkin-core/src/block/blocks/mod.rs
++++ b/crates/pumpkin-core/src/block/blocks/mod.rs
+@@ -129,6 +129,7 @@
+ pub(crate) mod create_pipe;
+ pub(crate) mod create_pump;
+ pub(crate) mod create_sail;
++pub(crate) mod create_chassis;
+ pub(crate) mod create_sticker;
+ pub(crate) mod create_water_wheel;
+ pub mod dried_ghast;
+diff --git a/crates/pumpkin-core/src/block/entities/mod.rs b/crates/pumpkin-core/src/block/entities/mod.rs
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -207,6 +207,9 @@
+     let y = nbt.get_int("y")?;
+     let z = nbt.get_int("z")?;
+     let pos = BlockPos::new(x, y, z);
++    if crate::block::blocks::create_chassis::id(id).is_some() {
++        return Some(Arc::new(crate::block::blocks::create_chassis::ChassisEntity::from_nbt(nbt, pos)));
++    }
+     if id == create_depot::CreateDepotBlockEntity::ID {
+         return Some(Arc::new(create_depot::CreateDepotBlockEntity::from_nbt(
+             nbt, pos,
+@@ -390,6 +393,7 @@
+             create_fluid_tank::ID | create_chute::ID | create_chute::SMART_ID | create_crusher::ID
+         )
+         || is_create_kinetic_block(block)
++        || crate::block::blocks::create_chassis::id(block.name).is_some()
+ }
+ 
+ #[must_use]
+@@ -403,6 +407,10 @@
+         return None;
+     }
+     let name = BLOCK_ENTITY_TYPES.get(block_entity_type_id as usize)?;
++    use crate::block::blocks::create_chassis::{self, ChassisEntity};
++    if let Some(id) = create_chassis::id_from_path(name) {
++        return Some(Arc::new(ChassisEntity::new(id, position)));
++    }
+     if *name == "millstone" {
+         return Some(Arc::new(create_millstone::CreateMillstoneBlockEntity::new(
+             position,
+diff --git a/crates/pumpkin-core/src/block/registry.rs b/crates/pumpkin-core/src/block/registry.rs
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -265,6 +265,7 @@
+     manager.register(crate::block::blocks::create_pump::MechanicalPump);
+     manager.register(crate::block::blocks::create_sail::CreateSail);
+     manager.register(crate::block::blocks::create_sticker::CreateStickerBlock);
++    manager.register(crate::block::blocks::create_chassis::CreateChassis);
+     manager.register(crate::block::blocks::create_gauge::CreateSpeedometer);
+     manager.register(crate::block::blocks::create_gauge::CreateStressometer);
+     manager.register(crate::block::blocks::create_hand_crank::CreateHandCrank);
+@@ -1202,8 +1203,11 @@
+         let clicked = Self::create_direction(clicked);
+         let sneaking = player.get_entity().is_sneaking();
+ 
+-        use crate::block::blocks::{create_chain as chain, create_pipe as pipe};
++        use crate::block::blocks::{create_chain as chain, create_chassis as chassis, create_pipe as pipe};
+         match placed_block.name {
++            name if chassis::id(name).is_some() => {
++                chassis::placement(world, position, state_id, clicked, look, sneaking)
++            }
+             crate::block::blocks::create_sticker::ID => {
+                 let facing = if sneaking { look } else { look.opposite() };
+                 let state = Self::set_create_facing(placed_block, state_id, facing);
+diff --git a/crates/pumpkin-core/src/net/java/mod.rs b/crates/pumpkin-core/src/net/java/mod.rs
+--- a/crates/pumpkin-core/src/net/java/mod.rs
++++ b/crates/pumpkin-core/src/net/java/mod.rs
+@@ -1098,6 +1098,7 @@
+                 let payload = SCustomPayload::read(&mut payload, &version)?;
+                 if payload.channel == MOD_NET_CHANNEL {
+                     apply_motor_setting(player, payload.data);
++                    crate::block::blocks::create_chassis::apply_settings(player, payload.data);
+                     return Ok(());
+                 }
+                 let channel_str = payload.channel.to_string();
+diff --git a/crates/pumpkin-core/src/net/java/play/use_item_on.rs b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+--- a/crates/pumpkin-core/src/net/java/play/use_item_on.rs
++++ b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+@@ -438,7 +438,9 @@
+             || matches!(
+                 block.name,
+                 crate::block::blocks::create_pipe::PIPE | crate::block::blocks::create_sticker::ID
+-            ) {
++            )
++            || crate::block::blocks::create_chassis::id(block.name).is_some()
++        {
+             server.block_registry.place_create_block(
+                 player,
+                 block,
+diff --git a/crates/pumpkin-core/src/block/blocks/create_chassis.rs b/crates/pumpkin-core/src/block/blocks/create_chassis.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/blocks/create_chassis.rs
+@@ -0,0 +1,362 @@
++use std::{
++    any::Any,
++    collections::{BTreeSet, VecDeque},
++    sync::{
++        Arc,
++        atomic::{AtomicU8, Ordering},
++    },
++};
++
++use create_engine::{
++    contraption::chassis::{Chassis, DEFAULT_RANGE, Kind, MAX_RANGE},
++    kinetics::Axis,
++    placement::Direction,
++};
++use pumpkin_data::BlockStateId;
++use pumpkin_macros::pumpkin_block;
++use pumpkin_nbt::compound::NbtCompound;
++use pumpkin_util::{GameMode, math::position::BlockPos};
++use pumpkin_world::world::BlockFlags;
++
++use crate::{
++    block::{
++        BlockBehaviour, NormalUseArgs, PlacedArgs, UseWithItemArgs,
++        entities::BlockEntity,
++        registry::{BlockActionResult, BlockRegistry},
++    },
++    entity::{EntityBase, player::Player},
++    world::World,
++};
++
++use super::create_pipe::{boolean, property, with_property};
++
++const LINEAR: &str = "create:linear_chassis";
++const SECONDARY: &str = "create:secondary_linear_chassis";
++const RADIAL: &str = "create:radial_chassis";
++const RANGE: &str = "ScrollValue";
++const SETTINGS_HEADER: &[u8] = b"\x17create:chassis_settings\x14";
++
++#[pumpkin_block(
++    "create:linear_chassis",
++    "create:secondary_linear_chassis",
++    "create:radial_chassis"
++)]
++pub struct CreateChassis;
++
++pub(crate) fn id(name: &str) -> Option<&'static str> {
++    [LINEAR, SECONDARY, RADIAL]
++        .into_iter()
++        .find(|&key| key == name)
++}
++
++pub(crate) fn id_from_path(path: &str) -> Option<&'static str> {
++    [LINEAR, SECONDARY, RADIAL]
++        .into_iter()
++        .find(|key| key.strip_prefix("create:") == Some(path))
++}
++
++fn kind(name: &str) -> Option<Kind> {
++    Some(match name {
++        LINEAR => Kind::Linear,
++        SECONDARY => Kind::Secondary,
++        RADIAL => Kind::Radial,
++        _ => return None,
++    })
++}
++
++fn read(state: BlockStateId) -> Option<Chassis> {
++    let axis = match property(state, "axis")? {
++        "x" => Axis::X,
++        "y" => Axis::Y,
++        "z" => Axis::Z,
++        _ => return None,
++    };
++    let mut chassis = Chassis::new(kind(state.to_block().name)?, axis, DEFAULT_RANGE)?;
++    for face in Direction::ALL {
++        if let Some(key) = chassis.sticky_property(face) {
++            chassis = chassis.with_sticky(face, property(state, key)? == "true")?;
++        }
++    }
++    Some(chassis)
++}
++
++fn neighbor(pos: BlockPos, direction: Direction) -> BlockPos {
++    let [x, y, z] = direction.vector();
++    BlockPos::new(pos.0.x + x, pos.0.y + y, pos.0.z + z)
++}
++
++pub(crate) fn placement(
++    world: &World,
++    pos: BlockPos,
++    state: BlockStateId,
++    face: Direction,
++    look: Direction,
++    sneak: bool,
++) -> BlockStateId {
++    let axis = if state.to_block().name == RADIAL || sneak {
++        face.axis()
++    } else {
++        world
++            .get_block_state_id_if_loaded(&neighbor(pos, face.opposite()))
++            .and_then(read)
++            .filter(|other| other.kind != Kind::Radial)
++            .map_or(look.axis(), |other| other.axis)
++    };
++    with_property(state, "axis", ["x", "y", "z"][axis.index()])
++}
++
++fn glue(world: &Arc<World>, pos: &BlockPos, face: Direction, apply: bool) -> bool {
++    let Some(before) = world.get_block_state_id_if_loaded(pos) else {
++        return false;
++    };
++    let Some(current) = read(before) else {
++        return false;
++    };
++    let Some(key) = current.sticky_property(face) else {
++        return false;
++    };
++    let can_glue = |face| {
++        current.kind == Kind::Radial
++            || world
++                .get_block_state_id_if_loaded(&neighbor(*pos, face))
++                .and_then(read)
++                .is_none_or(|other| !current.joins(other, face))
++    };
++    let mut after = before;
++    if apply && current.sticky(face) {
++        for other in Direction::ALL {
++            if !current.sticky(other)
++                && can_glue(other)
++                && let Some(key) = current.sticky_property(other)
++            {
++                after = with_property(after, key, "true");
++            }
++        }
++    } else if current.sticky(face) != apply && can_glue(face) {
++        after = with_property(after, key, boolean(apply));
++    } else {
++        return false;
++    }
++    after == before
++        || world
++            .set_block_state_if(pos, after, BlockFlags::NOTIFY_ALL, |id| id == before)
++            .is_some()
++}
++
++impl BlockBehaviour for CreateChassis {
++    fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
++        if args.player.get_entity().is_sneaking()
++            && matches!(
++                args.player.gamemode.load(),
++                GameMode::Creative | GameMode::Survival
++            )
++            && glue(
++                args.world,
++                args.position,
++                BlockRegistry::create_direction(*args.hit.face),
++                false,
++            )
++        {
++            BlockActionResult::SuccessServer
++        } else {
++            BlockActionResult::Pass
++        }
++    }
++
++    fn use_with_item(&self, args: UseWithItemArgs<'_>) -> BlockActionResult {
++        let key = args.item_stack.get_item().registry_key;
++        if matches!(
++            args.player.gamemode.load(),
++            GameMode::Creative | GameMode::Survival
++        ) && matches!(
++            key,
++            "slime_ball" | "minecraft:slime_ball" | "create:super_glue"
++        ) && glue(
++            args.world,
++            args.position,
++            BlockRegistry::create_direction(*args.hit.face),
++            true,
++        ) {
++            BlockActionResult::SuccessServer
++        } else {
++            BlockActionResult::PassToDefaultBlockAction
++        }
++    }
++
++    fn placed(&self, args: PlacedArgs<'_>) {
++        let Some(current) = read(args.state_id).filter(|chassis| chassis.kind != Kind::Radial)
++        else {
++            return;
++        };
++        for face in Direction::ALL
++            .into_iter()
++            .filter(|face| face.axis() == current.axis)
++        {
++            let pos = neighbor(*args.position, face);
++            if let Some(before) = args.world.get_block_state_id_if_loaded(&pos)
++                && let Some(other) = read(before).filter(|chassis| current.joins(*chassis, face))
++                && other.sticky(face.opposite())
++                && let Some(key) = other.sticky_property(face.opposite())
++            {
++                args.world.set_block_state_if(
++                    &pos,
++                    with_property(before, key, "false"),
++                    BlockFlags::NOTIFY_ALL,
++                    |state| state == before,
++                );
++            }
++        }
++    }
++}
++
++pub(crate) struct ChassisEntity {
++    id: &'static str,
++    pos: BlockPos,
++    range: AtomicU8,
++}
++
++impl ChassisEntity {
++    pub(crate) fn new(id: &'static str, pos: BlockPos) -> Self {
++        Self {
++            id,
++            pos,
++            range: AtomicU8::new(DEFAULT_RANGE),
++        }
++    }
++}
++
++impl BlockEntity for ChassisEntity {
++    fn from_nbt(nbt: &NbtCompound, pos: BlockPos) -> Self {
++        let mut entity = Self::new(nbt.get_string("id").and_then(id).unwrap_or(LINEAR), pos);
++        *entity.range.get_mut() = nbt
++            .get_int(RANGE)
++            .filter(|n| (1..=i32::from(MAX_RANGE)).contains(n))
++            .map_or(DEFAULT_RANGE, |n| n as u8);
++        entity
++    }
++    fn resource_location(&self) -> &'static str {
++        self.id
++    }
++    fn get_position(&self) -> BlockPos {
++        self.pos
++    }
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++    fn write_nbt(&self, tag: &mut NbtCompound) {
++        tag.put_int(RANGE, self.range.load(Ordering::Relaxed).into());
++    }
++    fn chunk_data_nbt(&self) -> Option<NbtCompound> {
++        let mut tag = NbtCompound::new();
++        self.write_nbt(&mut tag);
++        Some(tag)
++    }
++}
++
++fn decode_settings(payload: &[u8]) -> Option<(BlockPos, bool, u8)> {
++    let ([x, y, z, bulk, raw], []) = payload.strip_prefix(SETTINGS_HEADER)?.as_chunks::<4>() else {
++        return None;
++    };
++    let [x, y, z, bulk, raw] = [*x, *y, *z, *bulk, *raw].map(i32::from_be_bytes);
++    ((0..=1).contains(&bulk) && (0..i32::from(MAX_RANGE)).contains(&raw))
++        .then(|| (BlockPos::new(x, y, z), bulk == 1, raw as u8 + 1))
++}
++
++pub(crate) fn apply_settings(player: &Player, payload: &[u8]) {
++    let Some((pos, bulk, range)) = decode_settings(payload) else {
++        return;
++    };
++    if !matches!(
++        player.gamemode.load(),
++        GameMode::Survival | GameMode::Creative
++    ) || !player.living_entity.is_alive()
++        || !player.can_interact_with_block_at(&pos, 1.0)
++    {
++        return;
++    }
++    let world = player.get_entity().world.load_full();
++    let key = |p: BlockPos| (p.0.x, p.0.y, p.0.z);
++    let mut seen = BTreeSet::from([key(pos)]);
++    let mut search = VecDeque::from([pos]);
++    let mut members = Vec::new();
++    while let Some(p) = search.pop_front() {
++        if world.is_in_spawn_protection(player, &p) {
++            return;
++        }
++        let Some(state) = world.get_block_state_id_if_loaded(&p) else {
++            return;
++        };
++        let Some(chassis) = read(state) else { return };
++        let Some(entity) = world.get_block_entity(&p).filter(|e| {
++            e.resource_location() == state.to_block().name && e.as_any().is::<ChassisEntity>()
++        }) else {
++            return;
++        };
++        members.push(entity);
++        if bulk {
++            for face in Direction::ALL {
++                let next = neighbor(p, face);
++                if !seen.contains(&key(next))
++                    && world
++                        .get_block_state_id_if_loaded(&next)
++                        .and_then(read)
++                        .is_some_and(|other| chassis.joins(other, face))
++                {
++                    if seen.len() >= 512 {
++                        return;
++                    }
++                    seen.insert(key(next));
++                    search.push_back(next);
++                }
++            }
++        }
++    }
++    for entity in members {
++        let Some(chassis) = entity.as_any().downcast_ref::<ChassisEntity>() else {
++            continue;
++        };
++        if world
++            .get_block_entity(&chassis.pos)
++            .is_some_and(|current| Arc::ptr_eq(&current, &entity))
++            && chassis.range.swap(range, Ordering::Relaxed) != range
++        {
++            world.update_block_entity(&entity);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn stored_range_and_wire_bounds() {
++        assert_eq!(
++            b"create:chassis_settings".len(),
++            usize::from(SETTINGS_HEADER[0])
++        );
++        let pos = BlockPos::new(-5, 77, 20);
++        for (bulk, raw, expected) in [
++            (0, 0, Some((pos, false, 1))),
++            (1, 15, Some((pos, true, 16))),
++            (1, 16, None),
++            (-1, 4, None),
++        ] {
++            let mut packet = SETTINGS_HEADER.to_vec();
++            packet.extend(
++                [-5i32, 77, 20, bulk, raw]
++                    .into_iter()
++                    .flat_map(i32::to_be_bytes),
++            );
++            assert_eq!(decode_settings(&packet), expected);
++        }
++        let mut saved = NbtCompound::new();
++        saved.put_string("id", RADIAL.into());
++        saved.put_int(RANGE, 12);
++        let restored = ChassisEntity::from_nbt(&saved, pos);
++        assert_eq!(restored.resource_location(), RADIAL);
++        let mut written = NbtCompound::new();
++        restored.write_nbt(&mut written);
++        assert_eq!(written.get_int(RANGE), Some(12));
++    }
++}

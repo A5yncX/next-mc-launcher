@@ -1,0 +1,124 @@
+diff --git a/crates/pumpkin-core/src/block/blocks/mod.rs b/crates/pumpkin-core/src/block/blocks/mod.rs
+--- a/crates/pumpkin-core/src/block/blocks/mod.rs
++++ b/crates/pumpkin-core/src/block/blocks/mod.rs
+@@ -127,6 +127,7 @@
+ pub(crate) mod create_funnel;
+ pub(crate) mod create_gauge;
+ pub(crate) mod create_hand_crank;
++pub(crate) mod create_material;
+ pub(crate) mod create_millstone;
+ pub(crate) mod create_pipe;
+ pub(crate) mod create_pump;
+diff --git a/crates/pumpkin-core/src/net/java/play/use_item_on.rs b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+--- a/crates/pumpkin-core/src/net/java/play/use_item_on.rs
++++ b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+@@ -121,6 +121,13 @@
+             face,
+             item.item.registry_key,
+         ) {
++            player.swing_hand(hand, true);
++            return Ok(());
++        }
++
++        if crate::block::blocks::create_material::interact(&world, player, position, &mut item) {
++            inventory.set_stack_in_hand(hand, item);
++            player.sync_inventory_to_client();
+             player.swing_hand(hand, true);
+             return Ok(());
+         }
+diff --git a/crates/pumpkin-core/src/block/blocks/create_material.rs b/crates/pumpkin-core/src/block/blocks/create_material.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/blocks/create_material.rs
+@@ -0,0 +1,91 @@
++use std::{
++    collections::HashMap,
++    sync::{Arc, LazyLock},
++};
++
++use pumpkin_data::{Block, BlockId, item::Item, item_stack::ItemStack};
++use pumpkin_util::{GameMode, math::position::BlockPos};
++use pumpkin_world::world::BlockFlags;
++
++use crate::{
++    entity::{EntityBase, player::Player},
++    world::World,
++};
++
++type Recipes = HashMap<(BlockId, u16), (&'static Block, bool)>;
++static RECIPES: LazyLock<Recipes> = LazyLock::new(|| {
++    let rows: Vec<(&str, &str, &str, bool)> = serde_json::from_str(include_str!(concat!(
++        env!("CARGO_MANIFEST_DIR"),
++        "/../../assets/nextmc-create-item-application.json"
++    )))
++    .expect("generated Create item application recipes");
++    rows.into_iter()
++        .map(|(base, held, result, consume)| {
++            let base = Block::from_registry_key(base.strip_prefix("minecraft:").unwrap_or(base))
++                .expect("item application block");
++            let held = Item::from_registry_key(held).expect("item application ingredient");
++            let result = Block::from_registry_key(result).expect("item application result");
++            ((base.id, held.id), (result, consume))
++        })
++        .collect()
++});
++
++pub(crate) fn interact(
++    world: &Arc<World>,
++    player: &Player,
++    pos: BlockPos,
++    held: &mut ItemStack,
++) -> bool {
++    let mode = player.gamemode.load();
++    if held.is_empty()
++        || !matches!(mode, GameMode::Survival | GameMode::Creative)
++        || player.get_entity().is_sneaking()
++        || world.is_in_spawn_protection(player, &pos)
++    {
++        return false;
++    }
++    let Some(old) = world.get_block_state_id_if_loaded(&pos) else {
++        return false;
++    };
++    let Some(&(result, consume)) = RECIPES.get(&(old.to_block().id, held.get_item().id)) else {
++        return false;
++    };
++    if world
++        .set_block_state_if(
++            &pos,
++            result.default_state.id,
++            BlockFlags::NOTIFY_ALL,
++            |current| current == old,
++        )
++        .is_some()
++        && consume
++        && mode == GameMode::Survival
++    {
++        held.decrement(1);
++    }
++    true
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn recipes_cover_every_pinned_log_and_wood_for_each_casing() {
++        let recipes = &*RECIPES;
++        assert_eq!(recipes.len(), 63);
++        for (held, name) in [
++            ("create:andesite_alloy", "create:andesite_casing"),
++            ("create:brass_ingot", "create:brass_casing"),
++            ("minecraft:copper_ingot", "create:copper_casing"),
++        ] {
++            let held = Item::from_registry_key(held).unwrap();
++            for base in [Block::STRIPPED_OAK_LOG, Block::STRIPPED_OAK_WOOD] {
++                let (result, consume) = recipes[&(base.id, held.id)];
++                assert_eq!(result.name, name);
++                assert!(consume);
++            }
++            assert!(!recipes.contains_key(&(Block::OAK_LOG.id, held.id)));
++        }
++    }
++}

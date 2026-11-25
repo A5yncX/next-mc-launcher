@@ -1,0 +1,875 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_deployer.rs b/crates/pumpkin-core/src/block/entities/create_deployer.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_deployer.rs
+@@ -0,0 +1,570 @@
++use std::{
++    any::Any,
++    sync::{
++        Arc, Mutex, PoisonError, RwLock,
++        atomic::{AtomicBool, AtomicI32, Ordering},
++    },
++};
++
++use create_engine::deployer::{
++    BeltAction, Mode, Phase, Stationary, TickAction, Waiting, belt_action,
++};
++use pumpkin_data::{item::Item, item_stack::ItemStack, tag::Taggable};
++use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
++use pumpkin_util::math::position::BlockPos;
++use pumpkin_util::{GameMode, math::vector3::Vector3};
++
++use super::{BlockEntity, create_kinetic::CreateKinetic};
++use crate::{
++    block::blocks::{create_pipe::property, redstone::block_receives_redstone_power},
++    entity::{EntityBase, player::Player},
++    world::World,
++};
++
++pub(crate) const ID: &str = "create:deployer";
++const TICK_KEY: &str = "create_horizon:DeployerTick";
++const HAND_SIZE: usize = 1;
++
++pub(crate) enum TransportAction {
++    Hold,
++    Apply(ItemStack),
++    Pass,
++}
++
++pub(crate) struct CreateDeployerBlockEntity {
++    position: BlockPos,
++    kinetic: CreateKinetic,
++    used_stroke: AtomicBool,
++    hand: RwLock<[ItemStack; HAND_SIZE]>,
++    state: Mutex<Stationary>,
++    powered: AtomicBool,
++    sample_tick: AtomicI32,
++    dirty: AtomicBool,
++    other_nbt: NbtCompound,
++    opaque_nbt: Option<NbtCompound>,
++}
++
++impl BlockEntity for CreateDeployerBlockEntity {
++    fn resource_location(&self) -> &'static str {
++        ID
++    }
++
++    fn get_position(&self) -> BlockPos {
++        self.position
++    }
++
++    fn from_nbt(nbt: &NbtCompound, position: BlockPos) -> Self {
++        let state = read_stationary(nbt);
++        let powered = match nbt.get("Powered") {
++            None => Some(false),
++            Some(NbtTag::Byte(value)) => Some(*value != 0),
++            _ => None,
++        };
++        let hand = read_inventory(nbt);
++        let valid_hand = read_hand(nbt).is_some();
++        let sample_tick = match nbt.get(TICK_KEY) {
++            None => Some(0),
++            Some(NbtTag::Int(value)) => Some(*value),
++            _ => None,
++        };
++        let supported = state.is_some()
++            && powered.is_some()
++            && valid_hand
++            && hand.is_some()
++            && sample_tick.is_some();
++        let mut other_nbt = nbt.clone();
++        for key in [
++            "Mode",
++            "State",
++            "Powered",
++            "Timer",
++            "HeldItem",
++            "Inventory",
++            "Reach",
++            TICK_KEY,
++        ] {
++            other_nbt.child_tags.remove(key);
++        }
++
++        Self {
++            position,
++            kinetic: CreateKinetic::from_nbt(nbt, position),
++            used_stroke: AtomicBool::new(nbt.get_bool("NextMcUsedStroke").unwrap_or(false)),
++            hand: RwLock::new([hand.unwrap_or_else(|| ItemStack::EMPTY.clone())]),
++            state: Mutex::new(state.unwrap_or_default()),
++            powered: AtomicBool::new(powered.unwrap_or(false)),
++            sample_tick: AtomicI32::new(sample_tick.unwrap_or_default()),
++            dirty: AtomicBool::new(false),
++            other_nbt,
++            opaque_nbt: (!supported).then(|| nbt.clone()),
++        }
++    }
++
++    fn write_nbt(&self, nbt: &mut NbtCompound) {
++        if let Some(opaque_nbt) = &self.opaque_nbt {
++            nbt.merge(opaque_nbt);
++            return;
++        }
++
++        nbt.merge(&self.other_nbt);
++        self.kinetic.write_nbt(nbt);
++        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
++        let hand = self.hand.read().unwrap_or_else(PoisonError::into_inner);
++        nbt.put_string("Mode", state.mode.saved_name().to_owned());
++        nbt.put_string("State", state.phase.saved_name().to_owned());
++        nbt.put_bool("Powered", self.powered.load(Ordering::Relaxed));
++        nbt.put_int("Timer", state.timer);
++        nbt.put_compound(
++            "HeldItem",
++            if hand[0].is_empty() {
++                NbtCompound::new()
++            } else {
++                stack_nbt(&hand[0])
++            },
++        );
++        nbt.put_list("Inventory", inventory_nbt(&hand[0]));
++        nbt.put_float("Reach", state.reach);
++        nbt.put_int(TICK_KEY, self.sample_tick.load(Ordering::Relaxed));
++        nbt.put_bool("NextMcUsedStroke", self.used_stroke.load(Ordering::Relaxed));
++    }
++
++    fn tick(&self, world: &Arc<World>) {
++        let prev_speed = self.kinetic.rpm();
++        self.kinetic.tick(world);
++        let speed = self.kinetic.rpm();
++        let powered = block_receives_redstone_power(world, &self.position);
++        let power_changed = self.powered.swap(powered, Ordering::Relaxed) != powered;
++        // Belt hooks own new strokes. The stationary tick only advances the current stroke.
++        let tick = world.get_world_age();
++        let phase_changed = self.tick_cycle(speed, tick, |_| Waiting::Locked) != TickAction::None;
++        if (power_changed || phase_changed || prev_speed != speed)
++            && let Some(entity) = world.get_block_entity(&self.position)
++            && entity
++                .as_any()
++                .downcast_ref::<Self>()
++                .is_some_and(|live| std::ptr::eq(live, self))
++        {
++            world.update_block_entity(&entity);
++        }
++    }
++
++    fn chunk_data_nbt(&self) -> Option<NbtCompound> {
++        let mut nbt = NbtCompound::new();
++        self.write_nbt(&mut nbt);
++        Some(nbt)
++    }
++
++    fn on_block_replaced(self: Arc<Self>, world: &Arc<World>, position: &BlockPos) {
++        let stack = {
++            let mut hand = self.hand.write().unwrap_or_else(PoisonError::into_inner);
++            std::mem::replace(&mut hand[0], ItemStack::EMPTY.clone())
++        };
++        if !stack.is_empty() {
++            world.drop_stack(position, stack);
++        }
++    }
++
++    fn is_dirty(&self) -> bool {
++        self.dirty.load(Ordering::Relaxed)
++    }
++
++    fn clear_dirty(&self) {
++        self.dirty.store(false, Ordering::Relaxed);
++    }
++
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++}
++
++impl CreateDeployerBlockEntity {
++    #[must_use]
++    pub fn new(position: BlockPos) -> Self {
++        Self {
++            position,
++            kinetic: CreateKinetic::new(ID, position),
++            used_stroke: AtomicBool::new(false),
++            hand: RwLock::new([ItemStack::EMPTY.clone()]),
++            state: Mutex::new(Stationary::default()),
++            powered: AtomicBool::new(false),
++            sample_tick: AtomicI32::new(0),
++            dirty: AtomicBool::new(false),
++            other_nbt: NbtCompound::new(),
++            opaque_nbt: None,
++        }
++    }
++
++    #[must_use]
++    pub(crate) fn is_supported(&self) -> bool {
++        self.opaque_nbt.is_none()
++    }
++
++    #[cfg(test)]
++    fn stationary(&self) -> Stationary {
++        *self.state.lock().unwrap_or_else(PoisonError::into_inner)
++    }
++
++    #[cfg(test)]
++    fn hand(&self) -> Option<ItemStack> {
++        if !self.is_supported() {
++            return None;
++        }
++        let hand = self.hand.read().unwrap_or_else(PoisonError::into_inner);
++        (!hand[0].is_empty()).then(|| hand[0].clone())
++    }
++
++    pub(crate) fn rpm(&self) -> f32 {
++        self.kinetic.rpm()
++    }
++
++    /// Exchanges slot 0. Rejected stacks are returned untouched to the caller.
++    pub(crate) fn swap_hand(
++        &self,
++        incoming: Option<ItemStack>,
++    ) -> Result<Option<ItemStack>, Option<ItemStack>> {
++        if !self.is_supported()
++            || incoming
++                .as_ref()
++                .is_some_and(|stack| stack.is_empty() || stack.item_count > 99)
++        {
++            return Err(incoming);
++        }
++        let mut hand = self.hand.write().unwrap_or_else(PoisonError::into_inner);
++        let previous = std::mem::replace(
++            &mut hand[0],
++            incoming.unwrap_or_else(|| ItemStack::EMPTY.clone()),
++        );
++        self.mark_dirty();
++        Ok((!previous.is_empty()).then_some(previous))
++    }
++
++    /// Advances the pinned stationary engine state; the host supplies speed and target checks.
++    pub(crate) fn tick_cycle(
++        &self,
++        rpm: f32,
++        world_tick: i64,
++        waiting: impl FnOnce(Mode) -> Waiting,
++    ) -> TickAction {
++        if !self.is_supported() {
++            return TickAction::None;
++        }
++        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
++        let before = *state;
++        let action = state.tick(rpm, waiting);
++        let changed = before != *state;
++        let tick_changed = action == TickAction::Started
++            && self.sample_tick.swap(world_tick as i32, Ordering::Relaxed) != world_tick as i32;
++        if changed || tick_changed {
++            self.mark_dirty();
++        }
++        action
++    }
++
++    /// Processes one belt item. Only Apply consumes one input and one hand item.
++    pub(crate) fn transport(
++        &self,
++        input: &mut ItemStack,
++        held: bool,
++        powered: bool,
++        reach: f32,
++        world_tick: i64,
++    ) -> TransportAction {
++        if !self.is_supported() {
++            return TransportAction::Pass;
++        }
++
++        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
++        let mut hand = self.hand.write().unwrap_or_else(PoisonError::into_inner);
++        let powered_changed = self.powered.swap(powered, Ordering::Relaxed) != powered;
++        let result = recipe_result(input, &hand[0]);
++        let action = belt_action(*state, held, powered, !hand[0].is_empty(), result.is_some());
++        match action {
++            BeltAction::Pass => {
++                if powered_changed {
++                    self.mark_dirty();
++                }
++                TransportAction::Pass
++            }
++            BeltAction::Hold => {
++                if powered_changed {
++                    self.mark_dirty();
++                }
++                TransportAction::Hold
++            }
++            BeltAction::Start => {
++                self.used_stroke.store(false, Ordering::Relaxed);
++                state.start(reach);
++                self.sample_tick.store(world_tick as i32, Ordering::Relaxed);
++                self.mark_dirty();
++                TransportAction::Hold
++            }
++            BeltAction::Apply if self.used_stroke.load(Ordering::Relaxed) => TransportAction::Hold,
++            BeltAction::Apply => {
++                let Some(result) = result else {
++                    return TransportAction::Pass;
++                };
++                self.used_stroke.store(true, Ordering::Relaxed);
++                input.decrement(1);
++                hand[0].decrement(1);
++                if hand[0].is_empty() {
++                    hand[0] = ItemStack::EMPTY.clone();
++                }
++                self.mark_dirty();
++                TransportAction::Apply(ItemStack::new(1, result))
++            }
++        }
++    }
++
++    fn mark_dirty(&self) {
++        self.dirty.store(true, Ordering::Relaxed);
++    }
++}
++
++pub(crate) fn interact(
++    world: &Arc<World>,
++    player: &Player,
++    pos: &BlockPos,
++    cursor: &Vector3<f32>,
++    item: &mut ItemStack,
++) -> bool {
++    use create_engine::placement::Direction;
++    let Some(state) = world.get_block_state_id_if_loaded(pos) else {
++        return false;
++    };
++    if state.to_block().name != ID
++        || player.get_entity().is_sneaking()
++        || !matches!(
++            player.gamemode.load(),
++            GameMode::Creative | GameMode::Survival
++        )
++        || world.is_in_spawn_protection(player, pos)
++        || matches!(item.get_item().registry_key, ID | "create:wrench")
++    {
++        return false;
++    }
++    let Some(facing) = Direction::ALL
++        .into_iter()
++        .find(|d| property(state, "facing") == Some(d.name()))
++    else {
++        return false;
++    };
++    let axis = facing.axis().index();
++    let forward = [cursor.x, cursor.y, cursor.z][axis];
++    let depth = if facing.vector()[axis] > 0 {
++        forward
++    } else {
++        1.0 - forward
++    };
++    if depth < 0.75 {
++        return false;
++    }
++    let Some(entity) = world.get_block_entity(pos) else {
++        return false;
++    };
++    let Some(deployer) = entity.as_any().downcast_ref::<CreateDeployerBlockEntity>() else {
++        return false;
++    };
++    if let Ok(old) = deployer.swap_hand((!item.is_empty()).then(|| item.clone())) {
++        *item = old.unwrap_or_else(|| ItemStack::EMPTY.clone());
++        world.update_block_entity(&entity);
++        true
++    } else {
++        false
++    }
++}
++
++fn read_stationary(nbt: &NbtCompound) -> Option<Stationary> {
++    let mode = match nbt.get_string("Mode")? {
++        "USE" => Mode::Use,
++        "PUNCH" => Mode::Punch,
++        _ => return None,
++    };
++    let phase = match nbt.get("State") {
++        None => Phase::Waiting,
++        Some(NbtTag::String(phase)) => match phase.as_ref() {
++            "WAITING" => Phase::Waiting,
++            "EXPANDING" => Phase::Expanding,
++            "RETRACTING" => Phase::Retracting,
++            _ => return None,
++        },
++        _ => return None,
++    };
++    let timer = match nbt.get("Timer") {
++        None => 0,
++        Some(NbtTag::Int(timer)) if (-511..=5120).contains(timer) => *timer,
++        _ => return None,
++    };
++    let reach = match nbt.get("Reach") {
++        None => 0.0,
++        Some(NbtTag::Float(reach)) if reach.is_finite() => *reach,
++        _ => return None,
++    };
++    Some(Stationary {
++        mode,
++        phase,
++        timer,
++        reach,
++        ..Stationary::default()
++    })
++}
++
++fn read_inventory(nbt: &NbtCompound) -> Option<ItemStack> {
++    let hand = match nbt.get("Inventory") {
++        None => ItemStack::EMPTY.clone(),
++        Some(NbtTag::List(items)) if items.is_empty() => ItemStack::EMPTY.clone(),
++        Some(NbtTag::List(items)) if items.len() == 1 => {
++            let entry = items[0].extract_compound()?;
++            if entry.get_byte("Slot") != Some(0) {
++                return None;
++            }
++            let stack = ItemStack::read_item_stack(entry)?;
++            if stack.is_empty() || stack.item_count > 99 {
++                return None;
++            }
++            let mut encoded = stack_nbt(&stack);
++            encoded.put_byte("Slot", 0);
++            if &encoded != entry {
++                return None;
++            }
++            stack
++        }
++        _ => return None,
++    };
++    Some(hand)
++}
++
++fn read_hand(nbt: &NbtCompound) -> Option<ItemStack> {
++    let hand = read_inventory(nbt)?;
++    match nbt.get("HeldItem") {
++        None => Some(hand),
++        Some(NbtTag::Compound(display)) if hand.is_empty() && display.child_tags.is_empty() => {
++            Some(hand)
++        }
++        Some(NbtTag::Compound(display)) if !hand.is_empty() => {
++            (&stack_nbt(&hand) == display).then_some(hand)
++        }
++        _ => None,
++    }
++}
++
++fn stack_nbt(stack: &ItemStack) -> NbtCompound {
++    let mut nbt = NbtCompound::new();
++    stack.write_item_stack(&mut nbt);
++    if nbt
++        .get_compound("components")
++        .is_some_and(|components| components.child_tags.is_empty())
++    {
++        nbt.child_tags.remove("components");
++    }
++    nbt
++}
++
++fn inventory_nbt(stack: &ItemStack) -> Vec<NbtTag> {
++    if stack.is_empty() {
++        return Vec::new();
++    }
++    let mut entry = stack_nbt(stack);
++    entry.put_byte("Slot", 0);
++    vec![NbtTag::Compound(entry)]
++}
++
++fn recipe_result(input: &ItemStack, hand: &ItemStack) -> Option<&'static Item> {
++    if input.is_empty()
++        || hand.is_empty()
++        || hand.get_item().is_tagged_with("#minecraft:planks") != Some(true)
++    {
++        return None;
++    }
++    match input.get_item().registry_key {
++        "create:shaft" => Some(&Item::CREATE_COGWHEEL),
++        "create:cogwheel" => Some(&Item::CREATE_LARGE_COGWHEEL),
++        _ => None,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn belt_start_holds_then_apply_consumes_one_of_each_stack() {
++        let deployer = CreateDeployerBlockEntity::new(BlockPos::new(0, 0, 0));
++        assert!(
++            deployer
++                .swap_hand(Some(ItemStack::new(2, &Item::OAK_PLANKS)))
++                .is_ok()
++        );
++        let mut input = ItemStack::new(2, &Item::CREATE_SHAFT);
++
++        assert!(matches!(
++            deployer.transport(&mut input, false, false, 1.0, 10),
++            TransportAction::Hold
++        ));
++        assert_eq!(input.item_count, 2);
++        assert_eq!(deployer.stationary().phase, Phase::Expanding);
++
++        {
++            let mut state = deployer.state.lock().unwrap();
++            state.phase = Phase::Retracting;
++            state.timer = 1000;
++        }
++        let TransportAction::Apply(output) = deployer.transport(&mut input, true, false, 1.0, 11)
++        else {
++            panic!("expected a cogwheel application");
++        };
++        assert_eq!(output.get_item().registry_key, "create:cogwheel");
++        assert_eq!(input.item_count, 1);
++        assert_eq!(deployer.hand().unwrap().item_count, 1);
++    }
++
++    #[test]
++    fn tagged_planks_make_the_large_cogwheel_recipe() {
++        let input = ItemStack::new(1, &Item::CREATE_COGWHEEL);
++        let hand = ItemStack::new(1, &Item::OAK_PLANKS);
++        assert_eq!(
++            recipe_result(&input, &hand).map(|item| item.registry_key),
++            Some("create:large_cogwheel")
++        );
++    }
++
++    #[test]
++    fn nbt_round_trip_uses_the_pinned_client_fields() {
++        let deployer = CreateDeployerBlockEntity::new(BlockPos::new(0, 0, 0));
++        let mut nbt = NbtCompound::new();
++        deployer.write_nbt(&mut nbt);
++
++        assert_eq!(nbt.get_string("Mode"), Some("USE"));
++        assert_eq!(nbt.get_string("State"), Some("WAITING"));
++        assert_eq!(nbt.get_byte("Powered"), Some(0));
++        assert_eq!(nbt.get_int("Timer"), Some(0));
++        assert_eq!(nbt.get_float("Reach"), Some(0.0));
++        assert_eq!(nbt.get_int(TICK_KEY), Some(0));
++        assert!(nbt.get_list("Inventory").unwrap().is_empty());
++        assert!(
++            nbt.get_compound("HeldItem")
++                .is_some_and(|held| held.child_tags.is_empty())
++        );
++        assert!(
++            <CreateDeployerBlockEntity as BlockEntity>::from_nbt(&nbt, BlockPos::new(0, 0, 0))
++                .is_supported()
++        );
++    }
++
++    #[test]
++    fn mismatched_belt_item_passes_without_consumption() {
++        let deployer = CreateDeployerBlockEntity::new(BlockPos::new(0, 0, 0));
++        assert!(
++            deployer
++                .swap_hand(Some(ItemStack::new(1, &Item::OAK_PLANKS)))
++                .is_ok()
++        );
++        let mut input = ItemStack::new(2, &Item::STONE);
++
++        assert!(matches!(
++            deployer.transport(&mut input, false, false, 1.0, 10),
++            TransportAction::Pass
++        ));
++        assert_eq!(input.item_count, 2);
++        assert_eq!(deployer.hand().unwrap().item_count, 1);
++    }
++}
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -24,6 +24,7 @@
+ pub(crate) mod create_basin;
+ pub(crate) mod create_chute;
+ pub(crate) mod create_crusher;
++pub(crate) mod create_deployer;
+ pub(crate) mod create_depot;
+ pub(crate) mod create_drain;
+ mod create_drill;
+@@ -259,6 +260,11 @@
+             create_millstone::CreateMillstoneBlockEntity::from_nbt(nbt, pos),
+         ));
+     }
++    if id == create_deployer::ID {
++        return Some(Arc::new(
++            create_deployer::CreateDeployerBlockEntity::from_nbt(nbt, pos),
++        ));
++    }
+     if create_kinetic::kinetic_id(id).is_some() {
+         return Some(Arc::new(create_kinetic::CreateKinetic::from_nbt(nbt, pos)));
+     }
+@@ -442,6 +448,11 @@
+             position,
+         )));
+     }
++    if *name == "deployer" {
++        return Some(Arc::new(create_deployer::CreateDeployerBlockEntity::new(
++            position,
++        )));
++    }
+     if let Some(id) = create_kinetic::kinetic_id_from_path(name) {
+         return Some(Arc::new(create_kinetic::CreateKinetic::new(id, position)));
+     }
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -68,6 +68,7 @@
+     actuator::PISTON,
+     actuator::STICKY,
+     actuator::PULLEY,
++    super::create_deployer::ID,
+     wheel::SMALL,
+     wheel::LARGE,
+     "create:large_cogwheel",
+@@ -488,7 +489,11 @@
+     }
+     let directional_axis = matches!(
+         id,
+-        SPEEDOMETER | STRESSOMETER | actuator::PISTON | actuator::STICKY
++        SPEEDOMETER
++            | STRESSOMETER
++            | actuator::PISTON
++            | actuator::STICKY
++            | super::create_deployer::ID
+     );
+     let value = get(
+         if directional_axis
+@@ -549,7 +554,9 @@
+         press::ID => Kind::Press,
+         pump::ID => Kind::Pump,
+         saw::ID if vertical_saw => Kind::LinearActuator,
+-        actuator::PISTON | actuator::STICKY | actuator::PULLEY => Kind::LinearActuator,
++        actuator::PISTON | actuator::STICKY | actuator::PULLEY | super::create_deployer::ID => {
++            Kind::LinearActuator
++        }
+         fan::ID | drill::ID | saw::ID => Kind::Consumer {
+             facing: Direction::ALL
+                 .into_iter()
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -1400,7 +1400,7 @@
+                 );
+                 Self::set_create_axis(placed_block, state_id, axis)
+             }
+-            "create:mechanical_saw" | actuator::PISTON | actuator::STICKY => {
++            "create:mechanical_saw" | actuator::PISTON | actuator::STICKY | "create:deployer" => {
+                 let facing = if sneaking { look } else { look.opposite() };
+                 let yaw = f64::from(player.get_entity().yaw.load());
+                 let horizontal = [
+--- a/crates/pumpkin-core/src/block/blocks/create_belt.rs
++++ b/crates/pumpkin-core/src/block/blocks/create_belt.rs
+@@ -7,7 +7,8 @@
+     kinetics::{Axis, Kind, Node, Pos},
+     placement::Direction,
+     transport::{
+-        self, Belt, Ending, Hooks, Inventory, Part, Pulley, Slope, Space, Stack, Transported,
++        self, Belt, Ending, Hooks, Inventory, Part, ProcessingResult, ProcessingUpdate, Pulley,
++        Slope, Space, Stack, Transported, TransportedResult,
+     },
+ };
+ use pumpkin_data::{
+@@ -23,7 +24,14 @@
+ 
+ use super::create_pipe::{boolean, property, with_property};
+ use crate::{
+-    block::entities::create_kinetic,
++    block::{
++        blocks::redstone::block_receives_redstone_power,
++        entities::{
++            BlockEntity,
++            create_deployer::{self, CreateDeployerBlockEntity, TransportAction},
++            create_kinetic,
++        },
++    },
+     entity::{Entity, EntityBase, item::ItemEntity, player::Player},
+     world::World,
+ };
+@@ -394,10 +402,7 @@
+                 stack.item_count = 1;
+                 let maximum = stack.get_max_stack_size().into();
+                 // Preserve foreign locked/processed entries verbatim rather than misprocessing them.
+-                if row.get_bool("Locked") == Some(true)
+-                    || row.get_bool("LockedExternally") == Some(true)
+-                    || row.has("FanProcessingType")
+-                {
++                if row.get_bool("LockedExternally") == Some(true) || row.has("FanProcessingType") {
+                     return None;
+                 }
+                 let mut item = Transported::new(
+@@ -411,6 +416,7 @@
+                 item.position = position;
+                 item.previous_position = position;
+                 item.inserted_at = index;
++                item.locked = row.get_bool("Locked").unwrap_or(false);
+                 item.inserted_from = *Direction::ALL.get(row.get_int("InDirection")? as usize)?;
+                 out.push(item);
+             }
+@@ -462,6 +468,9 @@
+                             .unwrap_or(1) as i32,
+                     );
+                     nbt.put_int("Angle", item.angle);
++                    if item.locked {
++                        nbt.put_bool("Locked", true);
++                    }
+                     NbtTag::Compound(nbt)
+                 })
+                 .collect(),
+@@ -517,7 +526,15 @@
+                 .next()
+                 .is_none()
+         });
+-        let result = self.items.tick(belt, &mut Outlet(open));
++        let result = self.items.tick(
++            belt,
++            &mut Outlet {
++                world,
++                origin,
++                step,
++                open,
++            },
++        );
+         for mut item in result.ejected {
+             let mut at = belt.world_position(origin, item.position);
+             let velocity = belt.ejection_velocity();
+@@ -614,14 +631,126 @@
+     full
+ }
+ 
+-struct Outlet(bool);
+-impl Hooks<Payload> for Outlet {
++struct Outlet<'a> {
++    world: &'a Arc<World>,
++    origin: Pos,
++    step: Pos,
++    open: bool,
++}
++
++impl Outlet<'_> {
++    fn deployer(
++        &self,
++        index: i32,
++    ) -> Option<(BlockPos, Arc<dyn crate::block::entities::BlockEntity>)> {
++        let [x, y, z] = std::array::from_fn(|i| self.origin[i] + self.step[i] * index);
++        let p = BlockPos::new(x, y + 2, z);
++        let state = self.world.get_block_state_id_if_loaded(&p)?;
++        if state.to_block().name != create_deployer::ID
++            || property(state, "facing") != Some("down")
++            || !self
++                .world
++                .get_block_state_id_if_loaded(&BlockPos::new(x, y + 1, z))?
++                .to_block()
++                .is_air()
++        {
++            return None;
++        }
++        Some((p, self.world.get_block_entity(&p)?))
++    }
++
++    fn process(
++        &self,
++        item: &Transported<Payload>,
++        index: i32,
++        held: bool,
++    ) -> ProcessingUpdate<Payload> {
++        let Some((pos, entity)) = self.deployer(index) else {
++            return ProcessingResult::Pass.into();
++        };
++        let Some(machine) = entity.as_any().downcast_ref::<CreateDeployerBlockEntity>() else {
++            return ProcessingResult::Pass.into();
++        };
++        if machine.rpm() == 0.0 {
++            return ProcessingResult::Pass.into();
++        }
++        let mut input = full_stack(&item.stack);
++        let action = machine.transport(
++            &mut input,
++            held,
++            block_receives_redstone_power(self.world, &pos),
++            0.875,
++            self.world.get_world_age(),
++        );
++        if machine.is_dirty() {
++            self.world.update_block_entity(&entity);
++        }
++        match action {
++            TransportAction::Pass => ProcessingResult::Pass.into(),
++            TransportAction::Hold => ProcessingResult::Hold.into(),
++            TransportAction::Apply(mut result) => {
++                let count = result.item_count.into();
++                let maximum = result.get_max_stack_size().into();
++                result.item_count = 1;
++                let mut output = item.similar(
++                    Stack {
++                        payload: Payload(result),
++                        count,
++                        maximum,
++                    },
++                    item.angle,
++                );
++                output.clear_fan_processing();
++                let left = (!input.is_empty()).then(|| {
++                    let mut left = item.source_copy();
++                    left.stack.count = input.item_count.into();
++                    left.locked = true;
++                    left
++                });
++                ProcessingUpdate {
++                    decision: ProcessingResult::Hold,
++                    conversion: Some(TransportedResult::Convert {
++                        outputs: vec![output],
++                        held: left,
++                    }),
++                }
++            }
++        }
++    }
++}
++
++impl Hooks<Payload> for Outlet<'_> {
+     fn ending(&mut self, _: bool) -> Ending {
+-        if self.0 {
++        if self.open {
+             Ending::Eject
+         } else {
+             Ending::Blocked
+         }
++    }
++
++    fn processor(&mut self, index: i32) -> Option<bool> {
++        Some(self.deployer(index).is_some_and(|(_, entity)| {
++            entity
++                .as_any()
++                .downcast_ref::<CreateDeployerBlockEntity>()
++                .is_some_and(|d| d.rpm() != 0.0)
++        }))
++    }
++
++    fn received_update(
++        &mut self,
++        item: &mut Transported<Payload>,
++        index: i32,
++    ) -> ProcessingUpdate<Payload> {
++        self.process(item, index, false)
++    }
++
++    fn held_update(
++        &mut self,
++        item: &mut Transported<Payload>,
++        index: i32,
++    ) -> ProcessingUpdate<Payload> {
++        self.process(item, index, true)
+     }
+ }
+ 
+--- a/crates/pumpkin-core/src/net/java/play/use_item_on.rs
++++ b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+@@ -127,6 +127,13 @@
+ 
+         if crate::block::blocks::create_belt::interact(&world, player, position, &mut item)
+             || crate::block::blocks::create_material::interact(&world, player, position, &mut item)
++            || crate::block::entities::create_deployer::interact(
++                &world,
++                player,
++                &position,
++                &cursor_pos,
++                &mut item,
++            )
+             || crate::block::blocks::create_actuator::interact(
+                 &world, player, position, face, &mut item,
+             )

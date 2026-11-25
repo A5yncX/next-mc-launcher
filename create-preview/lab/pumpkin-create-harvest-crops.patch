@@ -1,0 +1,298 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_bearing.rs b/crates/pumpkin-core/src/block/entities/create_bearing.rs
+--- a/crates/pumpkin-core/src/block/entities/create_bearing.rs
++++ b/crates/pumpkin-core/src/block/entities/create_bearing.rs
+@@ -535,7 +535,7 @@
+                 let target = pos(target);
+                 if within_landing_scope(world, controller, target) {
+                     match tool {
+-                        Tool::Harvester => harvester::harvest_wheat(world, target),
++                        Tool::Harvester => harvester::harvest_crop(world, target),
+                         Tool::Plough => plough::till(world, target),
+                         _ => {}
+                     }
+diff --git a/crates/pumpkin-core/src/block/entities/create_harvester.rs b/crates/pumpkin-core/src/block/entities/create_harvester.rs
+--- a/crates/pumpkin-core/src/block/entities/create_harvester.rs
++++ b/crates/pumpkin-core/src/block/entities/create_harvester.rs
+@@ -13,8 +13,8 @@
+     placement::Direction,
+ };
+ use pumpkin_data::{
+-    Block, BlockStateId,
+-    block_properties::WheatLikeProperties,
++    Block, BlockStateId, HorizontalFacingExt,
++    block_properties::{CocoaLikeProperties, NetherWartLikeProperties, WheatLikeProperties},
+     item::Item,
+     item_stack::ItemStack,
+     tag::{self, Taggable},
+@@ -141,82 +141,122 @@
+     }
+ }
+ 
+-pub(super) fn harvest_wheat(world: &Arc<World>, pos: BlockPos) {
++fn crop(state: BlockStateId) -> Option<(Harvest, &'static Item)> {
++    let block = state.to_block();
++    let (mature_value, seed) = match block.name {
++        "wheat" => (MAX_AGE, &Item::WHEAT_SEEDS),
++        "carrots" => (MAX_AGE, &Item::CARROT),
++        "potatoes" => (MAX_AGE, &Item::POTATO),
++        "beetroots" => (3, &Item::BEETROOT_SEEDS),
++        "nether_wart" => (3, &Item::NETHER_WART),
++        "sweet_berry_bush" => (3, &Item::SWEET_BERRIES),
++        "cocoa" => (2, &Item::COCOA_BEANS),
++        _ => return None,
++    };
++    let value = match mature_value {
++        MAX_AGE => WheatLikeProperties::from_state_id(state).age,
++        2 => CocoaLikeProperties::from_state_id(state).age,
++        _ => NetherWartLikeProperties::from_state_id(state).age,
++    };
++    let age = Age {
++        value: u32::from(value),
++        mature_value: u32::from(mature_value),
++    };
++    let mut input = HarvesterBlock {
++        collision_empty: true,
++        ..Default::default()
++    };
++    input.plant = match block.name {
++        "nether_wart" => Plant::Other,
++        "sweet_berry_bush" => Plant::SweetBerryBush,
++        "cocoa" => Plant::Cocoa,
++        _ => Plant::Crop {
++            age,
++            matches_default_zero_state: value == 0,
++        },
++    };
++    if !matches!(input.plant, Plant::Crop { .. }) {
++        input.generic_age = Some(age);
++    }
++    Some((harvester::plan(input, Rules::default())?, seed))
++}
++
++pub(super) fn harvest_crop(world: &Arc<World>, pos: BlockPos) {
+     if !world.is_in_build_limit(pos) || world.spawn_protects_position(&pos) {
+         return;
+     }
+     let Some(original_state) = world.get_block_state_id_if_loaded(&pos) else {
+         return;
+     };
+-    if original_state.to_block() != &Block::WHEAT {
+-        return;
+-    }
+-    let properties = WheatLikeProperties::from_state_id(original_state);
+-    if properties.age != MAX_AGE {
+-        return;
+-    }
+-
+-    let soil_pos = pos.down();
+-    if !world.is_in_build_limit(soil_pos) {
+-        return;
+-    }
+-    let Some(soil_state) = world.get_block_state_id_if_loaded(&soil_pos) else {
+-        return;
+-    };
+-    let Some(mut harvest) = harvester::plan(
+-        HarvesterBlock {
+-            plant: Plant::Crop {
+-                age: Age {
+-                    value: u32::from(properties.age),
+-                    mature_value: u32::from(MAX_AGE),
+-                },
+-                matches_default_zero_state: original_state == Block::WHEAT.default_state.id,
+-            },
+-            collision_empty: true,
+-            ..Default::default()
+-        },
+-        Rules::default(),
+-    ) else {
+-        return;
+-    };
+-    if harvest.replacement != Replacement::ResetCropAge {
+-        return;
+-    }
+-
+-    let mut replanted_properties = properties;
+-    replanted_properties.age = 0;
+-    let replanted_state = if soil_state
+-        .to_block()
+-        .has_tag(&tag::Block::MINECRAFT_SUPPORTS_CROPS)
+-        && has_sufficient_light(world, &pos)
+-    {
+-        replanted_properties.to_state_id(&Block::WHEAT)
++    let Some((mut harvest, seed)) = crop(original_state) else {
++        return;
++    };
++    let block = original_state.to_block();
++    let support_pos = if block == &Block::COCOA {
++        pos.offset(
++            CocoaLikeProperties::from_state_id(original_state)
++                .facing
++                .to_offset(),
++        )
++    } else {
++        pos.down()
++    };
++    if !world.is_in_build_limit(support_pos) {
++        return;
++    }
++    let Some(support_state) = world.get_block_state_id_if_loaded(&support_pos) else {
++        return;
++    };
++    let support = support_state.to_block();
++    let (supports, age) = match (block.name, harvest.replacement) {
++        (_, Replacement::ResetCropAge) => (
++            support.has_tag(&tag::Block::MINECRAFT_SUPPORTS_CROPS)
++                && has_sufficient_light(world, &pos),
++            "0",
++        ),
++        ("nether_wart", Replacement::SetGenericAge(0)) => (
++            support.has_tag(&tag::Block::MINECRAFT_SUPPORTS_NETHER_WART),
++            "0",
++        ),
++        ("cocoa", Replacement::SetGenericAge(0)) => {
++            (support.has_tag(&tag::Block::MINECRAFT_SUPPORTS_COCOA), "0")
++        }
++        ("sweet_berry_bush", Replacement::SetGenericAge(1)) => (
++            support.has_tag(&tag::Block::MINECRAFT_SUPPORTS_VEGETATION),
++            "1",
++        ),
++        _ => return,
++    };
++    let replanted_state = if supports {
++        with_property(original_state, "age", age)
+     } else {
+         Block::AIR.default_state.id
+     };
+     // Compare the crop and its supporting soil before releasing any loot.
+     if !world.compare_create_field(
+         pos,
+-        [(original_state, replanted_state), (soil_state, soil_state)],
++        support_pos,
++        [
++            (original_state, replanted_state),
++            (support_state, support_state),
++        ],
+     ) {
+         return;
+     }
+ 
+-    release_loot(world, pos, original_state, &mut harvest);
+-}
+-
+-fn withhold_replant_seed(harvest: &mut Harvest, stack: &mut ItemStack) {
+-    stack.item_count = harvest.accept_drop(
+-        stack.item == &Item::WHEAT_SEEDS,
+-        u32::from(stack.item_count),
+-    ) as u8;
++    release_loot(world, pos, original_state, &mut harvest, seed);
++}
++
++fn withhold_replant_seed(harvest: &mut Harvest, stack: &mut ItemStack, seed: &Item) {
++    stack.item_count = harvest.accept_drop(stack.item == seed, u32::from(stack.item_count)) as u8;
+ }
+ 
+ fn release_loot(
+     world: &Arc<World>,
+     pos: BlockPos,
+-    original_state: pumpkin_data::BlockStateId,
++    original_state: BlockStateId,
+     harvest: &mut Harvest,
++    seed: &Item,
+ ) {
+     let block = original_state.to_block();
+     let Some(loot_table) = block.loot_table.and_then(|key| world.get_loot_table(key)) else {
+@@ -233,7 +273,7 @@
+     };
+     let mut items = loot_table.generate_loot_with_context(rand::random(), &params);
+     for stack in &mut items {
+-        withhold_replant_seed(harvest, stack);
++        withhold_replant_seed(harvest, stack, seed);
+     }
+     items.retain(|stack| !stack.is_empty());
+     if items.is_empty() {
+@@ -274,6 +314,28 @@
+         );
+         let mut duplicate = NbtCompound::new();
+         assert!(sample(&tool, anchor, 19.2, Some(&second), &mut duplicate).is_empty());
++    }
++
++    #[test]
++    fn plan_only_accepts_mature_crops_and_reserves_one_matching_seed() {
++        for (block, ripe, unripe, seed) in [
++            (&Block::WHEAT, "7", "6", &Item::WHEAT_SEEDS),
++            (&Block::CARROTS, "7", "6", &Item::CARROT),
++            (&Block::POTATOES, "7", "6", &Item::POTATO),
++            (&Block::BEETROOTS, "3", "2", &Item::BEETROOT_SEEDS),
++            (&Block::NETHER_WART, "3", "2", &Item::NETHER_WART),
++            (&Block::SWEET_BERRY_BUSH, "3", "2", &Item::SWEET_BERRIES),
++            (&Block::COCOA, "2", "1", &Item::COCOA_BEANS),
++        ] {
++            let id = block.default_state.id;
++            assert!(crop(with_property(id, "age", unripe)).is_none());
++            let (mut plan, reserved) = crop(with_property(id, "age", ripe)).unwrap();
++            assert_eq!(reserved.id, seed.id);
++            let mut drops = ItemStack::new(3, seed);
++            withhold_replant_seed(&mut plan, &mut drops, seed);
++            assert_eq!(drops.item_count, 2);
++        }
++        assert!(crop(Block::STONE.default_state.id).is_none());
+     }
+ 
+     #[test]
+@@ -297,9 +359,9 @@
+         let mut first_seed = ItemStack::new(1, &Item::WHEAT_SEEDS);
+         let mut next_seed = ItemStack::new(2, &Item::WHEAT_SEEDS);
+ 
+-        withhold_replant_seed(&mut harvest, &mut wheat);
+-        withhold_replant_seed(&mut harvest, &mut first_seed);
+-        withhold_replant_seed(&mut harvest, &mut next_seed);
++        withhold_replant_seed(&mut harvest, &mut wheat, &Item::WHEAT_SEEDS);
++        withhold_replant_seed(&mut harvest, &mut first_seed, &Item::WHEAT_SEEDS);
++        withhold_replant_seed(&mut harvest, &mut next_seed, &Item::WHEAT_SEEDS);
+ 
+         assert_eq!(wheat.item_count, 1);
+         assert_eq!(first_seed.item_count, 0);
+diff --git a/crates/pumpkin-core/src/block/entities/create_plough.rs b/crates/pumpkin-core/src/block/entities/create_plough.rs
+--- a/crates/pumpkin-core/src/block/entities/create_plough.rs
++++ b/crates/pumpkin-core/src/block/entities/create_plough.rs
+@@ -23,8 +23,11 @@
+         "coarse_dirt" | "rooted_dirt" => &Block::DIRT,
+         _ => return,
+     };
+-    if world.compare_create_field(top, [(air, air), (soil, result.default_state.id)])
+-        && kind == &Block::ROOTED_DIRT
++    if world.compare_create_field(
++        top,
++        top.down(),
++        [(air, air), (soil, result.default_state.id)],
++    ) && kind == &Block::ROOTED_DIRT
+     {
+         world.drop_stack(&top, ItemStack::new(1, &Item::HANGING_ROOTS));
+     }
+diff --git a/crates/pumpkin-core/src/world/mod.rs b/crates/pumpkin-core/src/world/mod.rs
+--- a/crates/pumpkin-core/src/world/mod.rs
++++ b/crates/pumpkin-core/src/world/mod.rs
+@@ -5561,16 +5561,17 @@
+     pub(crate) fn compare_create_field(
+         self: &Arc<Self>,
+         top: BlockPos,
++        support: BlockPos,
+         edits: [(BlockStateId, BlockStateId); 2],
+     ) -> bool {
+-        let positions = [top, top.down()];
+-        if positions
+-            .iter()
+-            .any(|p| !self.is_in_build_limit(*p) || self.spawn_protects_position(p))
+-        {
++        let positions = [top, support];
++        let key = top.chunk_and_chunk_relative_position().0;
++        if positions.iter().any(|p| {
++            p.chunk_and_chunk_relative_position().0 != key || !self.is_in_build_limit(*p)
++                || self.spawn_protects_position(p)
++        }) {
+             return false;
+         }
+-        let key = top.chunk_and_chunk_relative_position().0;
+         let changes = std::array::from_fn::<_, 2, _>(|i| {
+             let (_, relative) = positions[i].chunk_and_chunk_relative_position();
+             (relative.x as usize, relative.y, relative.z as usize, edits[i].0, edits[i].1)

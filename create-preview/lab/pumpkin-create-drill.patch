@@ -1,0 +1,449 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_drill.rs b/crates/pumpkin-core/src/block/entities/create_drill.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_drill.rs
+@@ -0,0 +1,226 @@
++use std::sync::{
++    Arc, Mutex,
++    atomic::{AtomicI32, Ordering},
++};
++
++use create_engine::{
++    drilling::{Action, DrillCycle},
++    placement::Direction,
++};
++use pumpkin_data::{Block, BlockStateId, tag::Taggable};
++use pumpkin_nbt::compound::NbtCompound;
++use pumpkin_util::math::position::BlockPos;
++
++use crate::world::World;
++
++pub(crate) const ID: &str = "create:mechanical_drill";
++const NON_BREAKABLE_TAG: &str = "create:non_breakable";
++static NEXT_BREAKER_ID: AtomicI32 = AtomicI32::new(-1);
++
++#[derive(Default)]
++struct DrillState {
++    cycle: DrillCycle,
++    lazy_ticks: u8,
++    last_target: Option<(BlockPos, BlockStateId)>,
++    crack_target: Option<(BlockPos, BlockStateId)>,
++}
++
++pub(crate) struct Drill {
++    state: Mutex<DrillState>,
++    breaker_id: i32,
++}
++
++impl Default for Drill {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl Drill {
++    pub(crate) fn new() -> Self {
++        Self {
++            state: Mutex::new(DrillState::default()),
++            breaker_id: NEXT_BREAKER_ID.fetch_sub(1, Ordering::Relaxed),
++        }
++    }
++
++    pub(crate) fn from_nbt(nbt: &NbtCompound) -> Self {
++        let mut drill = Self::new();
++        let state = drill
++            .state
++            .get_mut()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        state.cycle.progress = nbt.get_int("Progress").unwrap_or_default().clamp(0, 9);
++        state.cycle.next_tick = nbt.get_int("NextTick").unwrap_or_default().max(-1);
++        drill
++    }
++
++    pub(crate) fn write_nbt(&self, nbt: &mut NbtCompound) {
++        let state = self
++            .state
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        nbt.put_int("Progress", state.cycle.progress);
++        nbt.put_int("NextTick", state.cycle.next_tick);
++    }
++
++    /// Ticks once using the already validated effective network RPM. Returns whether progress
++    /// changed and the containing block entity should be refreshed.
++    pub(crate) fn tick(&self, world: &Arc<World>, position: BlockPos, rpm: f32) -> bool {
++        if !rpm.is_finite() {
++            return false;
++        }
++        let Some(source_id) = world.get_block_state_id_if_loaded(&position) else {
++            return false;
++        };
++        let source = Block::from_state_id(source_id);
++        if source.name != ID {
++            self.remove(world);
++            return false;
++        }
++        let Some(properties) = source
++            .properties(source_id)
++            .map(|properties| properties.to_props())
++        else {
++            self.remove(world);
++            return false;
++        };
++        let Some(facing) = properties
++            .iter()
++            .find(|property| property.key_str() == "facing")
++            .and_then(|property| {
++                Direction::ALL
++                    .into_iter()
++                    .find(|direction| direction.name() == property.value_str())
++            })
++        else {
++            self.remove(world);
++            return false;
++        };
++        let [dx, dy, dz] = facing.vector();
++        let target = BlockPos::new(position.0.x + dx, position.0.y + dy, position.0.z + dz);
++        let Some(target_id) = world.get_block_state_id_if_loaded(&target) else {
++            self.clear_crack(world);
++            return false;
++        };
++        let target_state = target_id.to_state();
++        let breakable = breakable_target(world, &target, target_id);
++
++        let (action, progress_changed, progress, old_crack) = {
++            let mut state = self
++                .state
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++            let old_cycle = state.cycle;
++            let old_crack = state
++                .crack_target
++                .filter(|previous| *previous != (target, target_id));
++            if old_crack.is_some() {
++                state.crack_target = None;
++            }
++            if state.lazy_ticks == 0 {
++                state.cycle.lazy_tick();
++                state.lazy_ticks = 10;
++            } else {
++                state.lazy_ticks -= 1;
++            }
++            if state
++                .last_target
++                .is_some_and(|previous| previous != (target, target_id))
++            {
++                state.cycle.wake();
++            }
++            state.last_target = Some((target, target_id));
++            let action = state.cycle.tick(rpm, target_state.hardness, breakable);
++            match action {
++                Action::Hit => state.crack_target = Some((target, target_id)),
++                Action::Clear | Action::Break => state.crack_target = None,
++                Action::None => {}
++            }
++            (
++                action,
++                old_cycle.progress != state.cycle.progress || action == Action::Break,
++                state.cycle.progress,
++                old_crack,
++            )
++        };
++
++        if let Some((old_position, _)) = old_crack {
++            world.set_block_destroy_stage(self.breaker_id, old_position, -1);
++        }
++        match action {
++            Action::Hit
++                if world.get_block_state_id_if_loaded(&position) == Some(source_id)
++                    && target_id_is_current(
++                        target_id,
++                        world.get_block_state_id_if_loaded(&target),
++                    ) =>
++            {
++                world.set_block_destroy_stage(self.breaker_id, target, progress as i8);
++            }
++            Action::Hit => self.clear_crack(world),
++            Action::Clear => world.set_block_destroy_stage(self.breaker_id, target, -1),
++            Action::Break => {
++                if world.get_block_state_id_if_loaded(&position) == Some(source_id)
++                    && breakable_target(world, &target, target_id)
++                {
++                    world.break_machine_target(&target, target_id);
++                }
++                world.set_block_destroy_stage(self.breaker_id, target, -1);
++            }
++            Action::None => {}
++        }
++        progress_changed
++    }
++
++    /// Call separately when this block entity is removed so clients lose its crack overlay.
++    pub(crate) fn remove(&self, world: &World) {
++        self.clear_crack(world);
++    }
++
++    fn clear_crack(&self, world: &World) {
++        let target = self
++            .state
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .crack_target
++            .take();
++        if let Some((position, _)) = target {
++            world.set_block_destroy_stage(self.breaker_id, position, -1);
++        }
++    }
++}
++
++fn target_id_is_current(expected: BlockStateId, current: Option<BlockStateId>) -> bool {
++    current == Some(expected)
++}
++
++fn breakable_target(world: &World, position: &BlockPos, state_id: BlockStateId) -> bool {
++    let block = Block::from_state_id(state_id);
++    let hardness = state_id.to_state().hardness;
++    !block.is_air()
++        && block != &Block::WATER
++        && block != &Block::LAVA
++        && hardness.is_finite()
++        && hardness >= 0.0
++        && block.is_tagged_with(NON_BREAKABLE_TAG) != Some(true)
++        // shortcut: exclude block entities until destruction can collect their contents atomically.
++        && state_id.to_state().block_entity_type == u16::MAX
++        && world.get_block_entity(position).is_none()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn replaced_or_unloaded_targets_fail_the_break_guard() {
++        let expected = Block::STONE.default_state.id;
++        assert!(target_id_is_current(expected, Some(expected)));
++        assert!(!target_id_is_current(
++            expected,
++            Some(Block::AIR.default_state.id)
++        ));
++        assert!(!target_id_is_current(expected, None));
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -17,7 +17,8 @@
+ use pumpkin_world::world::BlockFlags;
+ 
+ use super::{
+-    BlockEntity, create_fan_airflow as fan, create_millstone as millstone, create_press as press,
++    BlockEntity, create_drill as drill, create_fan_airflow as fan, create_millstone as millstone,
++    create_press as press,
+ };
+ use crate::{
+     block::blocks::{
+@@ -50,6 +51,7 @@
+     CRANK,
+     press::ID,
+     pump::ID,
++    drill::ID,
+     fan::ID,
+     millstone::ID,
+     pipe::VALVE,
+@@ -137,6 +139,7 @@
+     crank_until: AtomicI64,
+     material: AtomicU16,
+     structure_ready: AtomicBool,
++    drill: Option<Box<drill::Drill>>,
+ }
+ 
+ pub(crate) fn set_create_wheel_material(world: &World, pos: &BlockPos, item: &Item) -> bool {
+@@ -311,6 +314,7 @@
+             crank_until: AtomicI64::new(i64::MIN),
+             material: AtomicU16::new(Item::SPRUCE_PLANKS.id),
+             structure_ready: AtomicBool::new(false),
++            drill: (id == drill::ID).then(|| Box::new(drill::Drill::new())),
+         }
+     }
+ 
+@@ -404,7 +408,7 @@
+         if gauge
+             || matches!(
+                 id,
+-                MOTOR | CRANK | wheel::SMALL | press::ID | pump::ID | fan::ID
++                MOTOR | CRANK | wheel::SMALL | press::ID | pump::ID | fan::ID | drill::ID
+             )
+         {
+             "facing"
+@@ -456,13 +460,13 @@
+         GEARBOX => Kind::Gearbox,
+         press::ID => Kind::Press,
+         pump::ID => Kind::Pump,
+-        fan::ID => Kind::Consumer {
++        fan::ID | drill::ID => Kind::Consumer {
+             facing: Direction::ALL
+                 .into_iter()
+                 .find(|d| d.name() == value)?
+                 .opposite()
+                 .vector(),
+-            impact: 2.0,
++            impact: if id == drill::ID { 4.0 } else { 2.0 },
+         },
+         wheel::SMALL | wheel::LARGE => Kind::WaterWheel {
+             rpm: 0.0,
+@@ -488,6 +492,9 @@
+         let id = nbt.get_string("id").and_then(kinetic_id).unwrap_or(COG);
+         // The next tick recalculates the readings once the neighborhood is loaded.
+         let mut entity = Self::new(id, position);
++        if let Some(drill) = &mut entity.drill {
++            **drill = drill::Drill::from_nbt(nbt);
++        }
+         let readings = entity
+             .readings
+             .get_mut()
+@@ -563,6 +570,9 @@
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
+         tag.put_float("Speed", readings.rpm);
++        if let Some(drill) = &self.drill {
++            drill.write_nbt(tag);
++        }
+         if self.id == fan::ID {
+             tag.put(
+                 fan::TAG,
+@@ -647,6 +657,12 @@
+         let mut tag = NbtCompound::new();
+         self.write_nbt(&mut tag);
+         Some(tag)
++    }
++
++    fn on_block_replaced(self: Arc<Self>, world: &Arc<World>, _: &BlockPos) {
++        if let Some(drill) = &self.drill {
++            drill.remove(world);
++        }
+     }
+ 
+     fn tick(&self, world: &Arc<World>) {
+@@ -849,6 +865,10 @@
+                 );
+             }
+         }
++        let worked = self
++            .drill
++            .as_ref()
++            .is_some_and(|drill| drill.tick(world, self.position, next.rpm));
+         let (changed, changed_signal) = {
+             let mut readings = self
+                 .readings
+@@ -872,7 +892,7 @@
+             *readings = next;
+             (changed || press_changed, changed_signal)
+         };
+-        if (changed || built)
++        if (changed || built || worked)
+             && let Some(entity) = world.get_block_entity(&self.position)
+             && entity
+                 .as_any()
+diff --git a/crates/pumpkin-core/src/block/entities/mod.rs b/crates/pumpkin-core/src/block/entities/mod.rs
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -24,6 +24,7 @@
+ pub(crate) mod create_chute;
+ pub(crate) mod create_depot;
+ pub(crate) mod create_drain;
++mod create_drill;
+ pub(crate) mod create_fan_airflow;
+ pub(crate) mod create_fluid_tank;
+ pub(crate) mod create_kinetic;
+diff --git a/crates/pumpkin-core/src/block/registry.rs b/crates/pumpkin-core/src/block/registry.rs
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -1331,7 +1331,7 @@
+                     .from_properties(&properties)
+                     .to_state_id(placed_block)
+             }
+-            "create:encased_fan" => {
++            "create:encased_fan" | "create:mechanical_drill" => {
+                 let preferred = placement::preferred(ports).unwrap_or(look);
+                 Self::set_create_facing(
+                     placed_block,
+diff --git a/crates/pumpkin-core/src/world/mod.rs b/crates/pumpkin-core/src/world/mod.rs
+--- a/crates/pumpkin-core/src/world/mod.rs
++++ b/crates/pumpkin-core/src/world/mod.rs
+@@ -5704,6 +5704,28 @@
+         cause: Option<&Arc<Player>>,
+         flags: BlockFlags,
+     ) -> Option<BlockStateId> {
++        self.break_block_checked(position, cause, flags, None)
++    }
++
++    pub(crate) fn break_machine_target(
++        self: &Arc<Self>,
++        position: &BlockPos,
++        expected: BlockStateId,
++    ) -> Option<BlockStateId> {
++        // Block entities can depend on being present while their loot is generated.
++        if expected.to_state().block_entity_type != u16::MAX {
++            return None;
++        }
++        self.break_block_checked(position, None, BlockFlags::NOTIFY_ALL, Some(expected))
++    }
++
++    fn break_block_checked(
++        self: &Arc<Self>,
++        position: &BlockPos,
++        cause: Option<&Arc<Player>>,
++        flags: BlockFlags,
++        expected: Option<BlockStateId>,
++    ) -> Option<BlockStateId> {
+         if let Some(player) = cause
+             && self.is_in_spawn_protection(player, position)
+         {
+@@ -5716,7 +5738,7 @@
+         }
+ 
+         let (broken_block, broken_block_state) = self.get_block_and_state(position);
+-        if broken_block_state.is_air() {
++        if broken_block_state.is_air() || expected.is_some_and(|id| id != broken_block_state.id) {
+             return None;
+         }
+ 
+@@ -5749,6 +5771,21 @@
+         } else {
+             flags.insert(BlockFlags::SKIP_DROPS);
+         }
++
++        let replacement = || {
++            if *self.get_fluid(position) == Fluid::WATER {
++                Block::WATER.default_state.id
++            } else {
++                Block::AIR.default_state.id
++            }
++        };
++        let guarded_replacement = if let Some(expected) = expected {
++            let state = replacement();
++            self.set_block_state_if(position, state, flags, |id| id == expected)?;
++            Some(state)
++        } else {
++            None
++        };
+ 
+         if !flags.contains(BlockFlags::SKIP_DROPS) {
+             let tool = cause.as_ref().and_then(|p| {
+@@ -5766,13 +5803,9 @@
+             crate::block::drop_loot(self, broken_block, position, true, &params);
+         }
+ 
+-        let new_state_id = if *self.get_fluid(position) == Fluid::WATER {
+-            Block::WATER.default_state.id
+-        } else {
+-            Block::AIR.default_state.id
+-        };
+-
+-        let broken_state_id = self.set_block_state(position, new_state_id, flags);
++        let new_state_id = guarded_replacement.unwrap_or_else(replacement);
++        let broken_state_id =
++            expected.unwrap_or_else(|| self.set_block_state(position, new_state_id, flags));
+         let broken_block = Block::from_state_id(broken_state_id);
+         if !broken_block.is_air()
+             && broken_state_id != new_state_id

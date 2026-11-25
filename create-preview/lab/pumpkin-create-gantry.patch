@@ -1,0 +1,264 @@
+diff --git a/crates/pumpkin-core/src/block/blocks/mod.rs b/crates/pumpkin-core/src/block/blocks/mod.rs
+--- a/crates/pumpkin-core/src/block/blocks/mod.rs
++++ b/crates/pumpkin-core/src/block/blocks/mod.rs
+@@ -125,6 +125,7 @@
+ pub(crate) mod create_encasing;
+ pub(crate) mod create_fluid_tank;
+ pub(crate) mod create_funnel;
++pub(crate) mod create_gantry;
+ pub(crate) mod create_gauge;
+ pub(crate) mod create_hand_crank;
+ pub(crate) mod create_material;
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -23,7 +23,7 @@
+ };
+ use crate::{
+     block::blocks::{
+-        create_chain as chain, create_pipe as pipe, create_pump as pump,
++        create_chain as chain, create_gantry as gantry, create_pipe as pipe, create_pump as pump,
+         create_water_wheel as wheel, redstone::block_receives_redstone_power,
+     },
+     entity::{EntityBase, player::Player},
+@@ -61,6 +61,8 @@
+     pipe::VALVE,
+     chain::DRIVE,
+     chain::ADJUSTABLE,
++    gantry::SHAFT,
++    gantry::CARRIAGE,
+     wheel::SMALL,
+     wheel::LARGE,
+     "create:large_cogwheel",
+@@ -415,6 +417,15 @@
+             axis: pipe::valve_axis(state, true)?,
+             kind: Kind::Shaft,
+         });
++    }
++    if matches!(id, gantry::SHAFT | gantry::CARRIAGE) {
++        let facing = gantry::state_facing(state)?;
++        let (axis, kind) = if id == gantry::SHAFT {
++            (facing.axis(), Kind::GantryShaft { facing, powered: get("powered") == Some("true") })
++        } else {
++            (placement::gauge_axis(facing, get("axis_along_first")? == "true"), Kind::GantryCarriage { facing })
++        };
++        return Some(Node {pos, axis, kind});
+     }
+     let gauge = matches!(id, SPEEDOMETER | STRESSOMETER);
+     let value = get(
+@@ -713,6 +724,9 @@
+         let tick = world.get_world_age();
+         if matches!(self.id, CLUTCH | GEARSHIFT) {
+             self.update_transmission(world, tick);
++        }
++        if self.id == gantry::SHAFT {
++            gantry::refresh_rail(world, self.position);
+         }
+         let pos = [self.position.0.x, self.position.0.y, self.position.0.z];
+         let Some(state) = world.get_block_state_id_if_loaded(&self.position) else {
+diff --git a/crates/pumpkin-core/src/block/registry.rs b/crates/pumpkin-core/src/block/registry.rs
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -1055,9 +1055,15 @@
+                 assist,
+             );
+             use crate::block::{
+-                blocks::create_water_wheel as wheel,
++                blocks::{create_gantry as gantry, create_water_wheel as wheel},
+                 entities::create_kinetic::{CRANK, crank_support},
+             };
++            if placed_block.name == gantry::CARRIAGE {
++                let Some(state) = gantry::carriage_placement(&world, final_block_pos, new_state, Self::create_direction(face)) else {
++                    return Ok(None);
++                };
++                new_state = state;
++            }
+             if placed_block.name == CRANK
+                 && crank_support(&world, final_block_pos, new_state) != Some(true)
+             {
+@@ -1213,8 +1219,9 @@
+         let clicked = Self::create_direction(clicked);
+         let sneaking = player.get_entity().is_sneaking();
+ 
+-        use crate::block::blocks::{create_chain as chain, create_chassis as chassis, create_pipe as pipe};
++        use crate::block::blocks::{create_chain as chain, create_chassis as chassis, create_gantry as gantry, create_pipe as pipe};
+         match placed_block.name {
++            gantry::SHAFT => gantry::shaft_placement(world, position, state_id, clicked.opposite(), look, sneaking, ports),
+             name if chassis::id(name).is_some() => {
+                 chassis::placement(world, position, state_id, clicked, look, sneaking)
+             }
+diff --git a/crates/pumpkin-core/src/net/java/play/use_item_on.rs b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+--- a/crates/pumpkin-core/src/net/java/play/use_item_on.rs
++++ b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+@@ -240,6 +240,10 @@
+                     face,
+                     assist,
+                 )?;
++                if !should_try_decrement && block.name == crate::block::blocks::create_gantry::CARRIAGE {
++                    // Horizon predicts the item cost before the server validates the rail mount.
++                    player.sync_hand_slot(slot_index, item.clone());
++                }
+             }
+         }
+ 
+diff --git a/crates/pumpkin-core/src/block/blocks/create_gantry.rs b/crates/pumpkin-core/src/block/blocks/create_gantry.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/blocks/create_gantry.rs
+@@ -0,0 +1,156 @@
++use std::sync::Arc;
++
++use create_engine::{
++    contraption::gantry,
++    kinetics::Axis,
++    placement::{self, Direction},
++};
++use pumpkin_data::BlockStateId;
++use pumpkin_util::math::position::BlockPos;
++use pumpkin_world::world::BlockFlags;
++
++use super::{
++    create_pipe::{boolean, property, with_property},
++    redstone::block_receives_redstone_power,
++};
++use crate::world::World;
++
++pub(crate) const SHAFT: &str = "create:gantry_shaft";
++pub(crate) const CARRIAGE: &str = "create:gantry_carriage";
++const MAX_RAILS: usize = 65;
++
++fn offset(pos: BlockPos, direction: Direction) -> BlockPos {
++    let [x, y, z] = direction.vector();
++    BlockPos::new(pos.0.x + x, pos.0.y + y, pos.0.z + z)
++}
++
++pub(crate) fn state_facing(state: BlockStateId) -> Option<Direction> {
++    let name = property(state, "facing")?;
++    Direction::ALL
++        .into_iter()
++        .find(|facing| facing.name() == name)
++}
++
++fn shaft_facing(world: &World, pos: BlockPos) -> Option<Direction> {
++    let state = world.get_block_state_id_if_loaded(&pos)?;
++    (state.to_block().name == SHAFT)
++        .then(|| state_facing(state))
++        .flatten()
++}
++
++pub(crate) fn carriage_placement(
++    world: &World,
++    pos: BlockPos,
++    state: BlockStateId,
++    face: Direction,
++) -> Option<BlockStateId> {
++    let shaft = shaft_facing(world, offset(pos, face.opposite()))?;
++    let axis = gantry::pinion_axis(face, shaft)?;
++    Some(with_property(
++        with_property(state, "facing", face.name()),
++        "axis_along_first",
++        boolean(axis_along_first(face, axis)),
++    ))
++}
++
++fn axis_along_first(facing: Direction, axis: Axis) -> bool {
++    axis == if facing.axis() == Axis::X {
++        Axis::Y
++    } else {
++        Axis::X
++    }
++}
++
++pub(crate) fn shaft_placement(
++    world: &World,
++    pos: BlockPos,
++    state: BlockStateId,
++    face: Direction,
++    look: Direction,
++    sneaking: bool,
++    ports: [bool; 6],
++) -> BlockStateId {
++    let facing = if sneaking {
++        look
++    } else {
++        placement::preferred(ports).unwrap_or(look).opposite()
++    };
++    let aligned = shaft_facing(world, offset(pos, facing.opposite()))
++        .or_else(|| shaft_facing(world, offset(pos, face.opposite())))
++        .filter(|neighbor| neighbor.axis() == facing.axis())
++        .map_or(facing, |neighbor| {
++            if sneaking {
++                neighbor.opposite()
++            } else {
++                neighbor
++            }
++        });
++    with_property(state, "facing", aligned.name())
++}
++
++pub(crate) fn refresh_rail(world: &Arc<World>, pos: BlockPos) {
++    let Some(old) = world.get_block_state_id_if_loaded(&pos) else {
++        return;
++    };
++    if old.to_block().name != SHAFT {
++        return;
++    }
++    let Some(facing) = state_facing(old) else {
++        return;
++    };
++    let mut powered = block_receives_redstone_power(world, &pos);
++    let mut count = 1;
++    let mut connected = [false; 2];
++    for (i, direction) in [facing, facing.opposite()].into_iter().enumerate() {
++        let mut at = offset(pos, direction);
++        while shaft_facing(world, at) == Some(facing) {
++            count += 1;
++            if count > MAX_RAILS {
++                return;
++            }
++            connected[i] = true;
++            powered |= block_receives_redstone_power(world, &at);
++            at = offset(at, direction);
++        }
++    }
++    let part = match connected {
++        [true, true] => "middle",
++        [true, false] => "start",
++        [false, true] => "end",
++        [false, false] => "single",
++    };
++    let next = with_property(
++        with_property(old, "part", part),
++        "powered",
++        boolean(powered),
++    );
++    if next != old {
++        world.set_block_state_if(
++            &pos,
++            next,
++            BlockFlags::NOTIFY_LISTENERS | BlockFlags::UPDATE_KNOWN_SHAPE,
++            |current| current == old,
++        );
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn carriage_bit_matches_the_shared_shaft_axis_for_every_mount() {
++        for mount in Direction::ALL {
++            for rail in Direction::ALL {
++                if let Some(axis) = gantry::pinion_axis(mount, rail) {
++                    assert_eq!(
++                        placement::gauge_axis(mount, axis_along_first(mount, axis)),
++                        axis
++                    );
++                } else {
++                    assert_eq!(mount.axis(), rail.axis());
++                }
++            }
++        }
++    }
++}

@@ -1,0 +1,221 @@
+diff --git a/crates/pumpkin-core/src/block/blocks/mod.rs b/crates/pumpkin-core/src/block/blocks/mod.rs
+--- a/crates/pumpkin-core/src/block/blocks/mod.rs
++++ b/crates/pumpkin-core/src/block/blocks/mod.rs
+@@ -131,6 +131,7 @@
+ pub(crate) mod create_funnel;
+ pub(crate) mod create_gantry;
+ pub(crate) mod create_gauge;
++pub(crate) mod create_portable_storage;
+ pub(crate) mod create_hand_crank;
+ pub(crate) mod create_material;
+ pub(crate) mod create_millstone;
+diff --git a/crates/pumpkin-core/src/block/entities/mod.rs b/crates/pumpkin-core/src/block/entities/mod.rs
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -244,6 +244,10 @@
+     if id == create_drain::ID {
+         return Some(Arc::new(create_drain::CreateDrain::from_nbt(nbt, pos)));
+     }
++    if id == crate::block::blocks::create_portable_storage::ID {
++        use crate::block::blocks::create_portable_storage::PortableStorage;
++        return Some(Arc::new(PortableStorage::from_nbt(nbt, pos)));
++    }
+     if id == create_fluid_tank::ID {
+         return Some(Arc::new(create_fluid_tank::CreateFluidTank::from_nbt(
+             nbt, pos,
+@@ -428,6 +432,7 @@
+             "create:basin" | "create:andesite_funnel" | "create:brass_funnel"
+         )
+         || block.name == create_drain::ID
++        || block.name == crate::block::blocks::create_portable_storage::ID
+         || block.name == crate::block::blocks::create_burner::ID
+         || matches!(
+             block.name,
+@@ -487,6 +492,10 @@
+             position,
+         ))),
+         "item_drain" => Some(Arc::new(create_drain::CreateDrain::new(position))),
++        "portable_storage_interface" => {
++            use crate::block::blocks::create_portable_storage::PortableStorage;
++            Some(Arc::new(PortableStorage::from_nbt(&NbtCompound::new(), position)))
++        }
+         "chute" => Some(Arc::new(create_chute::CreateChuteBlockEntity::new(
+             position,
+         ))),
+diff --git a/crates/pumpkin-core/src/block/registry.rs b/crates/pumpkin-core/src/block/registry.rs
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -271,6 +271,7 @@
+     manager.register(crate::block::blocks::create_chassis::CreateChassis);
+     manager.register(crate::block::blocks::create_gauge::CreateSpeedometer);
+     manager.register(crate::block::blocks::create_gauge::CreateStressometer);
++    manager.register(crate::block::blocks::create_portable_storage::CreatePortableBlock);
+     manager.register(crate::block::blocks::create_hand_crank::CreateHandCrank);
+     manager.register(crate::block::blocks::create_water_wheel::CreateWaterWheel);
+     manager.register(crate::block::blocks::create_water_wheel::CreateLargeWaterWheel);
+@@ -1285,6 +1286,10 @@
+             name if chassis::id(name).is_some() => {
+                 chassis::placement(world, position, state_id, clicked, look, sneaking)
+             }
++            crate::block::blocks::create_portable_storage::ID => {
++                let facing = if sneaking { look } else { look.opposite() };
++                Self::set_create_facing(placed_block, state_id, facing)
++            }
+             crate::block::blocks::create_sticker::ID => {
+                 let facing = if sneaking { look } else { look.opposite() };
+                 let state = Self::set_create_facing(placed_block, state_id, facing);
+diff --git a/crates/pumpkin-core/src/net/java/play/use_item_on.rs b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+--- a/crates/pumpkin-core/src/net/java/play/use_item_on.rs
++++ b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+@@ -485,6 +485,7 @@
+                 block.name,
+                 crate::block::blocks::create_pipe::PIPE
+                     | crate::block::blocks::create_sticker::ID
++                    | crate::block::blocks::create_portable_storage::ID
+                     | crate::block::blocks::create_actuator::POLE
+                     | "create:windmill_bearing"
+             )
+diff --git a/crates/pumpkin-core/src/block/blocks/create_portable_storage.rs b/crates/pumpkin-core/src/block/blocks/create_portable_storage.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/blocks/create_portable_storage.rs
+@@ -0,0 +1,139 @@
++use std::{
++    any::Any,
++    sync::{Arc, Mutex, PoisonError},
++};
++
++use create_engine::contraption::portable_storage::{DEFAULT_TIMEOUT, Station};
++use pumpkin_macros::pumpkin_block;
++use pumpkin_nbt::compound::NbtCompound;
++use pumpkin_util::math::position::BlockPos;
++
++use crate::{
++    block::{
++        BlockBehaviour, GetComparatorOutputArgs, blocks::redstone::block_receives_redstone_power,
++        entities::BlockEntity,
++    },
++    world::World,
++};
++
++pub(crate) const ID: &str = "create:portable_storage_interface";
++
++#[pumpkin_block("create:portable_storage_interface")]
++pub(crate) struct CreatePortableBlock;
++
++impl BlockBehaviour for CreatePortableBlock {
++    fn get_comparator_output(&self, args: GetComparatorOutputArgs<'_>) -> Option<u8> {
++        Some(
++            args.world
++                .get_block_entity(args.position)
++                .and_then(|entity| {
++                    entity
++                        .as_any()
++                        .downcast_ref::<PortableStorage>()
++                        .map(PortableStorage::signal)
++                })
++                .unwrap_or(0),
++        )
++    }
++}
++
++pub(crate) struct PortableStorage {
++    position: BlockPos,
++    station: Mutex<Station>,
++    extra: NbtCompound,
++}
++
++impl PortableStorage {
++    fn signal(&self) -> u8 {
++        let station = *self.station.lock().unwrap_or_else(PoisonError::into_inner);
++        // A saved visual timer cannot authorize transfer without a live owner.
++        if station.can_transfer(DEFAULT_TIMEOUT) && !station.powered() {
++            station.signal(DEFAULT_TIMEOUT)
++        } else {
++            0
++        }
++    }
++}
++
++impl BlockEntity for PortableStorage {
++    fn resource_location(&self) -> &'static str {
++        ID
++    }
++    fn get_position(&self) -> BlockPos {
++        self.position
++    }
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++
++    fn from_nbt(nbt: &NbtCompound, position: BlockPos) -> Self {
++        let station = Station::from_saved(
++            nbt.get_int("Timer")
++                .unwrap_or(0)
++                .clamp(0, DEFAULT_TIMEOUT as i32 + 8) as u32,
++            nbt.get_float("Distance").unwrap_or(0.0),
++            nbt.get_bool("Powered").unwrap_or(false),
++        )
++        .unwrap_or_default();
++        let mut extra = nbt.clone();
++        for name in ["id", "x", "y", "z", "Timer", "Distance", "Powered"] {
++            extra.child_tags.remove(name);
++        }
++        Self {
++            position,
++            station: Mutex::new(station),
++            extra,
++        }
++    }
++
++    fn write_nbt(&self, nbt: &mut NbtCompound) {
++        nbt.child_tags.extend(self.extra.child_tags.clone());
++        let station = *self.station.lock().unwrap_or_else(PoisonError::into_inner);
++        nbt.put_int("Timer", station.timer() as i32);
++        nbt.put_float("Distance", station.distance());
++        nbt.put_bool("Powered", station.powered());
++    }
++
++    fn chunk_data_nbt(&self) -> Option<NbtCompound> {
++        let mut nbt = NbtCompound::new();
++        self.write_nbt(&mut nbt);
++        Some(nbt)
++    }
++
++    fn tick(&self, world: &Arc<World>) {
++        let powered = block_receives_redstone_power(world, &self.position);
++        let changed = {
++            let mut station = self.station.lock().unwrap_or_else(PoisonError::into_inner);
++            let old = *station;
++            station.set_powered(powered);
++            station.tick(DEFAULT_TIMEOUT);
++            old != *station
++        };
++        if changed
++            && let Some(entity) = world.get_block_entity(&self.position)
++            && entity
++                .as_any()
++                .downcast_ref::<Self>()
++                .is_some_and(|current| std::ptr::eq(current, self))
++        {
++            world.update_block_entity(&entity);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn preserves_saved_data_but_never_restores_a_stale_inventory_connection() {
++        let mut nbt = NbtCompound::new();
++        nbt.put_int("Timer", 12);
++        nbt.put_float("Distance", 1.0);
++        nbt.put_bool("Powered", false);
++        nbt.put_string("Other", "preserve".into());
++        let entity = PortableStorage::from_nbt(&nbt, BlockPos::new(0, 0, 0));
++        assert_eq!(entity.signal(), 0);
++        assert_eq!(entity.chunk_data_nbt(), Some(nbt));
++    }
++}

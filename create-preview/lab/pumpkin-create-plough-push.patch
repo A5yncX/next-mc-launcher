@@ -1,0 +1,96 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_bearing.rs b/crates/pumpkin-core/src/block/entities/create_bearing.rs
+--- a/crates/pumpkin-core/src/block/entities/create_bearing.rs
++++ b/crates/pumpkin-core/src/block/entities/create_bearing.rs
+@@ -531,12 +531,15 @@
+         ) && commit(world, controller, state, Some(previous), new, &[])
+         {
+             drop(_guard);
+-            for (tool, target) in visits {
++            for (tool, target, motion) in visits {
+                 let target = pos(target);
+                 if within_landing_scope(world, controller, target) {
+                     match tool {
+                         Tool::Harvester => harvester::harvest_crop(world, target),
+-                        Tool::Plough => plough::till(world, target),
++                        Tool::Plough => {
++                            plough::push(world, target, motion);
++                            plough::till(world, target);
++                        }
+                         _ => {}
+                     }
+                 }
+diff --git a/crates/pumpkin-core/src/block/entities/create_harvester.rs b/crates/pumpkin-core/src/block/entities/create_harvester.rs
+--- a/crates/pumpkin-core/src/block/entities/create_harvester.rs
++++ b/crates/pumpkin-core/src/block/entities/create_harvester.rs
+@@ -73,7 +73,7 @@
+     angle: f32,
+     previous: Option<&NbtCompound>,
+     next: &mut NbtCompound,
+-) -> Vec<(Tool, Pos)> {
++) -> Vec<(Tool, Pos, [f64; 3])> {
+     let rotation = Rotation::new(anchor, Axis::Y, angle).expect("validated pose");
+     let inverse = Rotation::new([0; 3], Axis::Y, -angle).expect("validated pose");
+     let mut saved = Vec::new();
+@@ -118,7 +118,7 @@
+             |motion| motion,
+             |motion| inverse.rotate_vector(motion),
+         );
+-        visits.extend(result.visit.map(|pos| (tool, pos)));
++        visits.extend(result.visit.map(|pos| (tool, pos, result.motion)));
+         let state = tracker.state();
+         let mut entry = NbtCompound::new();
+         entry.put("Pos", NbtTag::IntArray(local.into()));
+@@ -371,10 +371,11 @@
+         let mut first = NbtCompound::new();
+         assert!(sample(&tool, anchor, 9.6, None, &mut first).is_empty());
+         let mut second = NbtCompound::new();
+-        assert_eq!(
+-            sample(&tool, anchor, 19.2, Some(&first), &mut second),
+-            [(Tool::Harvester, [-263, 80, -109])]
+-        );
++        let visits = sample(&tool, anchor, 19.2, Some(&first), &mut second);
++        let [(Tool::Harvester, [-263, 80, -109], motion)] = visits.as_slice() else {
++            panic!("expected one harvester visit");
++        };
++        assert!(motion[2] < 0.0);
+         let mut duplicate = NbtCompound::new();
+         assert!(sample(&tool, anchor, 19.2, Some(&second), &mut duplicate).is_empty());
+     }
+diff --git a/crates/pumpkin-core/src/block/entities/create_plough.rs b/crates/pumpkin-core/src/block/entities/create_plough.rs
+--- a/crates/pumpkin-core/src/block/entities/create_plough.rs
++++ b/crates/pumpkin-core/src/block/entities/create_plough.rs
+@@ -1,11 +1,33 @@
+ use std::sync::Arc;
+ 
++use create_engine::contraption::actors::throw_boost;
+ use pumpkin_data::{Block, item::Item, item_stack::ItemStack};
+-use pumpkin_util::math::position::BlockPos;
++use pumpkin_util::math::{boundingbox::BoundingBox, position::BlockPos, vector3::Vector3};
+ 
+ use crate::world::World;
+ 
+ pub(super) const ID: &str = "create:mechanical_plough";
++
++pub(super) fn push(world: &World, pos: BlockPos, motion: [f64; 3]) {
++    if world.spawn_protects_position(&pos)
++        || world
++            .get_block_state_if_loaded(&pos)
++            .is_none_or(|s| s.is_solid_block())
++    {
++        return;
++    }
++    let [x, y, z] = throw_boost(motion);
++    let mut mobs = Vec::new();
++    // shortcut: limit a visit to 64 mobs; revisit if large pen stress tests need more.
++    world.extend_entities_in_box_where(&mut mobs, 64, BoundingBox::from_block(&pos), |e| {
++        e.get_mob().is_some()
++            && e.get_living_entity()
++                .is_some_and(|living| living.is_alive())
++    });
++    for mob in mobs.into_iter().take(64) {
++        mob.get_entity().add_velocity(Vector3::new(x, y, z));
++    }
++}
+ 
+ pub(super) fn till(world: &Arc<World>, top: BlockPos) {
+     let (Some(air), Some(soil)) = (

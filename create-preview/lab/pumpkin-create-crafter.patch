@@ -1,0 +1,730 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_mechanical_crafter.rs b/crates/pumpkin-core/src/block/entities/create_mechanical_crafter.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_mechanical_crafter.rs
+@@ -0,0 +1,604 @@
++use std::{
++    any::Any,
++    sync::{Arc, LazyLock, Mutex},
++};
++
++use create_engine::{
++    crafter::{self, Cycle, GroupedItems, Layout, Phase, Pointing, Tick},
++    kinetics::Pos,
++    placement::Direction,
++};
++use pumpkin_data::{entity::EntityType, item::Item, item_stack::ItemStack, tag::Taggable};
++use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
++use pumpkin_util::{
++    GameMode,
++    math::{position::BlockPos, vector3::Vector3},
++};
++use serde::Deserialize;
++
++use super::{BlockEntity, create_kinetic::CreateKinetic};
++use crate::{
++    block::blocks::{
++        create_pipe::{property, with_property},
++        redstone::block_receives_redstone_power,
++    },
++    entity::{Entity, EntityBase, item::ItemEntity, player::Player},
++    world::World,
++};
++
++pub(crate) const ID: &str = "create:mechanical_crafter";
++static TRANSFER: Mutex<()> = Mutex::new(());
++
++#[derive(Deserialize)]
++struct Recipe {
++    pattern: Vec<String>,
++    key: std::collections::HashMap<char, Ingredient>,
++    result: ResultItem,
++}
++#[derive(Deserialize)]
++#[serde(untagged)]
++enum Ingredient {
++    Items(Vec<String>),
++    Tag(String),
++}
++#[derive(Deserialize)]
++struct ResultItem {
++    id: String,
++    count: u8,
++}
++static RECIPE: LazyLock<Recipe> = LazyLock::new(|| {
++    serde_json::from_str(include_str!(
++        "../../../../../assets/nextmc-create-mechanical-crafting.json"
++    ))
++    .expect("validated pinned mechanical crafting recipe")
++});
++
++fn craft(group: &GroupedItems<ItemStack>) -> Option<ItemStack> {
++    let grid = group.recipe_grid()?;
++    if grid.height != RECIPE.pattern.len() {
++        return None;
++    }
++    for (y, line) in RECIPE.pattern.iter().enumerate() {
++        if grid.width != line.len() {
++            return None;
++        }
++        for (x, c) in line.chars().enumerate() {
++            let stack = grid.get(x, y);
++            if c == ' ' {
++                if stack.is_some() {
++                    return None;
++                }
++                continue;
++            }
++            let item = stack?.get_item();
++            let ingredient = RECIPE.key.get(&c)?;
++            if !match ingredient {
++                Ingredient::Tag(tag) => {
++                    item.is_tagged_with(tag.trim_start_matches('#')) == Some(true)
++                }
++                Ingredient::Items(keys) => keys.iter().any(|key| {
++                    Item::from_registry_key(key).is_some_and(|entry| entry.id == item.id)
++                }),
++            } {
++                return None;
++            }
++        }
++    }
++    Some(ItemStack::new(
++        RECIPE.result.count,
++        Item::from_registry_key(&RECIPE.result.id)?,
++    ))
++}
++
++#[derive(Default)]
++struct State {
++    item: Option<ItemStack>,
++    covered: bool,
++    powered: bool,
++    cycle: Cycle,
++    group: GroupedItems<ItemStack>,
++}
++
++pub(crate) struct MechanicalCrafter {
++    pos: BlockPos,
++    kinetic: CreateKinetic,
++    state: Mutex<State>,
++    saved: NbtCompound,
++    supported: bool,
++}
++
++fn coords(p: BlockPos) -> Pos {
++    [p.0.x, p.0.y, p.0.z]
++}
++fn pos([x, y, z]: Pos) -> BlockPos {
++    BlockPos::new(x, y, z)
++}
++pub(crate) fn facing(world: &World, p: BlockPos) -> Option<Direction> {
++    Some(layout(world, coords(p))?.facing)
++}
++
++fn layout(world: &World, p: Pos) -> Option<Layout> {
++    let state = world.get_block_state_id_if_loaded(&pos(p))?;
++    if state.to_block().name != ID {
++        return None;
++    }
++    let facing = Direction::ALL
++        .into_iter()
++        .find(|d| property(state, "facing") == Some(d.name()))?;
++    if facing.vector()[1] != 0 {
++        return None;
++    }
++    Some(Layout {
++        facing,
++        pointing: Pointing::from_name(property(state, "pointing")?)?,
++    })
++}
++
++fn machine(entity: &dyn BlockEntity) -> Option<&MechanicalCrafter> {
++    entity
++        .as_any()
++        .downcast_ref::<MechanicalCrafter>()
++        .filter(|e| e.supported)
++}
++
++fn item_tag(item: Option<&ItemStack>) -> NbtCompound {
++    let mut compound = NbtCompound::new();
++    if let Some(item) = item {
++        item.write_item_stack(&mut compound);
++    }
++    compound
++}
++
++fn read_state(tag: &NbtCompound) -> Option<State> {
++    let mut state = State {
++        covered: tag.get_bool("Cover").unwrap_or(false),
++        powered: tag.get_bool("NextMcPowered").unwrap_or(false),
++        ..State::default()
++    };
++    if let Some(field) = tag.get("Phase") {
++        state.cycle.phase = Phase::from_name(field.extract_string()?)?;
++    }
++    state.cycle.countdown = tag.get_int("CountDown").unwrap_or(0);
++    if !(0..=2000).contains(&state.cycle.countdown) {
++        return None;
++    }
++    if let Some(inv) = tag.get("Inventory") {
++        match inv.extract_compound()?.get_list("Items")? {
++            [] => (),
++            [item] => {
++                state.item = Some(ItemStack::read_item_stack(item.extract_compound()?)?);
++            }
++            _ => return None,
++        }
++    }
++    if let Some(group) = tag.get("GroupedItems") {
++        let rows = group.extract_compound()?.get_list("Grid")?;
++        if rows.len() > 256 {
++            return None;
++        }
++        for row in rows {
++            let row = row.extract_compound()?;
++            let (x, y) = (row.get_int("x")?, row.get_int("y")?);
++            if !(-256..=256).contains(&x) || !(-256..=256).contains(&y) {
++                return None;
++            }
++            let item = row.get_compound("item")?;
++            let item = if item.child_tags.is_empty() {
++                None
++            } else {
++                Some(ItemStack::read_item_stack(item)?)
++            };
++            if state.group.grid.insert((x, y), item).is_some() {
++                return None;
++            }
++        }
++    }
++    Some(state)
++}
++
++impl MechanicalCrafter {
++    pub(crate) fn new(pos: BlockPos) -> Self {
++        Self {
++            pos,
++            kinetic: CreateKinetic::new(ID, pos),
++            state: Mutex::default(),
++            saved: NbtCompound::new(),
++            supported: true,
++        }
++    }
++
++    fn start(world: &World, p: Pos, forced: bool) -> Option<Vec<Arc<dyn BlockEntity>>> {
++        let cells = crafter::chain(p, |p| layout(world, p)).ok()?;
++        let mut plans = Vec::new();
++        let mut has_items = false;
++        for at in cells {
++            // shortcut: keep all in-flight slots in one loaded chunk until cross-chunk recovery exists.
++            if pos(at).chunk_position() != pos(p).chunk_position() {
++                return None;
++            }
++            let entity = world.get_block_entity(&pos(at))?;
++            let member = machine(entity.as_ref())?;
++            let state = member.state.lock().unwrap();
++            if state.cycle.phase != Phase::Idle
++                || member.kinetic.rpm() == 0.0
++                || (!forced && !state.covered && state.item.is_none())
++            {
++                return None;
++            }
++            has_items |= state.item.is_some();
++            let here = layout(world, at)?;
++            let waits = !crafter::preceding(at, here, &mut |at| layout(world, at)).is_empty();
++            if crafter::target(at, here, &mut |at| layout(world, at)).is_none()
++                && !world
++                    .get_block_state_id_if_loaded(&pos(here.target_position(at)))?
++                    .to_block()
++                    .is_air()
++            {
++                return None;
++            }
++            drop(state);
++            plans.push((entity, waits));
++        }
++        if !has_items {
++            return None;
++        }
++        Some(
++            plans
++                .into_iter()
++                .map(|(entity, waits)| {
++                    let mut next = machine(entity.as_ref()).unwrap().state.lock().unwrap();
++                    next.group = GroupedItems::single(next.item.take());
++                    next.cycle = next.cycle.begin(waits);
++                    drop(next);
++                    entity
++                })
++                .collect(),
++        )
++    }
++
++    fn drain(state: &mut State) -> Vec<ItemStack> {
++        let mut stacks: Vec<_> = std::mem::take(&mut state.group)
++            .grid
++            .into_values()
++            .flatten()
++            .collect();
++        stacks.extend(state.item.take());
++        state.cycle = Cycle::default();
++        stacks
++    }
++
++    fn tick_chain(&self, world: &Arc<World>, at: Pos, here: Layout) -> Vec<Arc<dyn BlockEntity>> {
++        let _gate = TRANSFER.lock().unwrap();
++        let mut own = self.state.lock().unwrap();
++        let powered = block_receives_redstone_power(world, &self.pos);
++        let edge = powered && !own.powered;
++        let phase = own.cycle.phase;
++        own.powered = powered;
++        if phase == Phase::Idle
++            && (edge || own.item.is_some() && world.get_world_age().rem_euclid(20) == 0)
++        {
++            drop(own);
++            return Self::start(world, at, edge).unwrap_or_default();
++        }
++        match own.cycle.tick(self.kinetic.rpm()) {
++            Tick::AssemblyComplete => {
++                if crafter::target(at, here, &mut |p| layout(world, p)).is_some() {
++                    own.cycle = Cycle::exporting(own.group.only_empty());
++                } else if let Some(out) = craft(&own.group) {
++                    own.group = GroupedItems::single(Some(out));
++                    own.cycle = Cycle::crafting();
++                } else {
++                    own.cycle.phase = Phase::Inserting;
++                }
++            }
++            Tick::ExportComplete => {
++                let receiver = crafter::target(at, here, &mut |p| layout(world, p))
++                    .and_then(|p| world.get_block_entity(&pos(p)));
++                if let Some(entity) = receiver {
++                    if let Some(next) = machine(entity.as_ref()) {
++                        let mut dest = next.state.lock().unwrap();
++                        if dest.cycle.phase == Phase::Accepting
++                            && own.group.merge_onto(&mut dest.group, here.pointing)
++                        {
++                            own.cycle.phase = Phase::Waiting;
++                            let target = coords(next.pos);
++                            if let Some(target_layout) = layout(world, target)
++                                && crafter::preceding(target, target_layout, &mut |p| {
++                                    layout(world, p)
++                                })
++                                .into_iter()
++                                .all(|p| {
++                                    p == at
++                                        || world.get_block_entity(&pos(p)).is_some_and(|e| {
++                                            machine(e.as_ref()).is_some_and(|c| {
++                                                c.state.lock().unwrap().cycle.phase
++                                                    == Phase::Waiting
++                                            })
++                                        })
++                                })
++                            {
++                                dest.cycle = Cycle::assembling();
++                            }
++                            drop(dest);
++                            return vec![entity];
++                        }
++                    }
++                }
++                own.cycle.phase = Phase::Inserting;
++            }
++            Tick::CraftComplete => own.cycle.phase = Phase::Inserting,
++            _ => (),
++        }
++        if phase == Phase::Inserting {
++            let target = here.target_position(at);
++            if world
++                .get_block_state_id_if_loaded(&pos(target))
++                .is_some_and(|id| id.to_block().is_air())
++            {
++                // Keep each stack in the group until the world accepts its item entity.
++                for slot in own.group.grid.values_mut() {
++                    if let Some(stack) = slot {
++                        let [x, y, z] = target;
++                        let base = Entity::new(
++                            world.clone(),
++                            Vector3::new(
++                                f64::from(x) + 0.5,
++                                f64::from(y) + 0.5,
++                                f64::from(z) + 0.5,
++                            ),
++                            &EntityType::ITEM,
++                        );
++                        if world.spawn_entity(Arc::new(ItemEntity::new_with_velocity(
++                            base,
++                            stack.clone(),
++                            Vector3::new(0.0, 0.1, 0.0),
++                            20,
++                        ))) {
++                            *slot = None;
++                        }
++                    }
++                }
++                if own.group.only_empty() {
++                    drop(own);
++                    let chain =
++                        crafter::chain(at, |p| layout(world, p)).unwrap_or_else(|_| vec![at]);
++                    return chain
++                        .into_iter()
++                        .filter_map(|p| {
++                            let entity = world.get_block_entity(&pos(p))?;
++                            let candidate = machine(entity.as_ref())?;
++                            let mut state = candidate.state.lock().unwrap();
++                            if state.group.only_empty()
++                                && matches!(state.cycle.phase, Phase::Inserting | Phase::Waiting)
++                            {
++                                state.cycle = Cycle::default();
++                                state.group = GroupedItems::default();
++                            }
++                            drop(state);
++                            Some(entity)
++                        })
++                        .collect();
++                }
++            }
++        }
++        Vec::new()
++    }
++}
++
++impl BlockEntity for MechanicalCrafter {
++    fn resource_location(&self) -> &'static str {
++        ID
++    }
++    fn get_position(&self) -> BlockPos {
++        self.pos
++    }
++    fn from_nbt(tag: &NbtCompound, p: BlockPos) -> Self {
++        let state = read_state(tag);
++        Self {
++            pos: p,
++            kinetic: CreateKinetic::from_nbt(tag, p),
++            supported: state.is_some(),
++            state: Mutex::new(state.unwrap_or_default()),
++            saved: tag.clone(),
++        }
++    }
++    fn write_nbt(&self, tag: &mut NbtCompound) {
++        tag.merge(&self.saved);
++        if !self.supported {
++            return;
++        }
++        self.kinetic.write_nbt(tag);
++        let state = self.state.lock().unwrap();
++        let mut inv = NbtCompound::new();
++        inv.put_int("Size", 1);
++        inv.put_list(
++            "Items",
++            state
++                .item
++                .as_ref()
++                .map(|stack| {
++                    let mut row = item_tag(Some(stack));
++                    row.put_int("Slot", 0);
++                    NbtTag::Compound(row)
++                })
++                .into_iter()
++                .collect(),
++        );
++        tag.put_compound("Inventory", inv);
++        tag.put_bool("Cover", state.covered);
++        tag.put_bool("NextMcPowered", state.powered);
++        tag.put_string("Phase", state.cycle.phase.name().into());
++        tag.put_int("CountDown", state.cycle.countdown);
++        let mut group = NbtCompound::new();
++        group.put_list(
++            "Grid",
++            state
++                .group
++                .grid
++                .iter()
++                .map(|(&(x, y), item)| {
++                    let mut row = NbtCompound::new();
++                    row.put_int("x", x);
++                    row.put_int("y", y);
++                    row.put_compound("item", item_tag(item.as_ref()));
++                    NbtTag::Compound(row)
++                })
++                .collect(),
++        );
++        tag.put_compound("GroupedItems", group);
++    }
++    fn chunk_data_nbt(&self) -> Option<NbtCompound> {
++        let mut tag = NbtCompound::new();
++        self.write_nbt(&mut tag);
++        Some(tag)
++    }
++    fn tick(&self, world: &Arc<World>) {
++        if !self.supported {
++            return;
++        }
++        let at = coords(self.pos);
++        let Some(layout) = layout(world, at) else {
++            return;
++        };
++        let before = self.state.lock().unwrap().cycle;
++        let rpm = self.kinetic.rpm();
++        self.kinetic.tick(world);
++        let changed = self.tick_chain(world, at, layout);
++        for entity in changed {
++            world.update_block_entity(&entity);
++        }
++        if (before != self.state.lock().unwrap().cycle || rpm != self.kinetic.rpm())
++            && let Some(entity) = world.get_block_entity(&self.pos)
++            && machine(entity.as_ref()).is_some_and(|v| std::ptr::eq(v, self))
++        {
++            world.update_block_entity(&entity);
++        }
++    }
++    fn on_block_replaced(self: Arc<Self>, world: &Arc<World>, p: &BlockPos) {
++        let _gate = TRANSFER.lock().unwrap();
++        let mut state = self.state.lock().unwrap();
++        if state.covered {
++            world.drop_stack(p, ItemStack::new(1, &Item::CREATE_CRAFTER_SLOT_COVER));
++        }
++        for item in Self::drain(&mut state) {
++            world.drop_stack(p, item);
++        }
++    }
++    fn is_dirty(&self) -> bool {
++        false
++    }
++    fn clear_dirty(&self) {}
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++}
++
++pub(crate) fn interact(
++    world: &Arc<World>,
++    player: &Player,
++    p: BlockPos,
++    face: pumpkin_data::BlockDirection,
++    stack: &mut ItemStack,
++) -> bool {
++    let mode = player.gamemode.load();
++    if player.get_entity().is_sneaking()
++        || !matches!(mode, GameMode::Survival | GameMode::Creative)
++        || world.is_in_spawn_protection(player, &p)
++    {
++        return false;
++    }
++    let Some(layout) = layout(world, coords(p)) else {
++        return false;
++    };
++    let offset = face.to_offset();
++    if layout.facing.vector() != [offset.x, offset.y, offset.z] {
++        return false;
++    }
++    let Some(entity) = world.get_block_entity(&p) else {
++        return false;
++    };
++    let Some(member) = machine(entity.as_ref()) else {
++        return false;
++    };
++    let gate = TRANSFER.lock().unwrap();
++    let mut state = member.state.lock().unwrap();
++    if state.cycle.phase != Phase::Idle {
++        return false;
++    }
++    if stack.get_item() == &Item::CREATE_WRENCH {
++        drop(state);
++        drop(gate);
++        let Some(current) = world.get_block_state_id_if_loaded(&p) else {
++            return false;
++        };
++        if current.to_block().name != ID {
++            return false;
++        }
++        let next = with_property(current, "pointing", layout.pointing.next().name());
++        return world
++            .set_block_state_if(
++                &p,
++                next,
++                pumpkin_world::world::BlockFlags::NOTIFY_ALL,
++                |s| s == current,
++            )
++            .is_some();
++    }
++    if stack.is_empty() {
++        if state.covered {
++            state.covered = false;
++            if mode != GameMode::Creative {
++                *stack = ItemStack::new(1, &Item::CREATE_CRAFTER_SLOT_COVER);
++            }
++        } else {
++            *stack = state
++                .item
++                .take()
++                .unwrap_or_else(|| ItemStack::EMPTY.clone());
++        }
++    } else if state.covered || state.item.is_some() || stack.get_item().registry_key == ID {
++        return false;
++    } else {
++        if stack.get_item() == &Item::CREATE_CRAFTER_SLOT_COVER {
++            state.covered = true;
++        } else {
++            let mut one = stack.clone();
++            one.item_count = 1;
++            state.item = Some(one);
++        }
++        if mode != GameMode::Creative {
++            stack.decrement(1);
++        }
++    }
++    drop(state);
++    drop(gate);
++    world.update_block_entity(&entity);
++    true
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn crushing_pattern_requires_exact_slots() {
++        let mut group = GroupedItems::default();
++        for (y, row) in RECIPE.pattern.iter().enumerate() {
++            for (x, c) in row.chars().enumerate() {
++                let item = match c {
++                    'A' => &Item::CREATE_ANDESITE_ALLOY,
++                    'P' => &Item::OAK_PLANKS,
++                    'S' => &Item::STONE,
++                    _ => continue,
++                };
++                group
++                    .grid
++                    .insert((x as i32, -(y as i32)), Some(ItemStack::new(1, item)));
++            }
++        }
++        let result = craft(&group).unwrap();
++        assert_eq!(result.item_count, 2);
++        assert_eq!(result.get_item().id, Item::CREATE_CRUSHING_WHEEL.id);
++        group.grid.remove(&(2, -2));
++        assert!(craft(&group).is_none());
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -69,6 +69,7 @@
+     actuator::STICKY,
+     actuator::PULLEY,
+     super::create_deployer::ID,
++    super::create_mechanical_crafter::ID,
+     wheel::SMALL,
+     wheel::LARGE,
+     "create:large_cogwheel",
+@@ -499,7 +500,15 @@
+         if directional_axis
+             || matches!(
+                 id,
+-                MOTOR | CRANK | wheel::SMALL | press::ID | pump::ID | fan::ID | drill::ID | saw::ID
++                MOTOR
++                    | CRANK
++                    | wheel::SMALL
++                    | press::ID
++                    | pump::ID
++                    | fan::ID
++                    | drill::ID
++                    | saw::ID
++                    | super::create_mechanical_crafter::ID
+             )
+         {
+             "facing"
+@@ -552,6 +561,7 @@
+         crusher::WHEEL => Kind::CrushingWheel,
+         GEARBOX => Kind::Gearbox,
+         press::ID => Kind::Press,
++        super::create_mechanical_crafter::ID => Kind::Crafter,
+         pump::ID => Kind::Pump,
+         saw::ID if vertical_saw => Kind::LinearActuator,
+         actuator::PISTON | actuator::STICKY | actuator::PULLEY | super::create_deployer::ID => {
+diff --git a/crates/pumpkin-core/src/block/entities/mod.rs b/crates/pumpkin-core/src/block/entities/mod.rs
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -31,6 +31,7 @@
+ pub(crate) mod create_fan_airflow;
+ pub(crate) mod create_fluid_tank;
+ pub(crate) mod create_kinetic;
++pub(crate) mod create_mechanical_crafter;
+ pub(crate) mod create_millstone;
+ mod create_mixer;
+ pub(crate) mod create_press;
+@@ -260,6 +261,11 @@
+             create_millstone::CreateMillstoneBlockEntity::from_nbt(nbt, pos),
+         ));
+     }
++    if id == create_mechanical_crafter::ID {
++        return Some(Arc::new(
++            create_mechanical_crafter::MechanicalCrafter::from_nbt(nbt, pos),
++        ));
++    }
+     if id == create_deployer::ID {
+         return Some(Arc::new(
+             create_deployer::CreateDeployerBlockEntity::from_nbt(nbt, pos),
+@@ -448,6 +454,11 @@
+             position,
+         )));
+     }
++    if *name == "mechanical_crafter" {
++        return Some(Arc::new(create_mechanical_crafter::MechanicalCrafter::new(
++            position,
++        )));
++    }
+     if *name == "deployer" {
+         return Some(Arc::new(create_deployer::CreateDeployerBlockEntity::new(
+             position,
+diff --git a/crates/pumpkin-core/src/block/registry.rs b/crates/pumpkin-core/src/block/registry.rs
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -1241,6 +1241,33 @@
+             create_gantry as gantry, create_pipe as pipe,
+         };
+         match placed_block.name {
++            crate::block::entities::create_mechanical_crafter::ID => {
++                use create_engine::crafter::Pointing;
++                let yaw = f64::from(player.get_entity().yaw.load()).to_radians();
++                let facing =
++                    Self::create_direction(BlockDirection::get_nearest(-yaw.sin(), 0.0, yaw.cos()))
++                        .opposite();
++                let face = clicked.opposite();
++                let [dx, dy, dz] = face.vector();
++                let support =
++                    BlockPos::new(position.0.x - dx, position.0.y - dy, position.0.z - dz);
++                let connected = (!sneaking)
++                    .then(|| {
++                        crate::block::entities::create_mechanical_crafter::facing(world, support)
++                    })
++                    .flatten();
++                let facing = connected.unwrap_or(facing);
++                let pointing = if connected.is_some() || facing != face {
++                    Pointing::from_clicked_face(face, facing)
++                } else {
++                    Pointing::Up
++                };
++                pipe::with_property(
++                    Self::set_create_facing(placed_block, state_id, facing),
++                    "pointing",
++                    pointing.name(),
++                )
++            }
+             gantry::SHAFT => gantry::shaft_placement(
+                 world,
+                 position,
+diff --git a/crates/pumpkin-core/src/net/java/play/use_item_on.rs b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+--- a/crates/pumpkin-core/src/net/java/play/use_item_on.rs
++++ b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+@@ -127,6 +127,9 @@
+ 
+         if crate::block::blocks::create_belt::interact(&world, player, position, &mut item)
+             || crate::block::blocks::create_material::interact(&world, player, position, &mut item)
++            || crate::block::entities::create_mechanical_crafter::interact(
++                &world, player, position, face, &mut item,
++            )
+             || crate::block::entities::create_deployer::interact(
+                 &world,
+                 player,

@@ -1,0 +1,162 @@
+diff --git a/tools/pumpkin-codegen/src/block.rs b/tools/pumpkin-codegen/src/block.rs
+--- a/tools/pumpkin-codegen/src/block.rs
++++ b/tools/pumpkin-codegen/src/block.rs
+@@ -583,7 +583,10 @@
+                         from_props_arms.push(quote! {
+                             Property::#prop_var_ident(value) => block_props.#field_name = *value,
+                         });
+-                        for (other_prop_var, other_enum) in shared_none_variants {
++                        for (other_prop_var, other_enum) in shared_none_variants
++                            .iter()
++                            .filter(|_| values.iter().any(|value| value == "none"))
++                        {
+                             let other_prop_var_ident =
+                                 Ident::new(other_prop_var, Span::call_site());
+                             let other_enum_ident = Ident::new(other_enum, Span::call_site());
+@@ -1361,24 +1364,24 @@
+         let total_distinct_types =
+             usize::from(has_bool) + usize::from(has_int) + unique_canonical_enums.len();
+ 
++        let variant_name = |canon: &str| {
++            // Existing vanilla structure templates refer to Property::Part for BedPart.
++            if total_distinct_types == 1 || (key_name == "part" && canon == "BedPart") {
++                key_name.to_upper_camel_case()
++            } else {
++                canon.to_owned()
++            }
++        };
+         let mut canon_with_none: Vec<(String, String)> = Vec::new();
+         for (canon_name, canon_vals) in &unique_canonical_enums {
+-            let prop_var = if total_distinct_types == 1 {
+-                key_name.to_upper_camel_case()
+-            } else {
+-                canon_name.clone()
+-            };
++            let prop_var = variant_name(canon_name);
+             if canon_vals.iter().any(|v| v == "none") {
+                 canon_with_none.push((prop_var, canon_name.clone()));
+             }
+         }
+ 
+         for ((p, _, _), (canon_name, _)) in enum_entries.iter().zip(canonical_for_entry.iter()) {
+-            let prop_variant_name = if total_distinct_types == 1 {
+-                key_name.to_upper_camel_case()
+-            } else {
+-                canon_name.clone()
+-            };
++            let prop_variant_name = variant_name(canon_name);
+             let shared_none_variants: Vec<(String, String)> = canon_with_none
+                 .iter()
+                 .filter(|(_, other_canon)| other_canon != canon_name)
+@@ -1429,12 +1432,8 @@
+                 PropertyKey::#key_ident => Some(Self::#key_ident(value)),
+             });
+         }
+-        for (canon_name, _) in &unique_canonical_enums {
+-            let prop_var = if total_distinct_types == 1 {
+-                key_name.to_upper_camel_case()
+-            } else {
+-                canon_name.clone()
+-            };
++        for canon_name in unique_canonical_enums.keys() {
++            let prop_var = variant_name(canon_name);
+             let var_ident = Ident::new(&prop_var, Span::call_site());
+             let canon_ident = Ident::new(canon_name, Span::call_site());
+             property_enum_variants.push(quote! { #var_ident(#canon_ident) });
+@@ -1456,11 +1455,7 @@
+                 val_arms.push(quote! { "false" => Some(Self::#key_ident(false)), });
+             }
+             for (canon_name, canon_vals) in &unique_canonical_enums {
+-                let prop_var = if total_distinct_types == 1 {
+-                    key_name.to_upper_camel_case()
+-                } else {
+-                    canon_name.clone()
+-                };
++                let prop_var = variant_name(canon_name);
+                 let var_ident = Ident::new(&prop_var, Span::call_site());
+                 let canon_ident = Ident::new(canon_name, Span::call_site());
+                 for val_str in *canon_vals {
+diff --git a/crates/pumpkin-data/src/item_stack/mod.rs b/crates/pumpkin-data/src/item_stack/mod.rs
+--- a/crates/pumpkin-data/src/item_stack/mod.rs
++++ b/crates/pumpkin-data/src/item_stack/mod.rs
+@@ -817,8 +817,15 @@
+     }
+ 
+     pub fn write_item_stack(&self, compound: &mut NbtCompound) {
+-        // Minecraft 1.21.4 uses "id" as string with namespaced ID (minecraft:diamond_sword)
+-        compound.put_string("id", format!("minecraft:{}", self.item.registry_key));
++        let key = self.item.registry_key;
++        compound.put_string(
++            "id",
++            if key.contains(':') {
++                key.to_owned()
++            } else {
++                format!("minecraft:{key}")
++            },
++        );
+         compound.put_int("count", self.item_count as i32);
+ 
+         // Create a tag compound for additional data
+diff --git a/crates/pumpkin-world/src/block/mod.rs b/crates/pumpkin-world/src/block/mod.rs
+--- a/crates/pumpkin-world/src/block/mod.rs
++++ b/crates/pumpkin-world/src/block/mod.rs
+@@ -105,6 +105,40 @@
+ mod test {
+     use pumpkin_data::BlockStateId;
+ 
++    #[test]
++    fn create_full_registry_round_trips() {
++        use pumpkin_data::{Block, BlockId, item::Item, item_stack::ItemStack};
++
++        let mut states = 0;
++        let mut placeable = 0;
++        for id in 1286..=1391 {
++            let block = Block::from_id(BlockId::new(id).unwrap());
++            assert!(block.name.starts_with("create:"));
++            assert_eq!(Block::from_name(block.name).unwrap().id, block.id);
++            if block.item_id != 0 {
++                placeable += 1;
++                assert_eq!(Block::from_item_id(block.item_id).unwrap().id, block.id);
++                assert_eq!(Item::from_id(block.item_id).unwrap().registry_key, block.name);
++            }
++            for state in block.states {
++                states += 1;
++                assert_eq!(Block::from_state_id(state.id).id, block.id);
++                let nbt = super::BlockStateCodec::state_to_nbt(state.id);
++                assert_eq!(nbt.get_string("Name"), Some(block.name));
++                assert_eq!(super::BlockStateCodec::state_from_nbt(&nbt), Some(state.id));
++            }
++        }
++        assert_eq!((states, placeable), (2145, 84));
++        for id in 1658..=1780 {
++            let item = Item::from_id(id).unwrap();
++            assert!(item.registry_key.starts_with("create:"));
++            let mut nbt = super::NbtCompound::new();
++            ItemStack::new(1, item).write_item_stack(&mut nbt);
++            assert_eq!(nbt.get_string("id"), Some(item.registry_key));
++            assert_eq!(ItemStack::read_item_stack(&nbt).unwrap().item.id, id);
++        }
++    }
++
+     use crate::chunk::palette::BLOCK_NETWORK_MAX_BITS;
+ 
+     #[test]
+diff --git a/crates/pumpkin-command/src/argument_types/block.rs b/crates/pumpkin-command/src/argument_types/block.rs
+--- a/crates/pumpkin-command/src/argument_types/block.rs
++++ b/crates/pumpkin-command/src/argument_types/block.rs
+@@ -88,11 +88,12 @@
+             }
+             properties.push(Property::from_str_pair(key, value).ok_or_else(invalid)?);
+         }
+-        let result = block.from_properties(&properties);
+-        if !properties.iter().all(|p| result.to_props().contains(p)) {
++        let state = block.from_properties(&properties).to_state_id(block);
++        let actual = block.properties(state).map(|p| p.to_props()).unwrap_or_default();
++        if !properties.iter().all(|p| actual.contains(p)) {
+             return Err(invalid());
+         }
+-        Ok(result.to_state_id(block))
++        Ok(state)
+     }
+ 
+     fn client_side_parser(&self) -> JavaClientArgumentType {

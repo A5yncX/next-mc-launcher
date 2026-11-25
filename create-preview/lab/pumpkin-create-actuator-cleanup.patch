@@ -1,0 +1,198 @@
+--- a/crates/pumpkin-core/src/world/mod.rs
++++ b/crates/pumpkin-core/src/world/mod.rs
+@@ -5727,6 +5727,17 @@
+         self.break_block_checked(position, None, BlockFlags::NOTIFY_ALL, Some(expected))
+     }
+ 
++    pub(crate) fn break_linked_part(
++        self: &Arc<Self>,
++        position: &BlockPos,
++        expected: BlockStateId,
++        drop: bool,
++    ) -> Option<BlockStateId> {
++        let mut flags = BlockFlags::NOTIFY_ALL;
++        flags.set(BlockFlags::SKIP_DROPS, !drop);
++        self.break_block_checked(position, None, flags, Some(expected))
++    }
++
+     fn break_block_checked(
+         self: &Arc<Self>,
+         position: &BlockPos,
+@@ -5848,6 +5859,16 @@
+             }
+         }
+ 
++        if let Some(player) = cause
++            && broken_state_id != new_state_id
++        {
++            crate::block::blocks::create_actuator::after_player_break(
++                self,
++                player,
++                position,
++                broken_state_id,
++            );
++        }
+         Some(broken_state_id)
+     }
+ 
+--- a/crates/pumpkin-core/src/block/blocks/create_actuator.rs
++++ b/crates/pumpkin-core/src/block/blocks/create_actuator.rs
+@@ -1,6 +1,10 @@
+-use std::sync::Arc;
+-
+-use create_engine::{kinetics::Axis, placement::Direction};
++use std::{cell::RefCell, collections::HashMap, sync::Arc};
++
++use create_engine::{
++    contraption::{piston, pulley},
++    kinetics::{Axis, Pos},
++    placement::Direction,
++};
+ use pumpkin_data::{Block, BlockDirection, BlockStateId, item::Item, item_stack::ItemStack};
+ use pumpkin_util::{GameMode, math::position::BlockPos};
+ use pumpkin_world::world::BlockFlags;
+@@ -19,6 +23,144 @@
+ pub(crate) const STICKY: &str = "create:sticky_mechanical_piston";
+ pub(crate) const POLE: &str = "create:piston_extension_pole";
+ pub(crate) const PULLEY: &str = "create:rope_pulley";
++const HEAD: &str = "create:mechanical_piston_head";
++const ROPE: &str = "create:rope";
++const MAGNET: &str = "create:pulley_magnet";
++
++fn block_pos([x, y, z]: Pos) -> BlockPos {
++    BlockPos::new(x, y, z)
++}
++
++fn piston_cell(id: BlockStateId) -> piston::LineCell {
++    use piston::LineCell;
++    let Some(direction) = front(id) else {
++        return LineCell::Other;
++    };
++    match id.to_block().name {
++        PISTON | STICKY if property(id, "state") != Some("moving") => LineCell::Base(direction),
++        POLE => LineCell::Pole(direction.axis()),
++        HEAD => LineCell::Head(direction),
++        _ => LineCell::Other,
++    }
++}
++
++fn rope_cell(id: BlockStateId) -> pulley::Cell {
++    use pulley::{Cell, Part, Segment};
++    let part = match id.to_block().name {
++        PULLEY => return Cell::Pulley,
++        ROPE => Part::Rope,
++        MAGNET => Part::Magnet,
++        _ => return Cell::Other,
++    };
++    Cell::Rope(Segment {
++        part,
++        waterlogged: property(id, "waterlogged") == Some("true"),
++    })
++}
++
++pub(crate) fn after_player_break(
++    world: &Arc<World>,
++    player: &Player,
++    pos: &BlockPos,
++    broken: BlockStateId,
++) {
++    let name = broken.to_block().name;
++    if !matches!(name, PISTON | STICKY | POLE | HEAD | PULLEY | ROPE | MAGNET) {
++        return;
++    }
++    let origin = [pos.0.x, pos.0.y, pos.0.z];
++    let snapshot = RefCell::new(HashMap::new());
++    let read = |at| {
++        let pos = block_pos(at);
++        let mut states = snapshot.borrow_mut();
++        *states.entry(at).or_insert_with(|| {
++            if at == origin {
++                Some(broken)
++            } else if !world.is_in_build_limit(pos) {
++                Some(Block::AIR.default_state.id)
++            } else {
++                world.get_block_state_id_if_loaded(&pos)
++            }
++        })
++    };
++    let (parts, retract) = if matches!(name, PISTON | STICKY | POLE | HEAD) {
++        let plan = piston::break_parts(origin, piston::MAX_POLES, |at| {
++            read(at).map_or(piston::LineCell::Other, piston_cell)
++        });
++        (plan.remove, plan.retract)
++    } else {
++        // The pinned stationary cleanup handles only dry columns. Active strokes use a separate path.
++        let start = if name == PULLEY {
++            [origin[0], origin[1] - 1, origin[2]]
++        } else {
++            origin
++        };
++        let cell = |at| read(at).map_or(pulley::Cell::Unloaded, rope_cell);
++        if !matches!(
++            cell(start),
++            pulley::Cell::Rope(pulley::Segment {
++                waterlogged: false,
++                ..
++            })
++        ) {
++            return;
++        }
++        let Ok(mut plan) =
++            pulley::plan_rope_break(start, pulley::DEFAULT_MAX_ROPE_LENGTH as usize, cell)
++        else {
++            return;
++        };
++        if plan.segments.iter().any(|&at| {
++            !matches!(
++                cell(at),
++                pulley::Cell::Rope(pulley::Segment {
++                    waterlogged: false,
++                    ..
++                })
++            )
++        }) {
++            return;
++        }
++        if name == PULLEY {
++            plan.segments.retain(|&at| at != origin);
++            plan.segments.insert(0, start);
++        }
++        (plan.segments, None)
++    };
++    let snapshot = snapshot.into_inner();
++    if snapshot.values().any(Option::is_none)
++        || parts.iter().copied().chain(retract).any(|at| {
++            let p = block_pos(at);
++            world.is_in_spawn_protection(player, &p)
++                || world.get_block_state_id_if_loaded(&p) != snapshot[&at]
++        })
++    {
++        return;
++    }
++    let drop = !matches!(name, PISTON | STICKY | POLE | HEAD)
++        || player.gamemode.load() != GameMode::Creative;
++    for at in parts {
++        let Some(expected) = snapshot[&at] else {
++            return;
++        };
++        if world
++            .break_linked_part(&block_pos(at), expected, drop)
++            .is_none()
++        {
++            return;
++        }
++    }
++    if let Some(at) = retract
++        && let Some(expected) = snapshot[&at]
++    {
++        world.set_block_state_if(
++            &block_pos(at),
++            with_property(expected, "state", "retracted"),
++            BlockFlags::NOTIFY_ALL,
++            |state| state == expected,
++        );
++    }
++}
+ 
+ fn sticky(state: BlockStateId) -> Option<BlockStateId> {
+     let target = Block::from_registry_key(STICKY)?;

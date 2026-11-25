@@ -1,0 +1,206 @@
+diff --git a/crates/pumpkin-core/src/net/java/mod.rs b/crates/pumpkin-core/src/net/java/mod.rs
+--- a/crates/pumpkin-core/src/net/java/mod.rs
++++ b/crates/pumpkin-core/src/net/java/mod.rs
+@@ -1099,6 +1099,7 @@
+                 if payload.channel == MOD_NET_CHANNEL {
+                     apply_motor_setting(player, payload.data);
+                     crate::block::blocks::create_chassis::apply_settings(player, payload.data);
++                    crate::block::blocks::create_funnel::apply_settings(player, payload.data);
+                     return Ok(());
+                 }
+                 let channel_str = payload.channel.to_string();
+diff --git a/crates/pumpkin-core/src/block/blocks/create_funnel.rs b/crates/pumpkin-core/src/block/blocks/create_funnel.rs
+--- a/crates/pumpkin-core/src/block/blocks/create_funnel.rs
++++ b/crates/pumpkin-core/src/block/blocks/create_funnel.rs
+@@ -14,7 +14,7 @@
+ use pumpkin_macros::pumpkin_block;
+ use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
+ use pumpkin_util::{
+-    Hand,
++    GameMode, Hand,
+     math::{position::BlockPos, vector3::Vector3},
+ };
+ use pumpkin_world::world::{BlockAccessor, BlockFlags};
+@@ -26,7 +26,7 @@
+         blocks::{create_pipe, redstone},
+         entities::{BlockEntity, barrel::BarrelBlockEntity, chest::ChestBlockEntity},
+     },
+-    entity::EntityBase,
++    entity::{EntityBase, player::Player},
+     world::World,
+ };
+ 
+@@ -250,6 +250,136 @@
+         hit.cursor_pos.z - center[2],
+     ];
+     delta.into_iter().map(|v| v * v).sum::<f32>() < 0.25 * 0.25
++}
++
++enum FilterRequest {
++    Tap(BlockDirection, Vector3<f32>),
++    Amount { up_to: bool, raw: i32 },
++}
++
++fn decode_settings(payload: &[u8]) -> Option<(BlockPos, FilterRequest)> {
++    let (words, tail) = payload
++        .strip_prefix(b"\x11create:filter_tap\x20")
++        .or_else(|| payload.strip_prefix(b"\x16create:filter_settings\x14"))?
++        .as_chunks::<4>();
++    if !tail.is_empty() {
++        return None;
++    }
++    let request = match words {
++        [_, _, _, x, z, a, b, c] if payload.starts_with(b"\x11create:filter_tap\x20") => {
++            let face = match (i32::from_be_bytes(*x), i32::from_be_bytes(*z)) {
++                (-1, 0) => BlockDirection::West,
++                (1, 0) => BlockDirection::East,
++                (0, -1) => BlockDirection::North,
++                (0, 1) => BlockDirection::South,
++                _ => return None,
++            };
++            let [x, y, z] = [*a, *b, *c].map(|bits| f32::from_bits(u32::from_be_bytes(bits)));
++            if ![x, y, z]
++                .into_iter()
++                .all(|value| (-0.125..=1.125).contains(&value))
++            {
++                return None;
++            }
++            FilterRequest::Tap(face, Vector3::new(x, y, z))
++        }
++        [_, _, _, row, raw] if payload.starts_with(b"\x16create:filter_settings\x14") => {
++            let (row, raw) = (i32::from_be_bytes(*row), i32::from_be_bytes(*raw));
++            if !(0..=1).contains(&row) || !(0..=99).contains(&raw) {
++                return None;
++            }
++            FilterRequest::Amount {
++                up_to: row == 0,
++                raw,
++            }
++        }
++        _ => return None,
++    };
++    Some((
++        BlockPos::new(
++            i32::from_be_bytes(words[0]),
++            i32::from_be_bytes(words[1]),
++            i32::from_be_bytes(words[2]),
++        ),
++        request,
++    ))
++}
++
++pub(crate) fn apply_settings(player: &Player, payload: &[u8]) {
++    let Some((pos, request)) = decode_settings(payload) else {
++        return;
++    };
++    if !matches!(
++        player.gamemode.load(),
++        GameMode::Survival | GameMode::Creative
++    ) || !player.living_entity.is_alive()
++        || !player.can_interact_with_block_at(&pos, 1.0)
++    {
++        return;
++    }
++    let world = player.get_entity().world.load_full();
++    if world.is_in_spawn_protection(player, &pos) {
++        return;
++    }
++    let Some(state) = world.get_block_state_id_if_loaded(&pos) else {
++        return;
++    };
++    if state.to_block().name != BRASS
++        || create_pipe::property(state, "extracting") != Some("true")
++        || create_pipe::property(state, "waterlogged") == Some("true")
++    {
++        return;
++    }
++    let Some(entity) = world.get_block_entity(&pos) else {
++        return;
++    };
++    let Some(funnel) = entity.as_any().downcast_ref::<CreateFunnelBlockEntity>() else {
++        return;
++    };
++    match request {
++        FilterRequest::Tap(face, cursor_pos) => {
++            let Some(facing) = direction(state) else {
++                return;
++            };
++            let sample = player.inventory().held_item();
++            if !filter_hit(
++                &crate::block::BlockHitResult {
++                    face: &face,
++                    cursor_pos: &cursor_pos,
++                },
++                facing,
++                true,
++                player.get_entity().is_sneaking(),
++                false,
++            ) || matches!(
++                sample.get_item().registry_key,
++                "create:wrench" | "create:mechanical_arm" | "create:clipboard"
++            ) || (!sample.is_empty() && !is_filter_sample(&sample))
++            {
++                return;
++            }
++            funnel.set_filter(Some(&sample));
++        }
++        FilterRequest::Amount { up_to, raw } => {
++            let mut filter = funnel
++                .filter
++                .write()
++                .unwrap_or_else(PoisonError::into_inner);
++            if filter.opaque_filter.is_some() {
++                return;
++            }
++            let max = filter
++                .sample
++                .as_ref()
++                .map_or(64, |sample| i32::from(sample.get_max_stack_size()));
++            if max <= 1 {
++                return;
++            }
++            filter.amount = raw.clamp(1, max);
++            filter.up_to = up_to;
++        }
++    }
++    world.update_block_entity(&entity);
+ }
+ 
+ fn normal_use(args: NormalUseArgs<'_>) -> BlockActionResult {
+@@ -781,6 +911,36 @@
+     use pumpkin_data::item::Item;
+ 
+     #[test]
++    fn board_requests_match_pinned_layout_and_reject_invalid_fields() {
++        let mut tap = b"\x11create:filter_tap\x20".to_vec();
++        tap.extend(
++            [-264, 78, -108, 0, 1]
++                .into_iter()
++                .flat_map(i32::to_be_bytes),
++        );
++        tap.extend([0.5, 0.125, 0.9375].into_iter().flat_map(f32::to_be_bytes));
++        assert!(
++            matches!(decode_settings(&tap), Some((pos, FilterRequest::Tap(BlockDirection::South, _))) if pos == BlockPos::new(-264, 78, -108))
++        );
++        tap.push(0);
++        assert!(decode_settings(&tap).is_none());
++        let mut amount = b"\x16create:filter_settings\x14".to_vec();
++        amount.extend([0, 0, 0, 1, 99].into_iter().flat_map(i32::to_be_bytes));
++        assert!(matches!(
++            decode_settings(&amount),
++            Some((
++                _,
++                FilterRequest::Amount {
++                    up_to: false,
++                    raw: 99
++                }
++            ))
++        ));
++        *amount.last_mut().unwrap() = 100;
++        assert!(decode_settings(&amount).is_none());
++    }
++
++    #[test]
+     fn blocked_exact_transfer_does_not_touch_destination() {
+         let src = [ItemStack::new(7, &Item::WHEAT)];
+         let mut dst = [

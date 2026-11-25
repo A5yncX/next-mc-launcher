@@ -1,0 +1,354 @@
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -7,9 +7,9 @@
+ };
+ 
+ use create_engine::{
+-    kinetics::{Axis, Kind, Node, Pos, solve_half},
+-    placement::Direction,
+-    waterwheel,
++    kinetics::{Axis, Kind, Network, Node, Pos, Status, solve_half},
++    placement::{self, Direction},
++    visual, waterwheel,
+ };
+ use pumpkin_data::{Block, BlockStateId, block_properties::Property, item::Item};
+ use pumpkin_nbt::compound::NbtCompound;
+@@ -29,6 +29,8 @@
+ const GEARBOX: &str = "create:gearbox";
+ const CLUTCH: &str = "create:clutch";
+ const GEARSHIFT: &str = "create:gearshift";
++const SPEEDOMETER: &str = "create:speedometer";
++const STRESSOMETER: &str = "create:stressometer";
+ const KINETIC_IDS: &[&str] = &[
+     MOTOR,
+     SHAFT,
+@@ -36,6 +38,8 @@
+     GEARBOX,
+     CLUTCH,
+     GEARSHIFT,
++    SPEEDOMETER,
++    STRESSOMETER,
+     wheel::SMALL,
+     wheel::LARGE,
+     "create:large_cogwheel",
+@@ -141,6 +145,74 @@
+     rpm: f32,
+     ports: [f32; 6],
+     flow_score: i32,
++    gauge: Gauge,
++}
++
++#[derive(Default, PartialEq)]
++struct Gauge {
++    dial: f32,
++    color: i32,
++    capacity: f32,
++    stress: f32,
++    status: Option<Status>,
++}
++
++impl Gauge {
++    fn from_network(id: &str, rpm: f32, net: &Network, previous_color: i32) -> Self {
++        let mix = |from: i32, to: i32, amount: f32| {
++            [0, 8, 16]
++                .into_iter()
++                .map(|shift| {
++                    let a = (from >> shift) & 255;
++                    let b = (to >> shift) & 255;
++                    ((a as f32 + (b - a) as f32 * amount) as i32) << shift
++                })
++                .sum::<i32>()
++        };
++        let (dial, color) = if id == SPEEDOMETER {
++            let base = match rpm.abs() {
++                0.0 => 0,
++                r if r < 30.0 => 0x22FF22,
++                r if r < 100.0 => 0x0084FF,
++                _ => 0xFF55FF,
++            };
++            (visual::speed_dial(rpm), mix(base, 0xFFFFFF, 0.25))
++        } else {
++            let dial =
++                visual::stress_dial(net.capacity, net.stress, net.status == Status::Overstressed);
++            let color = if dial <= 0.0 {
++                previous_color
++            } else if dial < 0.5 {
++                mix(0x00FF00, 0xFFFF00, dial * 2.0)
++            } else if dial < 1.0 {
++                mix(0xFFFF00, 0xFF0000, dial * 2.0 - 1.0)
++            } else {
++                0xFF0000
++            };
++            (dial, color)
++        };
++        Self {
++            dial,
++            color,
++            capacity: net.capacity,
++            stress: net.stress,
++            status: Some(net.status),
++        }
++    }
++}
++
++pub(crate) fn gauge_signal(world: &World, pos: &BlockPos) -> u8 {
++    world
++        .get_block_entity(pos)
++        .and_then(|entity| {
++            let gauge = entity.as_any().downcast_ref::<CreateKinetic>()?;
++            let readings = gauge
++                .readings
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++            Some(visual::comparator(readings.gauge.dial))
++        })
++        .unwrap_or(0)
+ }
+ 
+ fn nbt_speed(tag: &NbtCompound, key: &str) -> f32 {
+@@ -215,16 +287,22 @@
+             .find(|p| p.key_str() == key)
+             .map(|p| p.value_str())
+     };
+-    let value = get(if matches!(id, MOTOR | wheel::SMALL) {
++    let gauge = matches!(id, SPEEDOMETER | STRESSOMETER);
++    let value = get(if gauge || matches!(id, MOTOR | wheel::SMALL) {
+         "facing"
+     } else {
+         "axis"
+     })?;
+-    let axis = match value {
+-        "x" | "east" | "west" => Axis::X,
+-        "y" | "up" | "down" => Axis::Y,
+-        "z" | "south" | "north" => Axis::Z,
+-        _ => return None,
++    let axis = if gauge {
++        let facing = Direction::ALL.into_iter().find(|d| d.name() == value)?;
++        placement::gauge_axis(facing, get("axis_along_first")? == "true")
++    } else {
++        match value {
++            "x" | "east" | "west" => Axis::X,
++            "y" | "up" | "down" => Axis::Y,
++            "z" | "south" | "north" => Axis::Z,
++            _ => return None,
++        }
+     };
+     let kind = match id {
+         MOTOR => {
+@@ -241,6 +319,8 @@
+             }
+         }
+         SHAFT
++        | SPEEDOMETER
++        | STRESSOMETER
+         | "create:flywheel"
+         | "create:andesite_encased_shaft"
+         | "create:brass_encased_shaft" => Kind::Shaft,
+@@ -276,6 +356,12 @@
+             .get_mut()
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
+         readings.rpm = nbt_speed(nbt, "Speed");
++        if matches!(id, SPEEDOMETER | STRESSOMETER) {
++            readings.gauge.dial = nbt_speed(nbt, "Value");
++            readings.gauge.color = nbt.get_int("Color").unwrap_or_default();
++            readings.gauge.capacity = nbt_speed(nbt, "Capacity");
++            readings.gauge.stress = nbt_speed(nbt, "Stress");
++        }
+         if matches!(id, wheel::SMALL | wheel::LARGE) {
+             readings.flow_score = nbt.get_int("FlowScore").unwrap_or(0).clamp(-12, 12);
+             entity.structure_ready.store(
+@@ -314,6 +400,17 @@
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
+         tag.put_float("Speed", readings.rpm);
++        if matches!(self.id, SPEEDOMETER | STRESSOMETER) {
++            let gauge = &readings.gauge;
++            tag.put_float("Value", gauge.dial);
++            tag.put_int("Color", gauge.color);
++            tag.put_float("Capacity", gauge.capacity);
++            tag.put_float("Stress", gauge.stress);
++            tag.put_string(
++                "NetworkStatus",
++                format!("{:?}", gauge.status.unwrap_or(Status::Idle)),
++            );
++        }
+         if matches!(self.id, wheel::SMALL | wheel::LARGE) {
+             tag.put_int("FlowScore", readings.flow_score);
+             if self.id == wheel::LARGE {
+@@ -447,7 +544,7 @@
+         let other = matches!(start.kind, Kind::Clutch { powered: true })
+             .then(|| solve_half(start, 1, &mut bounded_read));
+         let stronger = |a: f32, b: f32| if b.abs() > a.abs() { b } else { a };
+-        let next = if exhausted {
++        let mut next = if exhausted {
+             Readings {
+                 flow_score,
+                 ..Readings::default()
+@@ -470,16 +567,22 @@
+                 } else {
+                     [0.0; 6]
+                 },
+-            }
+-        };
+-        let changed = {
++                ..Readings::default()
++            }
++        };
++        let (changed, changed_signal) = {
+             let mut readings = self
+                 .readings
+                 .lock()
+                 .unwrap_or_else(std::sync::PoisonError::into_inner);
++            if !exhausted && matches!(self.id, SPEEDOMETER | STRESSOMETER) {
++                next.gauge = Gauge::from_network(self.id, next.rpm, &network, readings.gauge.color);
++            }
+             let changed = *readings != next;
++            let changed_signal =
++                visual::comparator(readings.gauge.dial) != visual::comparator(next.gauge.dial);
+             *readings = next;
+-            changed
++            (changed, changed_signal)
+         };
+         if (changed || built)
+             && let Some(entity) = world.get_block_entity(&self.position)
+@@ -489,6 +592,9 @@
+                 .is_some_and(|live| std::ptr::eq(live, self))
+         {
+             world.update_block_entity(&entity);
++            if changed_signal {
++                world.update_neighbour_for_output_signal(&self.position, state.to_block());
++            }
+         }
+     }
+ }
+@@ -526,6 +632,44 @@
+             assert_eq!(
+                 motor.chunk_data_nbt().unwrap().get_int("ScrollValue"),
+                 Some(expected)
++            );
++        }
++    }
++
++    #[test]
++    fn gauge_matches_create_network_load_and_overload() {
++        let pos = [0, 80, 0];
++        let station = Node {
++            pos,
++            axis: Axis::X,
++            kind: Kind::Shaft,
++        };
++        for (supply, want, overloaded) in [(16.0, 7, false), (4.0, 15, true)] {
++            let network = solve_half(station, 0, |pos| match pos[0] {
++                -1 if pos[1..] == [80, 0] => Some(Node {
++                    pos,
++                    axis: Axis::X,
++                    kind: Kind::Motor {
++                        facing: [1, 0, 0],
++                        rpm: 32.0,
++                        capacity: supply,
++                    },
++                }),
++                1 if pos[1..] == [80, 0] => Some(Node {
++                    pos,
++                    axis: Axis::X,
++                    kind: Kind::Press,
++                }),
++                _ => None,
++            });
++            let rpm = network.speed(pos);
++            let data = Gauge::from_network(STRESSOMETER, rpm, &network, 0);
++            assert_eq!(data.status == Some(Status::Overstressed), overloaded);
++            assert_eq!(visual::comparator(data.dial), want);
++            let speed = Gauge::from_network(SPEEDOMETER, rpm, &network, 0);
++            assert_eq!(
++                visual::comparator(speed.dial),
++                if overloaded { 0 } else { 7 }
+             );
+         }
+     }
+--- a/crates/pumpkin-core/src/block/blocks/mod.rs
++++ b/crates/pumpkin-core/src/block/blocks/mod.rs
+@@ -119,6 +119,7 @@
+ pub mod cauldron;
+ pub mod composter;
+ pub(crate) mod create_depot;
++pub(crate) mod create_gauge;
+ pub(crate) mod create_water_wheel;
+ pub mod dried_ghast;
+ pub mod frogspawn;
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -254,6 +254,8 @@
+ 
+     // Blocks
+     manager.register(crate::block::blocks::create_depot::CreateDepotBlock);
++    manager.register(crate::block::blocks::create_gauge::CreateSpeedometer);
++    manager.register(crate::block::blocks::create_gauge::CreateStressometer);
+     manager.register(crate::block::blocks::create_water_wheel::CreateWaterWheel);
+     manager.register(crate::block::blocks::create_water_wheel::CreateLargeWaterWheel);
+     manager.register(AnvilBlock);
+@@ -1191,6 +1193,38 @@
+                 };
+                 Self::set_create_axis(placed_block, state_id, axis)
+             }
++            "create:speedometer" | "create:stressometer" => {
++                let yaw = f64::from(player.get_entity().yaw.load());
++                let horizontal = [
++                    CreateDirection::South,
++                    CreateDirection::West,
++                    CreateDirection::North,
++                    CreateDirection::East,
++                ][((yaw / 90.0 + 0.5).floor() as i64 & 3) as usize];
++                let attached = CreateDirection::ALL
++                    .into_iter()
++                    .zip(ports)
++                    .any(|(direction, port)| direction == clicked.opposite() && port);
++                let (facing, first) = placement::gauge(clicked, look, horizontal, ports, attached);
++                let state = Self::set_create_facing(placed_block, state_id, facing);
++                let Some(mut properties) = placed_block.properties(state).map(|p| p.to_props())
++                else {
++                    return state;
++                };
++                if let Some(axis) = properties
++                    .iter_mut()
++                    .find(|p| p.key_str() == "axis_along_first")
++                    && let Some(value) = Property::from_str_pair(
++                        "axis_along_first",
++                        if first { "true" } else { "false" },
++                    )
++                {
++                    *axis = value;
++                }
++                placed_block
++                    .from_properties(&properties)
++                    .to_state_id(placed_block)
++            }
+             "create:water_wheel" => {
+                 let facing = if sneaking {
+                     look
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/blocks/create_gauge.rs
+@@ -0,0 +1,23 @@
++use pumpkin_macros::pumpkin_block;
++
++use crate::block::{
++    BlockBehaviour, GetComparatorOutputArgs, entities::create_kinetic::gauge_signal,
++};
++
++#[pumpkin_block("create:speedometer")]
++pub struct CreateSpeedometer;
++
++impl BlockBehaviour for CreateSpeedometer {
++    fn get_comparator_output(&self, args: GetComparatorOutputArgs<'_>) -> Option<u8> {
++        Some(gauge_signal(args.world, args.position))
++    }
++}
++
++#[pumpkin_block("create:stressometer")]
++pub struct CreateStressometer;
++
++impl BlockBehaviour for CreateStressometer {
++    fn get_comparator_output(&self, args: GetComparatorOutputArgs<'_>) -> Option<u8> {
++        CreateSpeedometer.get_comparator_output(args)
++    }
++}

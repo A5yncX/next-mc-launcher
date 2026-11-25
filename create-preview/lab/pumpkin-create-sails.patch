@@ -1,0 +1,265 @@
+diff --git a/crates/pumpkin-core/src/block/blocks/mod.rs b/crates/pumpkin-core/src/block/blocks/mod.rs
+--- a/crates/pumpkin-core/src/block/blocks/mod.rs
++++ b/crates/pumpkin-core/src/block/blocks/mod.rs
+@@ -123,6 +123,7 @@
+ pub(crate) mod create_drain;
+ pub(crate) mod create_gauge;
+ pub(crate) mod create_hand_crank;
++pub(crate) mod create_sail;
+ pub(crate) mod create_water_wheel;
+ pub mod dried_ghast;
+ pub mod frogspawn;
+diff --git a/crates/pumpkin-core/src/block/blocks/create_sail.rs b/crates/pumpkin-core/src/block/blocks/create_sail.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/blocks/create_sail.rs
+@@ -0,0 +1,153 @@
++use create_engine::{
++    kinetics::Pos,
++    placement::Direction,
++    sail::{self, Sail},
++};
++use pumpkin_data::{Block, BlockState, BlockStateId, item::Item};
++use pumpkin_macros::pumpkin_block;
++use pumpkin_util::{GameMode, math::position::BlockPos};
++use pumpkin_world::world::BlockFlags;
++
++use crate::{
++    block::{
++        BlockActionResult, BlockBehaviour, UseWithItemArgs,
++        registry::{BlockRegistry, can_replace_with_other_block},
++    },
++    entity::{EntityBase, player::Player},
++    world::World,
++};
++
++#[pumpkin_block(
++    "create:sail_frame",
++    "create:white_sail",
++    "create:orange_sail",
++    "create:magenta_sail",
++    "create:light_blue_sail",
++    "create:yellow_sail",
++    "create:lime_sail",
++    "create:pink_sail",
++    "create:gray_sail",
++    "create:light_gray_sail",
++    "create:cyan_sail",
++    "create:purple_sail",
++    "create:blue_sail",
++    "create:brown_sail",
++    "create:green_sail",
++    "create:red_sail",
++    "create:black_sail"
++)]
++pub struct CreateSail;
++
++pub(crate) fn read(id: BlockStateId) -> Option<Sail> {
++    let block = id.to_block();
++    let material = sail::material(block.name)?;
++    let properties = block.properties(id)?.to_props();
++    let facing = properties
++        .iter()
++        .find(|p| p.key_str() == "facing")?
++        .value_str();
++    Some(Sail {
++        material,
++        facing: Direction::ALL.into_iter().find(|d| d.name() == facing)?,
++    })
++}
++
++fn position([x, y, z]: Pos) -> BlockPos {
++    BlockPos::new(x, y, z)
++}
++
++fn inside(world: &World, player: &Player, pos: BlockPos) -> bool {
++    let (x, z) = (f64::from(pos.0.x), f64::from(pos.0.z));
++    world.is_in_build_limit(pos)
++        && !world.is_in_spawn_protection(player, &pos)
++        && world.worldborder.lock().is_ok_and(|border| {
++            border.is_within_bounds(x, z, 0.0)
++                && border.is_within_bounds(x + 1.0 - 1.0e-5, z + 1.0 - 1.0e-5, 0.0)
++        })
++}
++
++pub(crate) fn extension(
++    world: &World,
++    player: &Player,
++    base: Sail,
++    clicked: BlockPos,
++    cursor: [f64; 3],
++) -> Option<BlockPos> {
++    if !cursor.iter().all(|v| (0.0..=1.0).contains(v)) {
++        return None;
++    }
++    let pos = [clicked.0.x, clicked.0.y, clicked.0.z];
++    let hit = std::array::from_fn(|i| f64::from(pos[i]) + cursor[i]);
++    base.adjacent(pos, hit).map(position).find(|&candidate| {
++        inside(world, player, candidate)
++            && world
++                .get_block_state_id_if_loaded(&candidate)
++                .is_some_and(|id| {
++                    can_replace_with_other_block(id.to_block(), BlockState::from_id(id))
++                })
++    })
++}
++
++impl BlockBehaviour for CreateSail {
++    fn use_with_item(&self, args: UseWithItemArgs<'_>) -> BlockActionResult {
++        let pass = BlockActionResult::PassToDefaultBlockAction;
++        if !matches!(
++            args.player.gamemode.load(),
++            GameMode::Survival | GameMode::Creative
++        ) || args.player.get_entity().is_sneaking()
++            || !inside(args.world, args.player, *args.position)
++        {
++            return pass;
++        }
++        let Some(base) = args
++            .world
++            .get_block_state_id_if_loaded(args.position)
++            .and_then(read)
++        else {
++            return pass;
++        };
++        let item = args.item_stack.get_item();
++        let target = if item.id == Item::SHEARS.id {
++            sail::FRAME
++        } else if base.material != sail::FRAME
++            && item.registry_key.ends_with("_dye")
++            && !item.registry_key.contains(':')
++            && let Some(canvas) = sail::canvas_for_dye(&format!("minecraft:{}", item.registry_key))
++        {
++            canvas
++        } else {
++            return pass;
++        };
++        let Some(block) = Block::from_name(target) else {
++            return pass;
++        };
++        let new_state =
++            BlockRegistry::set_create_facing(block, block.default_state.id, base.facing);
++        let pos = [args.position.0.x, args.position.0.y, args.position.0.z];
++        let cursor = [
++            args.hit.cursor_pos.x,
++            args.hit.cursor_pos.y,
++            args.hit.cursor_pos.z,
++        ];
++        if !cursor.iter().all(|v| (0.0..=1.0).contains(v)) {
++            return pass;
++        }
++        let hit = std::array::from_fn(|i| f64::from(pos[i]) + f64::from(cursor[i]));
++        for p in sail::repaint(base, target, pos, hit, |p| {
++            let pos = position(p);
++            inside(args.world, args.player, pos)
++                .then(|| args.world.get_block_state_id_if_loaded(&pos).and_then(read))
++                .flatten()
++        }) {
++            args.world
++                .set_block_state_if(&position(p), new_state, BlockFlags::NOTIFY_ALL, |old| {
++                    read(old).is_some_and(|current| {
++                        current.facing == base.facing
++                            && current.material != target
++                            && (current.material != sail::FRAME || target == sail::FRAME)
++                    })
++                });
++        }
++        BlockActionResult::SuccessServer
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/registry.rs b/crates/pumpkin-core/src/block/registry.rs
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -257,6 +257,7 @@
+     manager.register(crate::block::blocks::create_chain::AdjustableChainGearshift);
+     manager.register(crate::block::blocks::create_depot::CreateDepotBlock);
+     manager.register(crate::block::blocks::create_drain::ItemDrain);
++    manager.register(crate::block::blocks::create_sail::CreateSail);
+     manager.register(crate::block::blocks::create_gauge::CreateSpeedometer);
+     manager.register(crate::block::blocks::create_gauge::CreateStressometer);
+     manager.register(crate::block::blocks::create_hand_crank::CreateHandCrank);
+@@ -860,7 +861,33 @@
+             return Ok(None);
+         }
+ 
+-        if !matches!(mode, PlacementMode::Create(Some(_))) {
++        use crate::block::blocks::create_sail;
++        use create_engine::sail;
++        let is_sail = sail::material(placed_block.name).is_some();
++        let mut sail_placement = None;
++        if is_sail
++            && !entity.is_sneaking()
++            && matches!(
++                player.gamemode.load(),
++                pumpkin_util::GameMode::Survival | pumpkin_util::GameMode::Creative
++            )
++            && let Some(base) = world
++                .get_block_state_id_if_loaded(&location)
++                .and_then(create_sail::read)
++        {
++            let cursor = [
++                use_item_on.cursor_pos.x,
++                use_item_on.cursor_pos.y,
++                use_item_on.cursor_pos.z,
++            ]
++            .map(f64::from);
++            let Some(pos) = create_sail::extension(&world, player, base, location, cursor) else {
++                return Ok(None);
++            };
++            sail_placement = Some((pos, base.facing));
++        }
++
++        if !matches!(mode, PlacementMode::Create(Some(_))) && sail_placement.is_none() {
+             if location.0.y + face.to_offset().y < world.get_bottom_y() {
+                 return Err(BlockPlacingError::BlockOutOfWorld);
+             }
+@@ -885,7 +912,9 @@
+             PlacementMode::Create(Some(assist)) => {
+                 Some(BlockPos::new(assist.pos[0], assist.pos[1], assist.pos[2]))
+             }
+-            PlacementMode::Vanilla | PlacementMode::Create(None) => None,
++            PlacementMode::Vanilla | PlacementMode::Create(None) => {
++                sail_placement.map(|(pos, _)| pos)
++            }
+         };
+         let Some((final_block_pos, final_face, replacing)) = self.placement_target_with_override(
+             &world,
+@@ -899,7 +928,7 @@
+             return Ok(None);
+         };
+ 
+-        if matches!(mode, PlacementMode::Create(_)) {
++        if is_sail || matches!(mode, PlacementMode::Create(_)) {
+             if !world.is_in_build_limit(final_block_pos)
+                 || world
+                     .get_block_state_id_if_loaded(&final_block_pos)
+@@ -983,6 +1012,20 @@
+                 .to_state_id(placed_block);
+         }
+ 
++        if is_sail {
++            let facing = sail_placement.map_or_else(
++                || {
++                    let look = pumpkin_util::math::vector3::Vector3::rotation_vector(
++                        f64::from(entity.pitch.load()),
++                        f64::from(entity.yaw.load()),
++                    );
++                    Self::create_direction(BlockDirection::get_nearest(look.x, look.y, look.z))
++                        .opposite()
++                },
++                |(_, facing)| facing,
++            );
++            new_state = Self::set_create_facing(placed_block, new_state, facing);
++        }
+         if let PlacementMode::Create(assist) = mode {
+             new_state = self.create_placement_state(
+                 placed_block,
+@@ -1313,7 +1356,7 @@
+         block.from_properties(&properties).to_state_id(block)
+     }
+ 
+-    fn set_create_facing(
++    pub(crate) fn set_create_facing(
+         block: &'static Block,
+         state_id: BlockStateId,
+         facing: CreateDirection,

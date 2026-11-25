@@ -1,0 +1,410 @@
+diff --git a/crates/pumpkin-core/src/block/blocks/create_belt.rs b/crates/pumpkin-core/src/block/blocks/create_belt.rs
+--- a/crates/pumpkin-core/src/block/blocks/create_belt.rs
++++ b/crates/pumpkin-core/src/block/blocks/create_belt.rs
+@@ -6,20 +6,25 @@
+ use create_engine::{
+     kinetics::{Axis, Kind, Node, Pos},
+     placement::Direction,
+-    transport::{self, Part, Pulley, Slope, Space},
++    transport::{
++        self, Belt, Ending, Hooks, Inventory, Part, Pulley, Slope, Space, Stack, Transported,
++    },
+ };
+ use pumpkin_data::{
+     Block, BlockStateId, data_component::DataComponent, data_component_impl::CustomDataImpl,
+-    item_stack::ItemStack,
++    entity::EntityType, item_stack::ItemStack,
+ };
+ use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
+-use pumpkin_util::{GameMode, math::position::BlockPos};
++use pumpkin_util::{
++    GameMode,
++    math::{boundingbox::BoundingBox, position::BlockPos, vector3::Vector3},
++};
+ use pumpkin_world::world::BlockFlags;
+ 
+ use super::create_pipe::{boolean, property, with_property};
+ use crate::{
+     block::entities::create_kinetic,
+-    entity::{EntityBase, player::Player},
++    entity::{Entity, EntityBase, item::ItemEntity, player::Player},
+     world::World,
+ };
+ 
+@@ -347,6 +352,279 @@
+     }
+ }
+ 
++#[derive(Clone)]
++struct Payload(ItemStack);
++
++impl PartialEq for Payload {
++    fn eq(&self, other: &Self) -> bool {
++        self.0.are_items_and_components_equal(&other.0)
++    }
++}
++
++#[derive(Default)]
++pub(crate) struct Cargo {
++    items: Inventory<Payload>,
++    opaque: Option<NbtTag>,
++}
++
++impl Cargo {
++    pub(crate) fn read(tag: &NbtCompound, segment: Segment) -> Self {
++        let Some(raw) = tag.get("Inventory") else {
++            return Self::default();
++        };
++        let decoded = (|| {
++            let tag = raw.extract_compound()?;
++            let items = tag.get_list("Items")?;
++            if items.len() > 20 {
++                return None;
++            }
++            let mut out = Vec::with_capacity(items.len());
++            for entry in items {
++                let row = entry.extract_compound()?;
++                let mut stack = ItemStack::read_item_stack(row.get_compound("Item")?)?;
++                let position = row.get_float("Pos")?;
++                let index = row.get_int("InSegment")?;
++                if stack.is_empty()
++                    || !(-0.5..=segment.length as f32 + 0.5).contains(&position)
++                    || !(0..segment.length).contains(&index)
++                {
++                    return None;
++                }
++                let count = stack.item_count as u32;
++                stack.item_count = 1;
++                let maximum = stack.get_max_stack_size().into();
++                // Preserve foreign locked/processed entries verbatim rather than misprocessing them.
++                if row.get_bool("Locked") == Some(true)
++                    || row.get_bool("LockedExternally") == Some(true)
++                    || row.has("FanProcessingType")
++                {
++                    return None;
++                }
++                let mut item = Transported::new(
++                    Stack {
++                        payload: Payload(stack),
++                        count,
++                        maximum,
++                    },
++                    row.get_int("Angle")?.clamp(0, 359),
++                );
++                item.position = position;
++                item.previous_position = position;
++                item.inserted_at = index;
++                item.inserted_from = *Direction::ALL.get(row.get_int("InDirection")? as usize)?;
++                out.push(item);
++            }
++            Some(Inventory {
++                items: out,
++                positive: tag.get_bool("PositiveOrder").unwrap_or(false),
++                ..Default::default()
++            })
++        })();
++        match decoded {
++            Some(items) => Self {
++                items,
++                opaque: None,
++            },
++            None => Self {
++                opaque: Some(raw.clone()),
++                ..Self::default()
++            },
++        }
++    }
++
++    pub(crate) fn write(&self, tag: &mut NbtCompound) {
++        if let Some(raw) = &self.opaque {
++            tag.put("Inventory", raw.clone());
++            return;
++        }
++        let mut inventory = NbtCompound::new();
++        inventory.put_bool("PositiveOrder", self.items.positive);
++        inventory.put_list(
++            "Items",
++            self.items
++                .items
++                .iter()
++                .map(|item| {
++                    let mut nbt = NbtCompound::new();
++                    let mut stack = NbtCompound::new();
++                    full_stack(&item.stack).write_item_stack(&mut stack);
++                    nbt.put_compound("Item", stack);
++                    nbt.put_float("Pos", item.position);
++                    nbt.put_float("PrevPos", item.previous_position);
++                    nbt.put_float("Offset", item.side_offset);
++                    nbt.put_float("PrevOffset", item.previous_side_offset);
++                    nbt.put_int("InSegment", item.inserted_at);
++                    nbt.put_int(
++                        "InDirection",
++                        Direction::ALL
++                            .iter()
++                            .position(|dir| *dir == item.inserted_from)
++                            .unwrap_or(1) as i32,
++                    );
++                    nbt.put_int("Angle", item.angle);
++                    NbtTag::Compound(nbt)
++                })
++                .collect(),
++        );
++        tag.put_compound("Inventory", inventory);
++    }
++
++    pub(crate) fn tick(
++        &mut self,
++        world: &Arc<World>,
++        segment: Segment,
++        state: BlockStateId,
++        rpm: f32,
++    ) -> bool {
++        if self.opaque.is_some() || rpm == 0.0 || property(state, "slope") != Some("horizontal") {
++            return false;
++        }
++        let Some(facing) = facing(state) else {
++            return false;
++        };
++        let belt = Belt {
++            facing,
++            slope: Slope::Horizontal,
++            rpm,
++            length: segment.length,
++        };
++        let origin = segment.controller;
++        let step = facing.vector();
++        for index in 0..segment.length {
++            let p = std::array::from_fn(|i| origin[i] + step[i] * index);
++            if create_kinetic::belt_at(world, &pos(p)) != Some(Segment { index, ..segment }) {
++                return false;
++            }
++        }
++        let mut changed = !self.items.items.is_empty();
++        if self.items.items.len() < segment.length as usize {
++            for index in 0..segment.length {
++                if self.capture(world, belt, origin, index) {
++                    changed = true;
++                    break;
++                }
++            }
++        }
++        let end = if belt.speed() > 0.0 {
++            segment.length
++        } else {
++            -1
++        };
++        let exit = pos(std::array::from_fn(|i| origin[i] + step[i] * end));
++        let open = world.get_block_state_id_if_loaded(&exit).is_some_and(|s| {
++            s.to_state()
++                .get_block_collision_shapes_at(&exit)
++                .next()
++                .is_none()
++        });
++        let result = self.items.tick(belt, &mut Outlet(open));
++        for mut item in result.ejected {
++            let mut at = belt.world_position(origin, item.position);
++            let velocity = belt.ejection_velocity();
++            at[0] += velocity[0].signum() * 0.15;
++            at[2] += velocity[2].signum() * 0.15;
++            at[1] += 0.3;
++            let entity = Entity::new(
++                world.clone(),
++                Vector3::new(at[0], at[1], at[2]),
++                &EntityType::ITEM,
++            );
++            if !world.spawn_entity(Arc::new(ItemEntity::new_with_velocity(
++                entity,
++                full_stack(&item.stack),
++                Vector3::new(velocity[0], velocity[1], velocity[2]),
++                20,
++            ))) {
++                item.position = if belt.speed() > 0.0 {
++                    segment.length as f32 - 0.45
++                } else {
++                    0.45
++                };
++                self.items.pending.push(item);
++            }
++        }
++        self.items.flush();
++        changed
++    }
++
++    fn capture(&mut self, world: &World, belt: Belt, origin: Pos, index: i32) -> bool {
++        if !self.items.can_insert(belt, index, Direction::Up) {
++            return false;
++        }
++        let [x, y, z] = belt.world_position(origin, index as f32 + 0.5);
++        let bounds =
++            BoundingBox::new_array([x - 0.45, y, z - 0.45], [x + 0.45, y + 0.65, z + 0.45]);
++        for entity in world.get_entities_at_box(&bounds) {
++            let Some(item) = entity.get_item_entity() else {
++                continue;
++            };
++            let base = item.get_entity();
++            let at = base.pos.load();
++            if base.removed.load(std::sync::atomic::Ordering::Acquire)
++                || at.y < y
++                || at.y > y + 0.7
++                || (at.x - x).abs() > 0.45
++                || (at.z - z).abs() > 0.45
++            {
++                continue;
++            }
++            let mut stack = item
++                .get_item_stack()
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++            if stack.is_empty() || stack.item_count > stack.get_max_stack_size() {
++                continue;
++            }
++            let mut payload = stack.clone();
++            payload.item_count = 1;
++            let maximum = stack.get_max_stack_size().into();
++            let moved = self.items.insert_automation(
++                belt,
++                index,
++                Stack {
++                    payload: Payload(payload),
++                    count: stack.item_count as u32,
++                    maximum,
++                },
++                180,
++                false,
++            );
++            if moved.count != 0 {
++                continue;
++            }
++            *stack = ItemStack::EMPTY.clone();
++            drop(stack);
++            base.remove();
++            return true;
++        }
++        false
++    }
++
++    pub(crate) fn drop_items(&mut self, world: &Arc<World>, position: &BlockPos) {
++        self.items.flush();
++        for item in self.items.items.drain(..) {
++            world.drop_stack(position, full_stack(&item.stack));
++        }
++    }
++}
++
++fn full_stack(stack: &Stack<Payload>) -> ItemStack {
++    let mut full = stack.payload.0.clone();
++    full.item_count = stack.count as u8;
++    full
++}
++
++struct Outlet(bool);
++impl Hooks<Payload> for Outlet {
++    fn ending(&mut self, _: bool) -> Ending {
++        if self.0 {
++            Ending::Eject
++        } else {
++            Ending::Blocked
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -150,6 +150,7 @@
+     saw_processing: Option<Box<Mutex<SawProcessing>>>,
+     mixer: Option<Box<Mutex<mixer::Mixer>>>,
+     belt: Mutex<Option<belt::Segment>>,
++    cargo: Option<Box<Mutex<belt::Cargo>>>,
+ }
+ 
+ pub(crate) fn rpm_at(world: &World, pos: &BlockPos) -> Option<f32> {
+@@ -367,6 +368,7 @@
+             saw_processing: (id == saw::ID).then(|| Box::new(Mutex::new(SawProcessing::default()))),
+             mixer: (id == mixer::ID).then(|| Box::new(Mutex::new(mixer::Mixer::default()))),
+             belt: Mutex::new(None),
++            cargo: (id == belt::ID).then(|| Box::new(Mutex::new(belt::Cargo::default()))),
+         }
+     }
+ 
+@@ -573,7 +575,11 @@
+         // The next tick recalculates the readings once the neighborhood is loaded.
+         let mut entity = Self::new(id, position);
+         if id == belt::ID {
+-            entity.belt = Mutex::new(belt::Segment::read(nbt));
++            let segment = belt::Segment::read(nbt);
++            if let Some(controller) = segment.filter(|part| part.index == 0) {
++                entity.cargo = Some(Box::new(Mutex::new(belt::Cargo::read(nbt, controller))));
++            }
++            entity.belt = Mutex::new(segment);
+         }
+         if let Some(drill) = &mut entity.drill {
+             **drill = drill::Drill::from_nbt(nbt);
+@@ -660,12 +666,20 @@
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
+         tag.put_float("Speed", readings.rpm);
+-        if let Some(belt) = *self
++        let segment = *self
+             .belt
+             .lock()
+-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+-        {
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if let Some(belt) = segment {
+             belt.write(tag);
++            if belt.index == 0
++                && let Some(cargo) = &self.cargo
++            {
++                cargo
++                    .lock()
++                    .unwrap_or_else(std::sync::PoisonError::into_inner)
++                    .write(tag);
++            }
+         }
+         if let Some(drill) = &self.drill {
+             drill.write_nbt(tag);
+@@ -773,6 +787,12 @@
+     }
+ 
+     fn on_block_replaced(self: Arc<Self>, world: &Arc<World>, _: &BlockPos) {
++        if let Some(cargo) = &self.cargo {
++            cargo
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .drop_items(world, &self.position);
++        }
+         if let Some(drill) = &self.drill {
+             drill.remove(world);
+         }
+@@ -1017,6 +1037,18 @@
+                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                 .tick_world(world, self.position, state, next.rpm)
+         });
++        let conveyed = self.cargo.as_ref().is_some_and(|cargo| {
++            let topology = *self
++                .belt
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++            topology.filter(|part| part.index == 0).is_some_and(|part| {
++                cargo
++                    .lock()
++                    .unwrap_or_else(std::sync::PoisonError::into_inner)
++                    .tick(world, part, state, next.rpm)
++            })
++        });
+         let mixed = self.mixer.as_ref().is_some_and(|mixer| {
+             mixer
+                 .lock()
+@@ -1053,7 +1085,7 @@
+             *readings = next;
+             (changed || press_changed, changed_signal)
+         };
+-        if (changed || built || worked || processed || mixed)
++        if (changed || built || worked || processed || mixed || conveyed)
+             && let Some(entity) = world.get_block_entity(&self.position)
+             && entity
+                 .as_any()

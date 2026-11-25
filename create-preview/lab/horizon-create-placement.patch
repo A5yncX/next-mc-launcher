@@ -1,0 +1,466 @@
+diff --git a/native-crates/create/engine/src/core/placement.rs b/native-crates/create/engine/src/core/placement.rs
+--- a/native-crates/create/engine/src/core/placement.rs
++++ b/native-crates/create/engine/src/core/placement.rs
+@@ -1,7 +1,7 @@
+ // Copyright (c) The Create Team / The Creators of Create
+ // SPDX-License-Identifier: MIT
+ //! Placement rules of the supported Create blocks. World queries stay in the adapter.
+-use crate::kinetics::Axis;
++use crate::kinetics::{Axis, Kind, Node, Pos};
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum Direction {
+@@ -71,6 +71,75 @@
+     pub fn from_vector(vector: [i32; 3]) -> Option<Self> {
+         Self::ALL.into_iter().find(|d| d.vector() == vector)
+     }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Assist {
++    pub pos: Pos,
++    pub axis: Axis,
++}
++
++/// The lab supports dedicated shafts and small cogs; the caller supplies only loaded cells.
++pub fn assist(
++    small_cog_in_hand: bool,
++    target: Node,
++    cursor: [f64; 3],
++    mut cell: impl FnMut(Pos) -> (Option<Node>, bool),
++) -> Option<Assist> {
++    if !cursor.iter().all(|v| v.is_finite()) {
++        return None;
++    }
++    let axis = target.axis;
++    let small_cog = Kind::Cog { large: false };
++    let extend_shaft = matches!(target.kind, Kind::Shaft);
++    if !extend_shaft && !(small_cog_in_hand && target.kind == small_cog) {
++        return None;
++    }
++    // The six-voxel pole bounds, including Create's 0.001 tolerance, exclude the cog hub.
++    if !extend_shaft
++        && (0..3).all(|i| {
++            let v = cursor[i].rem_euclid(1.0);
++            axis.index() == i || (0.3115..=0.6885).contains(&v)
++        })
++    {
++        return None;
++    }
++    let mut directions = Direction::ALL;
++    let score = |d: Direction| {
++        let [x, y, z] = d.vector();
++        (cursor[0] - 0.5) * f64::from(x)
++            + (cursor[1] - 0.5) * f64::from(y)
++            + (cursor[2] - 0.5) * f64::from(z)
++    };
++    directions.sort_by(|a, b| {
++        score(*b)
++            .partial_cmp(&score(*a))
++            .unwrap_or(std::cmp::Ordering::Equal)
++    });
++    // shortcut: default placement range, extend when the lab supports Extendo Grip/config.
++    let range = if extend_shaft { 12 } else { 1 };
++    for d in directions {
++        if (d.axis() == axis) != extend_shaft {
++            continue;
++        }
++        let delta = d.vector();
++        for distance in 1..=range {
++            let pos = std::array::from_fn(|i| target.pos[i] + distance * delta[i]);
++            let (node, replaceable) = cell(pos);
++            if extend_shaft
++                && node.is_some_and(|n| {
++                    n.axis == axis && matches!(n.kind, Kind::Shaft | Kind::Cog { .. })
++                })
++            {
++                continue;
++            }
++            if replaceable {
++                return Some(Assist { pos, axis });
++            }
++            break;
++        }
++    }
++    None
+ }
+ 
+ /// Ports on neighboring blocks point toward the block being placed.
+@@ -219,6 +288,74 @@
+ mod tests {
+     use super::*;
+     #[test]
++    fn assist_extends_the_aimed_end_then_falls_back_past_the_other_end() {
++        let node = |pos| Node {
++            pos,
++            axis: Axis::X,
++            kind: Kind::Shaft,
++        };
++        let cell = |pos: Pos| {
++            (
++                matches!(pos[0], -1 | 1).then(|| node(pos)),
++                pos[0].abs() > 1,
++            )
++        };
++        assert_eq!(
++            assist(false, node([0; 3]), [0.8, 0.5, 0.5], cell)
++                .unwrap()
++                .pos,
++            [2, 0, 0]
++        );
++        assert_eq!(
++            assist(true, node([0; 3]), [0.2, 0.5, 0.5], cell)
++                .unwrap()
++                .pos,
++            [-2, 0, 0]
++        );
++        assert_eq!(
++            assist(false, node([0; 3]), [0.8, 0.5, 0.5], |p| (p[0] > 0
++                && p[0] <= 12)
++                .then(|| node(p))
++                .map_or((None, true), |n| (Some(n), false)))
++            .unwrap()
++            .pos,
++            [-1, 0, 0]
++        );
++        assert_eq!(
++            assist(false, node([0; 3]), [0.8, 0.5, 0.5], |_| (None, false)),
++            None
++        );
++    }
++    #[test]
++    fn cog_assist_uses_the_edge_not_the_hub_and_keeps_the_axis() {
++        let node = Node {
++            pos: [0; 3],
++            axis: Axis::Y,
++            kind: Kind::Cog { large: false },
++        };
++        assert_eq!(
++            assist(true, node, [0.84, 0.6, 0.5], |_| (None, true)),
++            Some(Assist {
++                pos: [1, 0, 0],
++                axis: Axis::Y
++            })
++        );
++        assert_eq!(assist(true, node, [0.51, 1.0, 0.5], |_| (None, true)), None);
++        assert_eq!(
++            assist(false, node, [0.84, 0.6, 0.5], |_| (None, true)),
++            None
++        );
++    }
++    #[test]
++    fn motor_prefers_a_port_unless_sneaking() {
++        let mut ports = [false; 6];
++        ports[5] = true;
++        assert_eq!(motor(Direction::North, false, ports), Direction::East);
++        assert_eq!(motor(Direction::North, true, ports), Direction::North);
++        ports[0] = true;
++        assert_eq!(motor(Direction::North, false, ports), Direction::South);
++    }
++    #[test]
+     fn shaft_prefers_ports_and_shift_overrides_only_a_preferred_axis() {
+         let mut ports = [false; 6];
+         ports[5] = true;
+diff --git a/crates/horizon-client/src/game/remote.rs b/crates/horizon-client/src/game/remote.rs
+--- a/crates/horizon-client/src/game/remote.rs
++++ b/crates/horizon-client/src/game/remote.rs
+@@ -1617,7 +1617,7 @@
+     /// `LocalPlayer.isShiftKeyDown` (and so `isSecondaryUseActive`): the input as of the player's
+     /// last tick (`input.keyPresses`, what the last ServerboundPlayerInputPacket said), not the key
+     /// now: a sneak pressed in the frame of a click acts from the next tick, as on the server.
+-    fn remote_shift_down(&self) -> bool {
++    pub(super) fn remote_shift_down(&self) -> bool {
+         self.remote.as_ref().is_some_and(|r| r.last_input & SHIFT_INPUT != 0)
+     }
+     fn next_sequence(&mut self) -> i32 {
+@@ -8002,6 +8002,16 @@
+                 return true;
+             }
+             if held_block {
++                if let Some(stack) = held.as_ref()
++                    && super::create_lab_placement::on(self, &stack.item)
++                {
++                    let placed = !reacts && (super::create_lab_placement::assist(self, &hit, &stack.item).is_some()
++                        || self.remote_can_place(&hit, stack).is_some());
++                    if placed {
++                        self.with_hand(hand, Game::swing_arm);
++                    }
++                    return reacts || placed;
++                }
+                 let consumable = held
+                     .as_ref()
+                     .and_then(|stack| self.items().get(&stack.item).cloned())
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -283,6 +283,7 @@
+ mod native_falling;
+ mod native_fluid_render;
+ mod native_guards;
++mod create_lab_placement;
+ mod native_hooks;
+ mod native_host_bridge;
+ mod native_inventories;
+@@ -2435,6 +2436,7 @@
+     >,
+     /// Frames drawn with the player in the world, for `--world-frames`.
+     world_frames: u64,
++    create_lab_preview: create_lab_placement::Preview,
+     fps: f32,
+     fps_frames: u64,
+     fps_at: Instant,
+@@ -5449,6 +5451,7 @@
+                 self.screen = Screen::Inventory;
+             }
+         }
++        create_lab_placement::tick(self);
+         if self.remote.is_some() {
+             return self.tick_remote();
+         }
+@@ -5844,6 +5847,7 @@
+                         } else {
+                             hud_layout::paint(batch, &g.gui.atlas, &draws);
+                         }
++                        create_lab_placement::arrow(g, batch, wi, hi);
+                     },
+                 );
+             }
+@@ -7198,6 +7202,7 @@
+         self.finish_async_occlusion_culling();
+         laps.lap("eg_culling_finish");
+         self.native_world_geometry(camera, alpha as f32, &mut out);
++        create_lab_placement::ghost(self, camera, &mut out);
+         (
+             out,
+             static_block_entities,
+@@ -11351,6 +11356,7 @@
+             kept_block_entities: Default::default(),
+             item_level_cache: Default::default(),
+             world_frames: 0,
++            create_lab_preview: Default::default(),
+             fps: 0.0,
+             fps_frames: 0,
+             fps_at: now,
+diff --git a/crates/horizon-client/src/game/create_lab_placement.rs b/crates/horizon-client/src/game/create_lab_placement.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/horizon-client/src/game/create_lab_placement.rs
+@@ -0,0 +1,218 @@
++use super::{Game, Hit, HudBatch, Vertex, create_port, native_world_edit};
++use create_engine::{
++    kinetics::Pos,
++    placement::{self, Assist},
++};
++use glam::{DVec3, Mat4};
++use horizon_world::registry::BlockStateId;
++
++const SHAFT: &str = "create:shaft";
++const COG: &str = "create:cogwheel";
++
++pub(super) fn on(game: &Game<'_>, item: &str) -> bool {
++    matches!(item, SHAFT | COG | "create:creative_motor")
++        && game
++            .remote
++            .as_ref()
++            .is_some_and(|r| r.brand == "Pumpkin Create Lab")
++        && game.native_on("create")
++}
++
++pub(super) fn assist(game: &Game<'_>, hit: &Hit, item: &str) -> Option<Assist> {
++    if !on(game, item)
++        || !matches!(item, SHAFT | COG)
++        || !game.may_build()
++        || game.remote_shift_down()
++        || !matches!(game.block_name(hit.pos).as_ref(), SHAFT | COG)
++    {
++        return None;
++    }
++    let target = create_port::node(game, hit.pos)?;
++    let cursor = std::array::from_fn(|i| hit.point[i] - f64::from(hit.pos[i]));
++    let (bottom, height) = game.native_world_height();
++    placement::assist(item == COG, target, cursor, |p @ [x, y, z]| {
++        if !(bottom..bottom + height).contains(&y)
++            || !game
++                .world
++                .chunks
++                .contains_key(&(x.div_euclid(16), z.div_euclid(16)))
++        {
++            return (None, false);
++        }
++        (
++            create_port::node(game, p),
++            game.res
++                .behaviours()
++                .is_replaceable(game.world.block(x, y, z)),
++        )
++    })
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct Target {
++    pos: Pos,
++    from: Pos,
++    state: BlockStateId,
++}
++
++#[derive(Default)]
++pub(super) struct Preview {
++    target: Option<Target>,
++    previous: u8,
++    ticks: u8,
++}
++
++impl Preview {
++    fn advance(&mut self, target: Option<Target>) {
++        self.previous = self.ticks;
++        if let Some(t) = target {
++            self.target = Some(t);
++            self.ticks = (self.ticks + 1).min(10);
++        } else {
++            self.ticks = self.ticks.saturating_sub(2);
++            if self.previous == 0 {
++                self.target = None;
++            }
++        }
++    }
++
++    fn visible(&self, game: &Game<'_>) -> Option<(Target, f32)> {
++        let target = self.target?;
++        if game.ui.hide_gui
++            || !game.native_playing()
++            || game.screen_over_playing()
++            || !game.camera_type.first_person()
++            || !on(game, SHAFT)
++        {
++            return None;
++        }
++        let a = f32::from(self.previous);
++        let b = f32::from(self.ticks);
++        let opacity = ((a + (b - a) * game.clock.fraction() as f32) / 10.0).powi(2);
++        (opacity > 0.0).then_some((target, opacity))
++    }
++}
++
++fn target(game: &Game<'_>) -> Option<Target> {
++    if !on(game, SHAFT)
++        || !game.native_playing()
++        || game.screen_over_playing()
++        || game.entity_targeted()
++        || !game.camera_type.first_person()
++    {
++        return None;
++    }
++    let hit = game.pick()?;
++    game.inventory
++        .get(game.selected)
++        .and_then(Option::as_ref)
++        .into_iter()
++        .chain(game.offhand.as_ref())
++        .find_map(|stack| {
++            let Assist { pos, axis } = assist(game, &hit, &stack.item)?;
++            let registry = &game.pack.assets.registry;
++            let state = registry.default_state(&stack.item)?;
++            let state = native_world_edit::with_property(registry, state, "axis", axis.name())?;
++            Some(Target {
++                pos,
++                from: hit.pos,
++                state,
++            })
++        })
++}
++
++pub(super) fn tick(game: &mut Game<'_>) {
++    let next = target(game);
++    if next != game.create_lab_preview.target
++        && let Some(next) = next
++        && std::env::var_os("CREATE_LAB_PLACEMENT_TRACE").is_some()
++    {
++        log::info!(
++            "Create lab preview: {:?} -> {:?}, {:?}",
++            next.from,
++            next.pos,
++            next.state
++        );
++    }
++    game.create_lab_preview.advance(next);
++}
++
++pub(super) fn ghost(game: &Game<'_>, camera: DVec3, out: &mut Vec<Vertex>) {
++    let Some((target, opacity)) = game.create_lab_preview.visible(game) else {
++        return;
++    };
++    let origin = (DVec3::from_array(target.pos.map(f64::from)) - camera).as_vec3();
++    let start = out.len();
++    game.tinted_block_model_vertices(
++        target.state,
++        0,
++        Mat4::from_translation(origin),
++        |_| 0xF0F0,
++        false,
++        |_| None,
++        out,
++    );
++    let alpha = ((opacity * 144.0) as u32) << 24;
++    for vertex in &mut out[start..] {
++        vertex.color = (vertex.color & 0x00ff_ffff) | alpha;
++    }
++}
++
++pub(super) fn arrow(game: &Game<'_>, batch: &mut HudBatch, width: i32, height: i32) {
++    let Some((target, opacity)) = game.create_lab_preview.visible(game) else {
++        return;
++    };
++    let [x, y, z] = std::array::from_fn(|i| (target.pos[i] - target.from[i]) as f32);
++    let (sy, cy) = game.yaw.to_radians().sin_cos();
++    let (sp, cp) = game.pitch.to_radians().sin_cos();
++    let a = x * -cy - z * sy;
++    let b = -y * cp + (x * sy - z * cy) * sp;
++    if a.abs() + b.abs() < 1e-4 {
++        return;
++    }
++    let step = std::f32::consts::PI / 8.0;
++    let (s, c) = ((b.atan2(a) / step).round() * step).sin_cos();
++    let mx = width as f32 / 2.0;
++    let my = height as f32 / 2.0;
++    let point = |r: f32, w: f32| [mx + c * r - s * w, my + s * r + c * w];
++    let atlas = &game.gui.atlas;
++    let alpha = ((opacity * 255.0) as u32) << 24;
++    // A dark edge keeps the white arrow legible against both light and dark scenes.
++    for (tip, base, wing, color) in [(19.0, 10.0, 5.0, 0), (17.0, 12.0, 3.0, 0x00ff_ffff)] {
++        batch.fill_quad(
++            atlas,
++            [
++                point(tip, 0.0),
++                point(base, -wing),
++                point(base, wing),
++                point(base, wing),
++            ],
++            alpha | color,
++        );
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn appearance_takes_ten_ticks_and_fades_in_five() {
++        let mut p = Preview::default();
++        let t = Target {
++            pos: [1, 0, 0],
++            from: [0; 3],
++            state: BlockStateId(0),
++        };
++        for i in 1..=12 {
++            p.advance(Some(t));
++            assert_eq!(p.ticks, i.min(10));
++        }
++        for i in 1..=5 {
++            p.advance(None);
++            assert_eq!(p.ticks, 10 - 2 * i);
++        }
++        p.advance(None);
++        assert_eq!(p.target, None);
++    }
++}

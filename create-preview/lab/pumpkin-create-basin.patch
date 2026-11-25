@@ -1,0 +1,1266 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_basin.rs b/crates/pumpkin-core/src/block/entities/create_basin.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_basin.rs
+@@ -0,0 +1,737 @@
++use std::{
++    any::Any,
++    array::from_fn,
++    sync::{
++        Arc, PoisonError, RwLock,
++        atomic::{AtomicBool, Ordering},
++    },
++};
++
++use create_engine::basin as rules;
++use pumpkin_data::item_stack::ItemStack;
++use pumpkin_inventory::{Clearable, Inventory};
++use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
++use pumpkin_util::math::position::BlockPos;
++
++use super::BlockEntity;
++use crate::world::World;
++
++const INPUT_SIZE: usize = rules::ITEM_SLOTS;
++const OUTPUT_START: usize = INPUT_SIZE;
++const INVENTORY_SIZE: usize = INPUT_SIZE * 2;
++
++/// A recipe key whose equality keeps every item component significant.
++#[derive(Clone)]
++pub(crate) struct BasinItemKey(pub ItemStack);
++
++impl BasinItemKey {
++    #[must_use]
++    pub(crate) fn new(mut stack: ItemStack) -> Self {
++        stack.item_count = 1;
++        Self(stack)
++    }
++}
++
++impl PartialEq for BasinItemKey {
++    fn eq(&self, other: &Self) -> bool {
++        self.0.are_items_and_components_equal(&other.0)
++    }
++}
++impl Eq for BasinItemKey {}
++
++/// Converts a Pumpkin stack into the item representation expected by shared Create rules.
++#[must_use]
++pub(crate) fn basin_item(stack: ItemStack) -> rules::Item<BasinItemKey> {
++    rules::Item {
++        key: BasinItemKey::new(stack.clone()),
++        count: u32::from(stack.item_count),
++        maximum: u32::from(stack.get_max_stack_size()),
++    }
++}
++
++pub(crate) struct CreateBasinBlockEntity {
++    pub position: BlockPos,
++    pub items: RwLock<[ItemStack; INVENTORY_SIZE]>,
++    dirty: AtomicBool,
++    other_nbt: NbtCompound,
++    item_templates: [Option<NbtCompound>; 2],
++    opaque_items: Option<[Option<NbtTag>; 2]>,
++}
++
++impl BlockEntity for CreateBasinBlockEntity {
++    fn resource_location(&self) -> &'static str {
++        "create:basin"
++    }
++
++    fn get_position(&self) -> BlockPos {
++        self.position
++    }
++
++    fn from_nbt(nbt: &NbtCompound, position: BlockPos) -> Self {
++        let mut items = from_fn(|_| ItemStack::EMPTY.clone());
++        let readable = read_half(nbt.get("InputItems"), &mut items[..INPUT_SIZE]).is_some()
++            && read_half(nbt.get("OutputItems"), &mut items[OUTPUT_START..]).is_some();
++        let opaque_items = (!readable).then(|| {
++            [
++                nbt.get("InputItems").cloned(),
++                nbt.get("OutputItems").cloned(),
++            ]
++        });
++        let item_templates = if readable {
++            [
++                nbt.get_compound("InputItems").cloned(),
++                nbt.get_compound("OutputItems").cloned(),
++            ]
++        } else {
++            [None, None]
++        };
++        if !readable {
++            items.fill(ItemStack::EMPTY.clone());
++        }
++
++        let mut other_nbt = nbt.clone();
++        for key in ["InputItems", "OutputItems"] {
++            other_nbt.child_tags.remove(key);
++        }
++
++        Self {
++            position,
++            items: RwLock::new(items),
++            dirty: AtomicBool::new(false),
++            other_nbt,
++            item_templates,
++            opaque_items,
++        }
++    }
++
++    fn write_nbt(&self, nbt: &mut NbtCompound) {
++        nbt.child_tags.extend(self.other_nbt.child_tags.clone());
++        nbt.child_tags.remove("InputItems");
++        nbt.child_tags.remove("OutputItems");
++        if let Some(opaque) = &self.opaque_items {
++            for (key, value) in ["InputItems", "OutputItems"].into_iter().zip(opaque) {
++                if let Some(value) = value {
++                    nbt.put(key, value.clone());
++                }
++            }
++        } else {
++            let items = self.items.read().unwrap_or_else(PoisonError::into_inner);
++            write_half(
++                nbt,
++                "InputItems",
++                &items[..INPUT_SIZE],
++                self.item_templates[0].as_ref(),
++            );
++            write_half(
++                nbt,
++                "OutputItems",
++                &items[OUTPUT_START..],
++                self.item_templates[1].as_ref(),
++            );
++        }
++    }
++
++    fn chunk_data_nbt(&self) -> Option<NbtCompound> {
++        let mut nbt = NbtCompound::new();
++        self.write_nbt(&mut nbt);
++        Some(nbt)
++    }
++
++    fn get_inventory(self: Arc<Self>) -> Option<Arc<dyn Inventory>> {
++        self.is_supported().then_some(self)
++    }
++
++    fn on_block_replaced(self: Arc<Self>, world: &Arc<World>, position: &BlockPos) {
++        if self.is_supported() {
++            let inventory: Arc<dyn Inventory> = self;
++            world.scatter_inventory(position, &inventory);
++        }
++    }
++
++    fn is_dirty(&self) -> bool {
++        self.dirty.load(Ordering::Relaxed)
++    }
++
++    fn clear_dirty(&self) {
++        self.dirty.store(false, Ordering::Relaxed);
++    }
++
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++}
++
++impl CreateBasinBlockEntity {
++    pub const HALF_SIZE: usize = INPUT_SIZE;
++    pub const INVENTORY_SIZE: usize = INPUT_SIZE * 2;
++    pub const OUTPUT_START: usize = INPUT_SIZE;
++
++    #[must_use]
++    pub fn new(position: BlockPos) -> Self {
++        Self {
++            position,
++            items: RwLock::new(from_fn(|_| ItemStack::EMPTY.clone())),
++            dirty: AtomicBool::new(false),
++            other_nbt: NbtCompound::new(),
++            item_templates: [None, None],
++            opaque_items: None,
++        }
++    }
++
++    #[must_use]
++    pub fn is_supported(&self) -> bool {
++        self.opaque_items.is_none()
++    }
++
++    /// Inserts into the unique matching input slot, or its first empty slot.
++    /// The transfer is capped at the item's stack maximum and the basin's 64-item limit.
++    pub(crate) fn insert_hand_stack(&self, incoming: &mut ItemStack, simulate: bool) -> u8 {
++        if !self.is_supported() || incoming.is_empty() {
++            return 0;
++        }
++        let maximum = incoming.get_max_stack_size().min(64);
++        if maximum == 0 {
++            return 0;
++        }
++
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        let slots = &mut items[..INPUT_SIZE];
++        let mut matching = slots.iter().enumerate().filter_map(|(slot, held)| {
++            (!held.is_empty() && held.are_items_and_components_equal(incoming)).then_some(slot)
++        });
++        let target = match (matching.next(), matching.next()) {
++            (Some(slot), None) => slot,
++            (None, _) => match slots.iter().position(ItemStack::is_empty) {
++                Some(slot) => slot,
++                None => return 0,
++            },
++            _ => return 0,
++        };
++        let held_count = slots[target].item_count;
++        let inserted = incoming.item_count.min(maximum.saturating_sub(held_count));
++        if inserted == 0 {
++            return 0;
++        }
++        if !simulate {
++            if slots[target].is_empty() {
++                slots[target] = incoming.copy_with_count(inserted);
++            } else {
++                slots[target].increment(inserted);
++            }
++            incoming.decrement(inserted);
++            if incoming.is_empty() {
++                incoming.clear();
++            }
++            self.mark_dirty();
++        }
++        inserted
++    }
++
++    /// Extracts exact item/component matches from output first, falling back to input only when
++    /// no matching output remains. Simulation leaves storage unchanged.
++    pub(crate) fn extract_exact(
++        &self,
++        requested: &ItemStack,
++        amount: u8,
++        simulate: bool,
++    ) -> ItemStack {
++        if !self.is_supported() || requested.is_empty() || amount == 0 {
++            return ItemStack::EMPTY.clone();
++        }
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        let has_output = items[OUTPUT_START..]
++            .iter()
++            .any(|stack| !stack.is_empty() && stack.are_items_and_components_equal(requested));
++        let range = if has_output {
++            OUTPUT_START..INVENTORY_SIZE
++        } else {
++            0..INPUT_SIZE
++        };
++        let mut remaining = amount;
++        for held in &mut items[range] {
++            if held.is_empty() || !held.are_items_and_components_equal(requested) {
++                continue;
++            }
++            let extracted = remaining.min(held.item_count);
++            remaining -= extracted;
++            if !simulate {
++                held.decrement(extracted);
++                if held.is_empty() {
++                    *held = ItemStack::EMPTY.clone();
++                }
++            }
++            if remaining == 0 {
++                break;
++            }
++        }
++        let extracted = amount - remaining;
++        if extracted == 0 {
++            return ItemStack::EMPTY.clone();
++        }
++        if !simulate {
++            self.mark_dirty();
++        }
++        requested.copy_with_count(extracted)
++    }
++
++    pub(super) fn matches_item_recipe(
++        &self,
++        recipe: &rules::Recipe<BasinItemKey, ()>,
++        heat: rules::Heat,
++        context: &mut impl rules::Context<BasinItemKey, ()>,
++    ) -> bool {
++        self.run_item_recipe(recipe, heat, context, true).outcome == rules::Outcome::Simulated
++    }
++
++    /// Applies the shared Basin item rules to a private snapshot and publishes only success.
++    /// Fluid recipes are rejected here; press/mixer hosts own their fluid transaction.
++    pub(crate) fn apply_item_recipe(
++        &self,
++        recipe: &rules::Recipe<BasinItemKey, ()>,
++        heat: rules::Heat,
++        context: &mut impl rules::Context<BasinItemKey, ()>,
++    ) -> rules::Report {
++        self.run_item_recipe(recipe, heat, context, false)
++    }
++
++    fn run_item_recipe(
++        &self,
++        recipe: &rules::Recipe<BasinItemKey, ()>,
++        heat: rules::Heat,
++        context: &mut impl rules::Context<BasinItemKey, ()>,
++        simulate: bool,
++    ) -> rules::Report {
++        if !self.is_supported() {
++            return empty_report(rules::Outcome::NoMatch(
++                rules::Rejection::MissingItemCapability,
++            ));
++        }
++        if self.other_nbt.get("Filter").is_some_and(|filter| {
++            filter
++                .extract_compound()
++                .is_none_or(|filter| !filter.child_tags.is_empty())
++        }) {
++            return empty_report(rules::Outcome::Filtered);
++        }
++        if !recipe.fluid_amounts.is_empty() || !recipe.fluid_outputs.is_empty() {
++            return empty_report(rules::Outcome::Unsupported(
++                rules::Rejection::MissingFluidCapability,
++            ));
++        }
++
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        let mut snapshot = rules::Basin::<BasinItemKey, ()>::default();
++        snapshot.input = from_fn(|slot| rule_item(&items[slot]));
++        snapshot.output = from_fn(|slot| rule_item(&items[OUTPUT_START + slot]));
++        snapshot.heat = heat;
++        let report = snapshot.apply(recipe, simulate, context);
++        if report.outcome != rules::Outcome::Applied {
++            return report;
++        }
++
++        let Some(input) = native_slots(&snapshot.input) else {
++            return empty_report(rules::Outcome::Unsupported(
++                rules::Rejection::DefinitionBounds,
++            ));
++        };
++        let Some(output) = native_slots(&snapshot.output) else {
++            return empty_report(rules::Outcome::Unsupported(
++                rules::Rejection::DefinitionBounds,
++            ));
++        };
++        if report.changed() {
++            items[..INPUT_SIZE].clone_from_slice(&input);
++            items[OUTPUT_START..].clone_from_slice(&output);
++            self.mark_dirty();
++        }
++        report
++    }
++
++    fn mark_dirty(&self) {
++        self.dirty.store(true, Ordering::Relaxed);
++    }
++}
++
++fn empty_report(outcome: rules::Outcome) -> rules::Report {
++    rules::Report {
++        outcome,
++        consumed_items: 0,
++        consumed_fluid: 0,
++        inserted_items: 0,
++        inserted_fluid: 0,
++        random_calls: 0,
++        notify_all_fluid_tanks: false,
++    }
++}
++
++fn rule_item(stack: &ItemStack) -> Option<rules::Item<BasinItemKey>> {
++    (!stack.is_empty()).then(|| basin_item(stack.clone()))
++}
++
++fn native_slots(
++    slots: &[Option<rules::Item<BasinItemKey>>; INPUT_SIZE],
++) -> Option<[ItemStack; INPUT_SIZE]> {
++    let mut native = from_fn(|_| ItemStack::EMPTY.clone());
++    for (slot, item) in slots.iter().enumerate() {
++        if let Some(item) = item {
++            native[slot] = item.key.0.copy_with_count(u8::try_from(item.count).ok()?);
++        }
++    }
++    Some(native)
++}
++
++fn write_half(
++    nbt: &mut NbtCompound,
++    key: &str,
++    slots: &[ItemStack],
++    template: Option<&NbtCompound>,
++) {
++    let mut inventory = template.cloned().unwrap_or_default();
++    inventory.put_int("Size", slots.len() as i32);
++    inventory.put_list(
++        "Items",
++        slots
++            .iter()
++            .enumerate()
++            .filter(|(_, stack)| !stack.is_empty())
++            .map(|(slot, stack)| {
++                let mut item = NbtCompound::new();
++                stack.write_item_stack(&mut item);
++                item.put_int("Slot", slot as i32);
++                NbtTag::Compound(item)
++            })
++            .collect(),
++    );
++    nbt.put_compound(key, inventory);
++}
++
++fn read_half(tag: Option<&NbtTag>, slots: &mut [ItemStack]) -> Option<()> {
++    let Some(tag) = tag else {
++        return Some(());
++    };
++    let inventory = tag.extract_compound()?;
++    if inventory.get_int("Size")? != slots.len() as i32 {
++        return None;
++    }
++    let entries = inventory.get_list("Items")?;
++    if entries.len() > slots.len() {
++        return None;
++    }
++    let mut seen = vec![false; slots.len()];
++    for entry in entries {
++        let entry = entry.extract_compound()?;
++        if entry
++            .child_tags
++            .keys()
++            .any(|key| !["Slot", "id", "count", "components"].contains(&key.as_ref()))
++        {
++            return None;
++        }
++        let count = entry.get_int("count")?;
++        if !(1..=255).contains(&count)
++            || entry
++                .get("components")
++                .is_some_and(|components| components.extract_compound().is_none())
++        {
++            return None;
++        }
++        let slot = entry
++            .get_int("Slot")
++            .or_else(|| entry.get_byte("Slot").map(i32::from))?;
++        let slot = usize::try_from(slot).ok()?;
++        let was_seen = seen.get_mut(slot)?;
++        if *was_seen {
++            return None;
++        }
++        *was_seen = true;
++        slots[slot] = ItemStack::read_item_stack(entry)?;
++    }
++    Some(())
++}
++
++impl Inventory for CreateBasinBlockEntity {
++    fn size(&self) -> usize {
++        Self::INVENTORY_SIZE
++    }
++
++    fn is_empty(&self) -> bool {
++        self.items
++            .read()
++            .unwrap_or_else(PoisonError::into_inner)
++            .iter()
++            .all(ItemStack::is_empty)
++    }
++
++    fn get_stack(&self, slot: usize) -> ItemStack {
++        self.items
++            .read()
++            .unwrap_or_else(PoisonError::into_inner)
++            .get(slot)
++            .cloned()
++            .unwrap_or_else(|| ItemStack::EMPTY.clone())
++    }
++
++    fn remove_stack(&self, slot: usize) -> ItemStack {
++        if !self.is_supported() {
++            return ItemStack::EMPTY.clone();
++        }
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        let Some(stack) = items.get_mut(slot) else {
++            return ItemStack::EMPTY.clone();
++        };
++        if stack.is_empty() {
++            return ItemStack::EMPTY.clone();
++        }
++        let removed = std::mem::replace(stack, ItemStack::EMPTY.clone());
++        self.mark_dirty();
++        removed
++    }
++
++    fn remove_stack_specific(&self, slot: usize, amount: u8) -> ItemStack {
++        if !self.is_supported() || amount == 0 {
++            return ItemStack::EMPTY.clone();
++        }
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        let Some(stack) = items.get_mut(slot) else {
++            return ItemStack::EMPTY.clone();
++        };
++        if stack.is_empty() {
++            return ItemStack::EMPTY.clone();
++        }
++        let removed = stack.split(amount);
++        if stack.is_empty() {
++            *stack = ItemStack::EMPTY.clone();
++        }
++        self.mark_dirty();
++        removed
++    }
++
++    fn set_stack(&self, slot: usize, stack: ItemStack) {
++        if !self.is_supported() {
++            return;
++        }
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        if let Some(target) = items.get_mut(slot) {
++            *target = stack;
++            self.mark_dirty();
++        }
++    }
++
++    fn get_max_count_per_stack(&self) -> u8 {
++        64
++    }
++
++    fn is_valid_slot_for(&self, slot: usize, stack: &ItemStack) -> bool {
++        self.is_supported()
++            && slot < INPUT_SIZE
++            && self.items.read().unwrap_or_else(PoisonError::into_inner)[..INPUT_SIZE]
++                .iter()
++                .enumerate()
++                .all(|(i, held)| {
++                    i == slot || held.is_empty() || !held.are_items_and_components_equal(stack)
++                })
++    }
++
++    fn can_transfer_to(
++        &self,
++        _hopper_inventory: &dyn Inventory,
++        slot: usize,
++        _stack: &ItemStack,
++    ) -> bool {
++        self.is_supported() && slot < Self::INVENTORY_SIZE
++    }
++
++    fn mark_dirty(&self) {
++        CreateBasinBlockEntity::mark_dirty(self);
++    }
++
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++}
++
++impl Clearable for CreateBasinBlockEntity {
++    fn clear(&self) {
++        if self.is_supported() {
++            self.items
++                .write()
++                .unwrap_or_else(PoisonError::into_inner)
++                .fill_with(|| ItemStack::EMPTY.clone());
++            self.mark_dirty();
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pumpkin_data::item::Item;
++
++    fn half(stack: Option<ItemStack>, slot: i32) -> NbtCompound {
++        let mut inventory = NbtCompound::new();
++        inventory.put_int("Size", CreateBasinBlockEntity::HALF_SIZE as i32);
++        let items = stack
++            .map(|stack| {
++                let mut item = NbtCompound::new();
++                stack.write_item_stack(&mut item);
++                item.put_int("Slot", slot);
++                vec![NbtTag::Compound(item)]
++            })
++            .unwrap_or_default();
++        inventory.put_list("Items", items);
++        inventory
++    }
++
++    #[test]
++    fn canonical_halves_round_trip_components_and_keep_other_tags() {
++        let mut stack = ItemStack::new(3, &Item::DIAMOND);
++        stack.set_lore(vec![pumpkin_util::text::TextComponent::text("basin")]);
++        let mut input_half = half(Some(stack.clone()), 4);
++        input_half.put("unknown", NbtTag::String("keep".into()));
++        let mut nbt = NbtCompound::new();
++        nbt.put_compound("InputItems", input_half);
++        nbt.put("InputTanks", NbtTag::String("opaque fluid data".into()));
++        nbt.put("Filter", NbtTag::Int(19));
++
++        let basin = CreateBasinBlockEntity::from_nbt(&nbt, BlockPos::new(1, 2, 3));
++        assert!(basin.is_supported());
++        let mut saved = NbtCompound::new();
++        basin.write_nbt(&mut saved);
++
++        let input = saved.get_compound("InputItems").unwrap();
++        assert_eq!(input.get_int("Size"), Some(9));
++        assert_eq!(input.get_string("unknown"), Some("keep"));
++        let entry = input.get_list("Items").unwrap()[0]
++            .extract_compound()
++            .unwrap();
++        assert_eq!(entry.get_int("Slot"), Some(4));
++        let restored = ItemStack::read_item_stack(entry).unwrap();
++        assert!(restored.are_items_and_components_equal(&stack));
++        assert_eq!(saved.get("InputTanks"), nbt.get("InputTanks"));
++        assert_eq!(saved.get("Filter"), nbt.get("Filter"));
++        let output = saved.get_compound("OutputItems").unwrap();
++        assert_eq!(output.get_int("Size"), Some(9));
++        assert!(output.get_list("Items").unwrap().is_empty());
++    }
++
++    #[test]
++    fn unreadable_half_stays_opaque_and_disables_inventory() {
++        let mut unknown_item = NbtCompound::new();
++        unknown_item.put_int("Slot", 0);
++        unknown_item.put_string("id", "minecraft:stone".into());
++        unknown_item.put_int("count", 1);
++        unknown_item.put_string("future", "unknown item data".into());
++        let mut bad = NbtCompound::new();
++        bad.put_int("Size", 9);
++        bad.put_list("Items", vec![NbtTag::Compound(unknown_item)]);
++        let mut nbt = NbtCompound::new();
++        nbt.put_compound("InputItems", bad);
++        nbt.put("OutputItems", NbtTag::String("unreadable".into()));
++
++        let basin = Arc::new(CreateBasinBlockEntity::from_nbt(
++            &nbt,
++            BlockPos::new(0, 0, 0),
++        ));
++        assert!(!basin.is_supported());
++        assert!(basin.clone().get_inventory().is_none());
++        let mut saved = NbtCompound::new();
++        basin.write_nbt(&mut saved);
++        assert_eq!(saved.get("InputItems"), nbt.get("InputItems"));
++        assert_eq!(saved.get("OutputItems"), nbt.get("OutputItems"));
++    }
++
++    #[test]
++    fn hand_insert_and_exact_extraction_are_bounded_and_output_first() {
++        let basin = CreateBasinBlockEntity::new(BlockPos::new(0, 0, 0));
++        basin.items.write().unwrap()[0] = ItemStack::new(62, &Item::STONE);
++        let mut hand = ItemStack::new(6, &Item::STONE);
++        assert_eq!(basin.insert_hand_stack(&mut hand, true), 2);
++        assert_eq!(hand.item_count, 6);
++        assert_eq!(basin.insert_hand_stack(&mut hand, false), 2);
++        assert_eq!(hand.item_count, 4);
++        assert_eq!(basin.items.read().unwrap()[0].item_count, 64);
++
++        basin.items.write().unwrap()[9] = ItemStack::new(2, &Item::STONE);
++        basin.items.write().unwrap()[10] = ItemStack::new(1, &Item::STONE);
++        let filter = ItemStack::new(1, &Item::STONE);
++        let preview = basin.extract_exact(&filter, 1, true);
++        assert_eq!(preview.item_count, 1);
++        assert_eq!(basin.items.read().unwrap()[9].item_count, 2);
++        let output = basin.extract_exact(&filter, 4, false);
++        assert_eq!(output.item_count, 3);
++        assert!(
++            basin.items.read().unwrap()[9..11]
++                .iter()
++                .all(ItemStack::is_empty)
++        );
++        let input = basin.extract_exact(&filter, 4, false);
++        assert_eq!(input.item_count, 4);
++        assert_eq!(basin.items.read().unwrap()[0].item_count, 60);
++        assert_eq!(basin.extract_exact(&filter, 60, false).item_count, 60);
++        assert!(basin.items.read().unwrap()[0].is_empty());
++    }
++
++    struct StoneIngredients;
++    impl rules::Context<BasinItemKey, ()> for StoneIngredients {
++        fn item_matches(&mut self, _ingredient: usize, stack: &rules::Item<BasinItemKey>) -> bool {
++            stack.key.0.item == &Item::STONE
++        }
++
++        fn fluid_matches(&mut self, _ingredient: usize, _stack: &rules::Fluid<()>) -> bool {
++            false
++        }
++
++        fn random(&mut self) -> f32 {
++            0.5
++        }
++    }
++
++    fn two_stone_recipe() -> rules::Recipe<BasinItemKey, ()> {
++        rules::Recipe {
++            kind: rules::RecipeKind::Crafting,
++            item_ingredients: 2,
++            fluid_amounts: Vec::new(),
++            outputs: vec![rules::Roll {
++                stack: rules::Item {
++                    key: BasinItemKey::new(ItemStack::new(1, &Item::DIAMOND)),
++                    count: 1,
++                    maximum: 64,
++                },
++                chance: 1.0,
++            }],
++            fluid_outputs: Vec::new(),
++            heat: rules::HeatRequirement::None,
++            duration: 0,
++        }
++    }
++
++    #[test]
++    fn item_recipe_matches_duplicate_ingredients_and_commits_only_with_capacity() {
++        let basin = CreateBasinBlockEntity::new(BlockPos::new(0, 0, 0));
++        basin.items.write().unwrap()[0] = ItemStack::new(2, &Item::STONE);
++        let mut context = StoneIngredients;
++        let report = basin.apply_item_recipe(&two_stone_recipe(), rules::Heat::None, &mut context);
++        assert_eq!(report.outcome, rules::Outcome::Applied);
++        assert!(basin.items.read().unwrap()[0].is_empty());
++        assert_eq!(basin.items.read().unwrap()[9].item, &Item::DIAMOND);
++
++        let blocked = CreateBasinBlockEntity::new(BlockPos::new(0, 0, 0));
++        {
++            let mut items = blocked.items.write().unwrap();
++            items[0] = ItemStack::new(2, &Item::STONE);
++            for output in &mut items[9..] {
++                *output = ItemStack::new(64, &Item::STONE);
++            }
++        }
++        let before = blocked.items.read().unwrap().clone();
++        let mut context = StoneIngredients;
++        let report =
++            blocked.apply_item_recipe(&two_stone_recipe(), rules::Heat::None, &mut context);
++        assert_eq!(
++            report.outcome,
++            rules::Outcome::NoMatch(rules::Rejection::ItemOutputs)
++        );
++        let after = blocked.items.read().unwrap();
++        assert!(before.iter().zip(after.iter()).all(|(a, b)| a.are_equal(b)));
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -18,8 +18,8 @@
+ 
+ use super::{
+     BlockEntity, create_crusher as crusher, create_drill as drill, create_fan_airflow as fan,
+-    create_millstone as millstone, create_press as press, create_saw_processing::SawProcessing,
+-    create_saw_tree as saw,
++    create_millstone as millstone, create_mixer as mixer, create_press as press,
++    create_saw_processing::SawProcessing, create_saw_tree as saw,
+ };
+ use crate::{
+     block::blocks::{
+@@ -57,6 +57,7 @@
+     crusher::WHEEL,
+     fan::ID,
+     millstone::ID,
++    mixer::ID,
+     pipe::VALVE,
+     chain::DRIVE,
+     chain::ADJUSTABLE,
+@@ -144,6 +145,7 @@
+     structure_ready: AtomicBool,
+     drill: Option<Box<drill::Drill>>,
+     saw_processing: Option<Box<Mutex<SawProcessing>>>,
++    mixer: Option<Box<Mutex<mixer::Mixer>>>,
+ }
+ 
+ pub(crate) fn set_create_wheel_material(world: &World, pos: &BlockPos, item: &Item) -> bool {
+@@ -173,6 +175,7 @@
+     chain_signal: u8,
+     press: PressCycle,
+     press_finished: bool,
++    press_basin: bool,
+     valve: Option<[f32; 3]>,
+     air_current: Option<Vec<i32>>,
+ }
+@@ -320,6 +323,7 @@
+             structure_ready: AtomicBool::new(false),
+             drill: matches!(id, drill::ID | saw::ID).then(|| Box::new(drill::Drill::new())),
+             saw_processing: (id == saw::ID).then(|| Box::new(Mutex::new(SawProcessing::default()))),
++            mixer: (id == mixer::ID).then(|| Box::new(Mutex::new(mixer::Mixer::default()))),
+         }
+     }
+ 
+@@ -387,11 +391,15 @@
+             kind: Kind::Chain { state, signal: 0 },
+         });
+     }
+-    if id == millstone::ID {
++    if matches!(id, millstone::ID | mixer::ID) {
+         return Some(Node {
+             pos,
+             axis: Axis::Y,
+-            kind: Kind::Millstone,
++            kind: if id == mixer::ID {
++                Kind::Mixer
++            } else {
++                Kind::Millstone
++            },
+         });
+     }
+     let properties = block.properties(state)?.to_props();
+@@ -506,6 +514,9 @@
+         if let Some(saw) = &mut entity.saw_processing {
+             **saw = Mutex::new(SawProcessing::from_nbt(nbt));
+         }
++        if let Some(mixer) = &mut entity.mixer {
++            **mixer = Mutex::new(mixer::Mixer::read(nbt));
++        }
+         let readings = entity
+             .readings
+             .get_mut()
+@@ -524,6 +535,7 @@
+                 applied: ticks > pressing::CYCLE / 2 || nbt.get_int("Applied") == Some(1),
+             };
+             readings.press_finished = nbt.get_bool("Finished").unwrap_or(false);
++            readings.press_basin = nbt.get_int("Mode") == Some(PressMode::Basin as i32);
+         }
+         if id == pipe::VALVE
+             && let Some(tag) = nbt.get_compound("Pointer")
+@@ -589,6 +601,12 @@
+                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                 .write_nbt(tag);
+         }
++        if let Some(mixer) = &self.mixer {
++            mixer
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .write(tag);
++        }
+         if self.id == fan::ID {
+             tag.put(
+                 fan::TAG,
+@@ -602,7 +620,14 @@
+             tag.put_int("Ticks", readings.press.ticks);
+             tag.put_int("Applied", i32::from(readings.press.applied));
+             tag.put_bool("Finished", readings.press_finished);
+-            tag.put_int("Mode", PressMode::Belt as i32);
++            tag.put_int(
++                "Mode",
++                if readings.press_basin {
++                    PressMode::Basin
++                } else {
++                    PressMode::Belt
++                } as i32,
++            );
+         }
+         if let Some([value, target, speed]) = readings.valve {
+             let mut pointer = NbtCompound::new();
+@@ -896,6 +921,12 @@
+                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                 .tick_world(world, self.position, state, next.rpm)
+         });
++        let mixed = self.mixer.as_ref().is_some_and(|mixer| {
++            mixer
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .tick(world, self.position, next.rpm)
++        });
+         let (changed, changed_signal) = {
+             let mut readings = self
+                 .readings
+@@ -909,7 +940,14 @@
+             let mut press_changed = false;
+             if self.id == press::ID {
+                 let mut cycle = readings.press;
+-                let action = press::tick(&mut cycle, world, self.position, next.rpm);
++                next.press_basin = readings.press_basin;
++                let action = press::tick(
++                    &mut cycle,
++                    &mut next.press_basin,
++                    world,
++                    self.position,
++                    next.rpm,
++                );
+                 next.press = cycle;
+                 next.press_finished = readings.press_finished || action == Action::Finished;
+                 press_changed = action != Action::None;
+@@ -919,7 +957,7 @@
+             *readings = next;
+             (changed || press_changed, changed_signal)
+         };
+-        if (changed || built || worked || processed)
++        if (changed || built || worked || processed || mixed)
+             && let Some(entity) = world.get_block_entity(&self.position)
+             && entity
+                 .as_any()
+diff --git a/crates/pumpkin-core/src/block/entities/create_mixer.rs b/crates/pumpkin-core/src/block/entities/create_mixer.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_mixer.rs
+@@ -0,0 +1,245 @@
++use std::sync::{Arc, OnceLock};
++
++use create_engine::{basin as rules, burner::Heat as BurnerHeat};
++use pumpkin_data::{item::Item, item_stack::ItemStack};
++use pumpkin_nbt::compound::NbtCompound;
++use pumpkin_util::math::position::BlockPos;
++use serde::Deserialize;
++
++use super::{
++    BlockEntity,
++    create_basin::{BasinItemKey, CreateBasinBlockEntity, basin_item},
++};
++use crate::{
++    block::blocks::{create_burner, create_pipe::property},
++    world::World,
++};
++
++pub(super) const ID: &str = "create:mechanical_mixer";
++
++#[derive(Deserialize)]
++struct Rows {
++    mixing: Vec<Row>,
++    compacting: Vec<Row>,
++}
++#[derive(Deserialize)]
++struct Row {
++    ingredients: Vec<Vec<String>>,
++    results: Vec<Output>,
++    #[serde(default)]
++    heat_requirement: String,
++    #[serde(default)]
++    processing_time: i32,
++}
++#[derive(Deserialize)]
++struct Output {
++    id: String,
++    #[serde(default = "one")]
++    count: u8,
++    #[serde(default = "certain")]
++    chance: f32,
++}
++fn one() -> u8 {
++    1
++}
++fn certain() -> f32 {
++    1.0
++}
++
++pub(super) struct Recipe {
++    inputs: Vec<Vec<u16>>,
++    core: rules::Recipe<BasinItemKey, ()>,
++}
++struct Match<'a>(&'a [Vec<u16>]);
++impl rules::Context<BasinItemKey, ()> for Match<'_> {
++    fn item_matches(&mut self, ingredient: usize, stack: &rules::Item<BasinItemKey>) -> bool {
++        self.0[ingredient].contains(&stack.key.0.get_item().id)
++    }
++    fn fluid_matches(&mut self, _: usize, _: &rules::Fluid<()>) -> bool {
++        false
++    }
++    fn random(&mut self) -> f32 {
++        rand::random()
++    }
++}
++
++fn convert(row: Row) -> Recipe {
++    let item = |key: &str| Item::from_registry_key(key).expect("pinned basin item");
++    let inputs = row
++        .ingredients
++        .iter()
++        .map(|keys| keys.iter().map(|key| item(key).id).collect())
++        .collect();
++    let core = rules::Recipe {
++        kind: rules::RecipeKind::Basin,
++        item_ingredients: row.ingredients.len(),
++        fluid_amounts: vec![],
++        outputs: row
++            .results
++            .into_iter()
++            .map(|output| rules::Roll {
++                stack: basin_item(ItemStack::new(output.count, item(&output.id))),
++                chance: output.chance,
++            })
++            .collect(),
++        fluid_outputs: vec![],
++        heat: match row.heat_requirement.as_str() {
++            "" | "none" => rules::HeatRequirement::None,
++            "heated" => rules::HeatRequirement::Heated,
++            "superheated" => rules::HeatRequirement::Superheated,
++            _ => panic!("unknown pinned basin heat requirement"),
++        },
++        duration: row.processing_time,
++    };
++    Recipe { inputs, core }
++}
++
++pub(super) fn recipes(press: bool) -> &'static [Recipe] {
++    static RECIPES: OnceLock<(Vec<Recipe>, Vec<Recipe>)> = OnceLock::new();
++    let (mix, compact) = RECIPES.get_or_init(|| {
++        let rows: Rows = serde_json::from_str(include_str!(
++            "../../../../../assets/nextmc-create-basin.json"
++        ))
++        .expect("pinned item-only Create basin recipes");
++        (
++            rows.mixing.into_iter().map(convert).collect(),
++            rows.compacting.into_iter().map(convert).collect(),
++        )
++    });
++    if press { compact } else { mix }
++}
++
++pub(super) fn basin(world: &World, operator: BlockPos) -> Option<Arc<dyn BlockEntity>> {
++    let pos = operator.down().down();
++    let state = world.get_block_state_id_if_loaded(&pos)?;
++    // shortcut: only the internal output mode is represented; do not take items from a side-spout setup.
++    if state.to_block().name != "create:basin" || property(state, "facing") != Some("down") {
++        return None;
++    }
++    world.get_block_entity(&pos)
++}
++
++fn heat(world: &World, basin: BlockPos) -> rules::Heat {
++    match world
++        .get_block_state_id_if_loaded(&basin.down())
++        .and_then(create_burner::heat)
++    {
++        None | Some(BurnerHeat::None) => rules::Heat::None,
++        Some(BurnerHeat::Smouldering) => rules::Heat::Smouldering,
++        Some(BurnerHeat::Fading) => rules::Heat::Fading,
++        Some(BurnerHeat::Kindled) => rules::Heat::Kindled,
++        Some(BurnerHeat::Seething) => rules::Heat::Seething,
++    }
++}
++
++impl Recipe {
++    pub(super) fn matches(&self, entity: &dyn BlockEntity, world: &World) -> bool {
++        entity
++            .as_any()
++            .downcast_ref::<CreateBasinBlockEntity>()
++            .is_some_and(|basin| {
++                basin.matches_item_recipe(
++                    &self.core,
++                    heat(world, basin.position),
++                    &mut Match(&self.inputs),
++                )
++            })
++    }
++    pub(super) fn apply(&self, entity: &Arc<dyn BlockEntity>, world: &World) -> bool {
++        let Some(basin) = entity.as_any().downcast_ref::<CreateBasinBlockEntity>() else {
++            return false;
++        };
++        let report = basin.apply_item_recipe(
++            &self.core,
++            heat(world, basin.position),
++            &mut Match(&self.inputs),
++        );
++        if report.changed() {
++            world.update_block_entity(entity);
++        }
++        report.outcome == rules::Outcome::Applied
++    }
++}
++
++#[derive(Default)]
++pub(super) struct Mixer {
++    cycle: rules::Mixer,
++    recipe: Option<usize>,
++}
++impl Mixer {
++    pub(super) fn read(nbt: &NbtCompound) -> Self {
++        let recipe = nbt
++            .get_int("NextMCRecipe")
++            .and_then(|i| usize::try_from(i).ok())
++            .filter(|&i| i < recipes(false).len());
++        Self {
++            cycle: rules::Mixer {
++                running: nbt.get_bool("Running") == Some(true) && recipe.is_some(),
++                ticks: nbt.get_int("Ticks").unwrap_or_default().clamp(0, 40),
++                processing_ticks: nbt
++                    .get_int("NextMCProcessingTicks")
++                    .unwrap_or(-1)
++                    .clamp(-1, 1200),
++            },
++            recipe,
++        }
++    }
++
++    pub(super) fn write(&self, nbt: &mut NbtCompound) {
++        nbt.put_bool("Running", self.cycle.running);
++        nbt.put_int("Ticks", self.cycle.ticks);
++        nbt.put_bool("NeedsUpdate", false);
++        nbt.put_int("NextMCRecipe", self.recipe.map_or(-1, |i| i as i32));
++        nbt.put_int("NextMCProcessingTicks", self.cycle.processing_ticks);
++    }
++
++    pub(super) fn tick(&mut self, world: &World, pos: BlockPos, rpm: f32) -> bool {
++        let previous = self.cycle;
++        let basin = basin(world, pos);
++        let powered = rpm.abs() >= rules::DEFAULT_MIXER_MINIMUM_RPM;
++        let recipes = recipes(false);
++        match &basin {
++            None => self.cycle.basin_removed(),
++            Some(basin) if powered && !self.cycle.running => {
++                self.recipe = recipes
++                    .iter()
++                    .position(|recipe| recipe.matches(&**basin, world));
++                if self.recipe.is_some() {
++                    self.cycle.start();
++                    self.cycle.processing_ticks = -1;
++                }
++            }
++            _ => {}
++        }
++        let recipe = self.recipe.and_then(|i| recipes.get(i));
++        self.cycle.tick(
++            rpm,
++            rules::DEFAULT_MIXER_MINIMUM_RPM,
++            recipe.map_or(0, |r| r.core.duration),
++            || {
++                powered
++                    && recipe.zip(basin.as_ref()).is_some_and(|(r, basin)| {
++                        r.apply(basin, world) && r.matches(&**basin, world)
++                    })
++            },
++        );
++        self.cycle != previous
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn pinned_basin_recipes_decode_with_heat_and_duplicate_ingredients() {
++        assert_eq!(recipes(false).len(), 3);
++        assert_eq!(recipes(false)[2].core.heat, rules::HeatRequirement::Heated);
++        let [ice] = recipes(true) else {
++            panic!("expected compacted ice")
++        };
++        assert!(ice.inputs.len() > 1);
++        assert!(ice.inputs.iter().all(|ids| ids == &[Item::SNOW_BLOCK.id]));
++        assert_eq!(ice.core.outputs[0].stack.key.0.get_item().id, Item::ICE.id);
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/entities/create_press.rs b/crates/pumpkin-core/src/block/entities/create_press.rs
+--- a/crates/pumpkin-core/src/block/entities/create_press.rs
++++ b/crates/pumpkin-core/src/block/entities/create_press.rs
+@@ -5,7 +5,7 @@
+ use pumpkin_inventory::Inventory;
+ use pumpkin_util::math::position::BlockPos;
+ 
+-use super::create_depot::CreateDepotBlockEntity;
++use super::{create_depot::CreateDepotBlockEntity, create_mixer as mixer};
+ use crate::world::World;
+ 
+ pub(crate) const ID: &str = "create:mechanical_press";
+@@ -24,8 +24,14 @@
+     })
+ }
+ 
+-// shortcut: process the depot path first; loose entities, belts and basins need their own ownership hooks.
+-pub(super) fn tick(cycle: &mut PressCycle, world: &Arc<World>, pos: BlockPos, rpm: f32) -> Action {
++// shortcut: loose entities and belts need separate ownership hooks.
++pub(super) fn tick(
++    cycle: &mut PressCycle,
++    basin_mode: &mut bool,
++    world: &Arc<World>,
++    pos: BlockPos,
++    rpm: f32,
++) -> Action {
+     let gap = BlockPos::new(pos.0.x, pos.0.y - 1, pos.0.z);
+     let target = BlockPos::new(pos.0.x, pos.0.y - 2, pos.0.z);
+     let entity = world.get_block_entity(&target).filter(|_| {
+@@ -42,15 +48,32 @@
+             .downcast_ref::<CreateDepotBlockEntity>()
+             .filter(|depot| depot.is_supported())
+     });
++    let basin = entity.as_ref().and_then(|_| mixer::basin(world, pos));
++    let recipe = |basin: &Arc<dyn super::BlockEntity>| {
++        mixer::recipes(true)
++            .iter()
++            .find(|recipe| recipe.matches(&**basin, world))
++    };
++    let can_compact = !cycle.running && basin.as_ref().and_then(recipe).is_some();
+     let action = cycle.tick(
+         rpm,
+-        !cycle.running && depot.is_some_and(|d| result(&d.get_stack(0)).is_some()),
++        can_compact || (!cycle.running && depot.is_some_and(|d| result(&d.get_stack(0)).is_some())),
+     );
+-    if action == Action::Press
+-        && let (Some(depot), Some(entity)) = (depot, entity.as_ref())
+-        && process(depot)
+-    {
+-        world.update_block_entity(entity);
++    if action == Action::Started {
++        *basin_mode = can_compact;
++    }
++    if action == Action::Press {
++        if *basin_mode {
++            if let Some(basin) = &basin
++                && let Some(recipe) = recipe(basin)
++            {
++                recipe.apply(basin, world);
++            }
++        } else if let (Some(depot), Some(entity)) = (depot, entity.as_ref())
++            && process(depot)
++        {
++            world.update_block_entity(entity);
++        }
+     }
+     action
+ }
+diff --git a/crates/pumpkin-core/src/block/entities/mod.rs b/crates/pumpkin-core/src/block/entities/mod.rs
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -21,6 +21,7 @@
+ pub mod chiseled_bookshelf;
+ pub mod command_block;
+ pub mod comparator;
++pub(crate) mod create_basin;
+ pub(crate) mod create_chute;
+ pub(crate) mod create_crusher;
+ pub(crate) mod create_depot;
+@@ -30,6 +31,7 @@
+ pub(crate) mod create_fluid_tank;
+ pub(crate) mod create_kinetic;
+ pub(crate) mod create_millstone;
++mod create_mixer;
+ pub(crate) mod create_press;
+ mod create_saw_processing;
+ mod create_saw_tree;
+@@ -212,7 +214,14 @@
+         return Some(Arc::new(CreateBurner::from_nbt(nbt, pos)));
+     }
+     if crate::block::blocks::create_chassis::id(id).is_some() {
+-        return Some(Arc::new(crate::block::blocks::create_chassis::ChassisEntity::from_nbt(nbt, pos)));
++        return Some(Arc::new(
++            crate::block::blocks::create_chassis::ChassisEntity::from_nbt(nbt, pos),
++        ));
++    }
++    if id == "create:basin" {
++        return Some(Arc::new(create_basin::CreateBasinBlockEntity::from_nbt(
++            nbt, pos,
++        )));
+     }
+     if id == create_depot::CreateDepotBlockEntity::ID {
+         return Some(Arc::new(create_depot::CreateDepotBlockEntity::from_nbt(
+@@ -391,6 +400,7 @@
+ pub fn has_block_block_entity(block: &Block) -> bool {
+     BLOCK_ENTITY_TYPES.contains(&block.name)
+         || block.name == create_depot::CreateDepotBlockEntity::ID
++        || block.name == "create:basin"
+         || block.name == create_drain::ID
+         || block.name == crate::block::blocks::create_burner::ID
+         || matches!(
+@@ -425,7 +435,12 @@
+         return Some(Arc::new(create_kinetic::CreateKinetic::new(id, position)));
+     }
+     match *name {
+-        "blaze_burner" => Some(Arc::new(crate::block::blocks::create_burner::CreateBurner::new(position))),
++        "blaze_burner" => Some(Arc::new(
++            crate::block::blocks::create_burner::CreateBurner::new(position),
++        )),
++        "basin" => Some(Arc::new(create_basin::CreateBasinBlockEntity::new(
++            position,
++        ))),
+         "depot" => Some(Arc::new(create_depot::CreateDepotBlockEntity::new(
+             position,
+         ))),

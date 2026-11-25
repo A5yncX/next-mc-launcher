@@ -1,0 +1,262 @@
+diff --git a/crates/pumpkin-core/src/block/entities/mod.rs b/crates/pumpkin-core/src/block/entities/mod.rs
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -23,6 +23,7 @@
+ pub mod comparator;
+ pub(crate) mod create_depot;
+ pub(crate) mod create_kinetic;
++pub(crate) mod create_press;
+ pub(crate) use create_kinetic::set_create_wheel_material;
+ pub(crate) fn create_kinetic_node(
+     state: BlockStateId,
+diff --git a/crates/pumpkin-core/src/block/entities/create_press.rs b/crates/pumpkin-core/src/block/entities/create_press.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_press.rs
+@@ -0,0 +1,106 @@
++use std::sync::{Arc, PoisonError};
++
++use create_engine::pressing::{Action, PressCycle};
++use pumpkin_data::{item::Item, item_stack::ItemStack};
++use pumpkin_inventory::Inventory;
++use pumpkin_util::math::position::BlockPos;
++
++use super::create_depot::CreateDepotBlockEntity;
++use crate::world::World;
++
++pub(crate) const ID: &str = "create:mechanical_press";
++
++// shortcut: pinned recipes have singleton input tags, load recipe packs when custom processing is supported.
++fn result(stack: &ItemStack) -> Option<&'static Item> {
++    if stack.is_empty() {
++        return None;
++    }
++    Some(match stack.get_item().registry_key {
++        "iron_ingot" => &Item::CREATE_IRON_SHEET,
++        "gold_ingot" => &Item::CREATE_GOLDEN_SHEET,
++        "copper_ingot" => &Item::CREATE_COPPER_SHEET,
++        "create:brass_ingot" => &Item::CREATE_BRASS_SHEET,
++        _ => return None,
++    })
++}
++
++// shortcut: process the depot path first; loose entities, belts and basins need their own ownership hooks.
++pub(super) fn tick(cycle: &mut PressCycle, world: &Arc<World>, pos: BlockPos, rpm: f32) -> Action {
++    let gap = BlockPos::new(pos.0.x, pos.0.y - 1, pos.0.z);
++    let target = BlockPos::new(pos.0.x, pos.0.y - 2, pos.0.z);
++    let entity = world.get_block_entity(&target).filter(|_| {
++        world.get_block_state_id_if_loaded(&gap).is_some_and(|id| {
++            id.to_state()
++                .get_block_collision_shapes_at(&gap)
++                .next()
++                .is_none()
++        })
++    });
++    let depot = entity.as_ref().and_then(|entity| {
++        entity
++            .as_any()
++            .downcast_ref::<CreateDepotBlockEntity>()
++            .filter(|depot| depot.is_supported())
++    });
++    let action = cycle.tick(
++        rpm,
++        !cycle.running && depot.is_some_and(|d| result(&d.get_stack(0)).is_some()),
++    );
++    if action == Action::Press
++        && let (Some(depot), Some(entity)) = (depot, entity.as_ref())
++        && process(depot)
++    {
++        world.update_block_entity(entity);
++    }
++    action
++}
++
++fn process(depot: &CreateDepotBlockEntity) -> bool {
++    let mut items = depot.items.write().unwrap_or_else(PoisonError::into_inner);
++    let Some(result) = result(&items[0]) else {
++        return false;
++    };
++    let output = ItemStack::new(1, result);
++    if items[0].item_count == 1 {
++        items[0] = output;
++    } else {
++        let Some(slot) = items[1..].iter_mut().find(|slot| {
++            slot.is_empty()
++                || (slot.item_count < 64 && slot.are_items_and_components_equal(&output))
++        }) else {
++            return false;
++        };
++        if slot.is_empty() {
++            *slot = output;
++        } else {
++            slot.item_count += 1;
++        }
++        items[0].item_count -= 1;
++    }
++    depot.mark_dirty();
++    true
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_strike_converts_one_ingot_without_losing_items() {
++        let depot = CreateDepotBlockEntity::new(BlockPos::new(0, 0, 0));
++        depot.set_stack(0, ItemStack::new(2, &Item::IRON_INGOT));
++        for slot in 1..CreateDepotBlockEntity::INVENTORY_SIZE {
++            depot.set_stack(slot, ItemStack::new(64, &Item::STONE));
++        }
++        assert!(!process(&depot));
++        assert_eq!(depot.get_stack(0).item_count, 2);
++        depot.set_stack(1, ItemStack::EMPTY.clone());
++        assert!(process(&depot));
++        assert_eq!(depot.get_stack(0).get_item().id, Item::IRON_INGOT.id);
++        assert_eq!(depot.get_stack(0).item_count, 1);
++        assert_eq!(depot.get_stack(1).get_item().id, Item::CREATE_IRON_SHEET.id);
++        assert!(process(&depot));
++        assert_eq!(depot.get_stack(0).get_item().id, Item::CREATE_IRON_SHEET.id);
++        assert!(!process(&depot));
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -16,7 +16,7 @@
+ use pumpkin_util::{GameMode, math::position::BlockPos};
+ use pumpkin_world::world::BlockFlags;
+ 
+-use super::BlockEntity;
++use super::{BlockEntity, create_press as press};
+ use crate::{
+     block::blocks::{
+         create_chain as chain, create_water_wheel as wheel, redstone::block_receives_redstone_power,
+@@ -24,6 +24,7 @@
+     entity::{EntityBase, player::Player},
+     world::World,
+ };
++use create_engine::pressing::{self, Action, PressCycle, PressMode};
+ 
+ pub(super) const MOTOR: &str = "create:creative_motor";
+ pub(super) const SHAFT: &str = "create:shaft";
+@@ -44,6 +45,7 @@
+     SPEEDOMETER,
+     STRESSOMETER,
+     CRANK,
++    press::ID,
+     chain::DRIVE,
+     chain::ADJUSTABLE,
+     wheel::SMALL,
+@@ -155,6 +157,8 @@
+     gauge: Gauge,
+     crank: i8,
+     chain_signal: u8,
++    press: PressCycle,
++    press_finished: bool,
+ }
+ 
+ #[derive(Default, PartialEq)]
+@@ -366,11 +370,13 @@
+             .map(|p| p.value_str())
+     };
+     let gauge = matches!(id, SPEEDOMETER | STRESSOMETER);
+-    let value = get(if gauge || matches!(id, MOTOR | CRANK | wheel::SMALL) {
+-        "facing"
+-    } else {
+-        "axis"
+-    })?;
++    let value = get(
++        if gauge || matches!(id, MOTOR | CRANK | wheel::SMALL | press::ID) {
++            "facing"
++        } else {
++            "axis"
++        },
++    )?;
+     let axis = if gauge {
+         let facing = Direction::ALL.into_iter().find(|d| d.name() == value)?;
+         placement::gauge_axis(facing, get("axis_along_first")? == "true")
+@@ -413,6 +419,7 @@
+         COG => Kind::Cog { large: false },
+         "create:large_cogwheel" => Kind::Cog { large: true },
+         GEARBOX => Kind::Gearbox,
++        press::ID => Kind::Press,
+         wheel::SMALL | wheel::LARGE => Kind::WaterWheel {
+             rpm: 0.0,
+             capacity: if id == wheel::LARGE { 128.0 } else { 32.0 },
+@@ -444,6 +451,18 @@
+         if id != CRANK {
+             readings.rpm = nbt_speed(nbt, "Speed");
+         }
++        if id == press::ID {
++            let ticks = nbt
++                .get_int("Ticks")
++                .unwrap_or(0)
++                .clamp(0, pressing::CYCLE + 60);
++            readings.press = PressCycle {
++                running: nbt.get_bool("Running").unwrap_or(false),
++                ticks,
++                applied: ticks > pressing::CYCLE / 2 || nbt.get_int("Applied") == Some(1),
++            };
++            readings.press_finished = nbt.get_bool("Finished").unwrap_or(false);
++        }
+         if id == chain::ADJUSTABLE {
+             readings.chain_signal = nbt.get_int("Signal").unwrap_or(0).clamp(0, 15) as u8;
+         }
+@@ -491,6 +510,13 @@
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
+         tag.put_float("Speed", readings.rpm);
++        if self.id == press::ID {
++            tag.put_bool("Running", readings.press.running);
++            tag.put_int("Ticks", readings.press.ticks);
++            tag.put_int("Applied", i32::from(readings.press.applied));
++            tag.put_bool("Finished", readings.press_finished);
++            tag.put_int("Mode", PressMode::Belt as i32);
++        }
+         if self.id == chain::ADJUSTABLE {
+             tag.put_int("Signal", i32::from(readings.chain_signal));
+         }
+@@ -727,11 +753,20 @@
+             if !exhausted && matches!(self.id, SPEEDOMETER | STRESSOMETER) {
+                 next.gauge = Gauge::from_network(self.id, next.rpm, &network, readings.gauge.color);
+             }
+-            let changed = *readings != next;
++            // The client advances the press between update packets; only send cycle boundaries.
++            let changed = readings.rpm != next.rpm || (self.id != press::ID && *readings != next);
++            let mut press_changed = false;
++            if self.id == press::ID {
++                let mut cycle = readings.press;
++                let action = press::tick(&mut cycle, world, self.position, next.rpm);
++                next.press = cycle;
++                next.press_finished = readings.press_finished || action == Action::Finished;
++                press_changed = action != Action::None;
++            }
+             let changed_signal =
+                 visual::comparator(readings.gauge.dial) != visual::comparator(next.gauge.dial);
+             *readings = next;
+-            (changed, changed_signal)
++            (changed || press_changed, changed_signal)
+         };
+         if (changed || built)
+             && let Some(entity) = world.get_block_entity(&self.position)
+diff --git a/crates/pumpkin-core/src/block/registry.rs b/crates/pumpkin-core/src/block/registry.rs
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -1216,6 +1216,16 @@
+                 };
+                 Self::set_create_axis(placed_block, state_id, axis)
+             }
++            crate::block::entities::create_press::ID => {
++                let yaw = f64::from(player.get_entity().yaw.load());
++                let facing = [
++                    CreateDirection::North,
++                    CreateDirection::East,
++                    CreateDirection::South,
++                    CreateDirection::West,
++                ][((yaw / 90.0 + 0.5).floor() as i64 & 3) as usize];
++                Self::set_create_facing(placed_block, state_id, facing)
++            }
+             "create:hand_crank" => Self::set_create_facing(
+                 placed_block,
+                 state_id,

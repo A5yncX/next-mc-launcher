@@ -1,0 +1,432 @@
+diff --git a/crates/pumpkin-core/src/block/blocks/mod.rs b/crates/pumpkin-core/src/block/blocks/mod.rs
+--- a/crates/pumpkin-core/src/block/blocks/mod.rs
++++ b/crates/pumpkin-core/src/block/blocks/mod.rs
+@@ -121,6 +121,7 @@
+ pub(crate) mod create_chain;
+ pub(crate) mod create_depot;
+ pub(crate) mod create_drain;
++pub(crate) mod create_fluid_tank;
+ pub(crate) mod create_gauge;
+ pub(crate) mod create_hand_crank;
+ pub(crate) mod create_sail;
+diff --git a/crates/pumpkin-core/src/block/blocks/create_fluid_tank.rs b/crates/pumpkin-core/src/block/blocks/create_fluid_tank.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/blocks/create_fluid_tank.rs
+@@ -0,0 +1,115 @@
++use std::sync::Arc;
++
++use pumpkin_data::{data_component_impl::EquipmentSlot, item::Item, item_stack::ItemStack};
++use pumpkin_inventory::screen_handler::InventoryPlayer;
++use pumpkin_macros::pumpkin_block;
++use pumpkin_util::{GameMode, Hand};
++
++use crate::{
++    block::{
++        BlockActionResult, BlockBehaviour, GetComparatorOutputArgs, PlacedArgs, UseWithItemArgs,
++        entities::create_fluid_tank::CreateFluidTank,
++    },
++    entity::EntityBase,
++};
++
++#[pumpkin_block("create:fluid_tank")]
++pub struct FluidTank;
++
++pub(crate) fn handles_container(stack: &ItemStack) -> bool {
++    !stack.is_empty()
++        && [Item::BUCKET.id, Item::WATER_BUCKET.id, Item::LAVA_BUCKET.id]
++            .contains(&stack.get_item().id)
++}
++
++impl BlockBehaviour for FluidTank {
++    fn placed(&self, args: PlacedArgs<'_>) {
++        if args.world.get_block_entity(args.position).is_none() {
++            args.world
++                .add_block_entity(Arc::new(CreateFluidTank::new(*args.position)));
++        }
++    }
++
++    fn get_comparator_output(&self, args: GetComparatorOutputArgs<'_>) -> Option<u8> {
++        Some(
++            args.world
++                .get_block_entity(args.position)
++                .as_ref()
++                .and_then(|entity| entity.as_any().downcast_ref::<CreateFluidTank>())
++                .map_or(0, CreateFluidTank::signal),
++        )
++    }
++
++    fn use_with_item(&self, args: UseWithItemArgs<'_>) -> BlockActionResult {
++        let mode = args.player.gamemode.load();
++        if args.player.get_entity().is_sneaking()
++            || !matches!(
++                mode,
++                GameMode::Survival | GameMode::Creative | GameMode::Adventure
++            )
++            || args
++                .world
++                .is_in_spawn_protection(args.player, args.position)
++        {
++            return BlockActionResult::PassToDefaultBlockAction;
++        }
++        if !handles_container(args.item_stack) {
++            return BlockActionResult::PassToDefaultBlockAction;
++        }
++        let item_id = args.item_stack.get_item().id;
++        let Some(entity) = args.world.get_block_entity(args.position) else {
++            return BlockActionResult::SuccessServer;
++        };
++        let Some(tank) = entity.as_any().downcast_ref::<CreateFluidTank>() else {
++            return BlockActionResult::SuccessServer;
++        };
++
++        let output = match item_id {
++            id if id == Item::WATER_BUCKET.id => {
++                tank.pour("minecraft:water", 1000).then_some(&Item::BUCKET)
++            }
++            id if id == Item::LAVA_BUCKET.id => {
++                tank.pour("minecraft:lava", 1000).then_some(&Item::BUCKET)
++            }
++            id if id == Item::BUCKET.id => tank.take_bucket().map(|fluid| {
++                if fluid == "minecraft:water" {
++                    &Item::WATER_BUCKET
++                } else {
++                    &Item::LAVA_BUCKET
++                }
++            }),
++            _ => return BlockActionResult::PassToDefaultBlockAction,
++        };
++        let Some(output) = output else {
++            return BlockActionResult::SuccessServer;
++        };
++
++        if mode != GameMode::Creative {
++            let mut container = ItemStack::new(1, output);
++            if args.item_stack.item_count == 1 {
++                *args.item_stack = container;
++            } else {
++                args.item_stack.decrement(1);
++                args.player
++                    .get_inventory()
++                    .insert_stack_anywhere(&mut container);
++                if !container.is_empty() {
++                    args.world.drop_stack(args.position, container);
++                }
++            }
++            let hand = if *args.equipment_slot == EquipmentSlot::OFF_HAND {
++                Hand::Left
++            } else {
++                Hand::Right
++            };
++            args.player
++                .get_inventory()
++                .set_stack_in_hand(hand, args.item_stack.clone());
++            args.player.sync_inventory_to_client();
++        }
++        args.world.update_block_entity(&entity);
++        args.world
++            .update_neighbour_for_output_signal(args.position, args.block);
++        BlockActionResult::SuccessServer
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/entities/mod.rs b/crates/pumpkin-core/src/block/entities/mod.rs
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -23,6 +23,7 @@
+ pub mod comparator;
+ pub(crate) mod create_depot;
+ pub(crate) mod create_drain;
++pub(crate) mod create_fluid_tank;
+ pub(crate) mod create_kinetic;
+ pub(crate) mod create_press;
+ pub(crate) use create_kinetic::set_create_wheel_material;
+@@ -207,6 +208,11 @@
+     if id == create_drain::ID {
+         return Some(Arc::new(create_drain::CreateDrain::from_nbt(nbt, pos)));
+     }
++    if id == create_fluid_tank::ID {
++        return Some(Arc::new(create_fluid_tank::CreateFluidTank::from_nbt(
++            nbt, pos,
++        )));
++    }
+     if create_kinetic::kinetic_id(id).is_some() {
+         return Some(Arc::new(create_kinetic::CreateKinetic::from_nbt(nbt, pos)));
+     }
+@@ -357,6 +363,7 @@
+     BLOCK_ENTITY_TYPES.contains(&block.name)
+         || block.name == create_depot::CreateDepotBlockEntity::ID
+         || block.name == create_drain::ID
++        || block.name == create_fluid_tank::ID
+         || is_create_kinetic_block(block)
+ }
+ 
+@@ -379,6 +386,7 @@
+             position,
+         ))),
+         "item_drain" => Some(Arc::new(create_drain::CreateDrain::new(position))),
++        "fluid_tank" => Some(Arc::new(create_fluid_tank::CreateFluidTank::new(position))),
+         "furnace" => Some(Arc::new(furnace::FurnaceBlockEntity::new(position))),
+         "chest" => Some(Arc::new(chest::ChestBlockEntity::new(position))),
+         "trapped_chest" => Some(Arc::new(trapped_chest::TrappedChestBlockEntity::new(
+diff --git a/crates/pumpkin-core/src/block/entities/create_fluid_tank.rs b/crates/pumpkin-core/src/block/entities/create_fluid_tank.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_fluid_tank.rs
+@@ -0,0 +1,221 @@
++use std::{
++    any::Any,
++    sync::{
++        Mutex, PoisonError,
++        atomic::{AtomicBool, Ordering},
++    },
++};
++
++use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
++use pumpkin_util::math::position::BlockPos;
++
++use super::BlockEntity;
++
++pub(crate) const ID: &str = "create:fluid_tank";
++// shortcut: single-block/manual only; add network aggregation with Create pipe integration.
++const CAPACITY: i32 = create_engine::fluid_tank::BLOCK_CAPACITY as i32;
++const BUCKET_VOLUME: i32 = 1000;
++
++pub(crate) struct CreateFluidTank {
++    position: BlockPos,
++    nbt: Mutex<NbtCompound>,
++    dirty: AtomicBool,
++}
++
++impl CreateFluidTank {
++    pub fn new(position: BlockPos) -> Self {
++        let mut nbt = NbtCompound::new();
++        let mut boiler = NbtCompound::new();
++        for key in ["ActiveHeat", "Engines", "Whistles"] {
++            boiler.put_int(key, 0);
++        }
++        for key in ["PassiveHeat", "Update"] {
++            boiler.put_byte(key, 0);
++        }
++        boiler.put_float("Supply", 0.0);
++        nbt.put_compound("Boiler", boiler);
++        nbt.put_int("Height", 1);
++        nbt.put_int("Size", 1);
++        nbt.put_int("Luminosity", 0);
++        nbt.put_byte("Window", 1);
++        write_tank(&mut nbt, "minecraft:water", 0);
++        Self::from_nbt(&nbt, position)
++    }
++
++    pub fn pour(&self, id: &str, amount: i32) -> bool {
++        let mut nbt = self.nbt.lock().unwrap_or_else(PoisonError::into_inner);
++        let Some((old_fluid, old_amount)) = tank_contents(&nbt) else {
++            return false;
++        };
++        if !matches!(id, "minecraft:water" | "minecraft:lava")
++            || amount <= 0
++            || amount > CAPACITY - old_amount
++            || (old_amount > 0 && old_fluid != id)
++        {
++            return false;
++        }
++        write_tank(&mut nbt, id, old_amount + amount);
++        self.dirty.store(true, Ordering::Relaxed);
++        true
++    }
++
++    pub fn take_bucket(&self) -> Option<&'static str> {
++        let mut nbt = self.nbt.lock().unwrap_or_else(PoisonError::into_inner);
++        let (fluid, amount) = tank_contents(&nbt)?;
++        if amount < BUCKET_VOLUME {
++            return None;
++        }
++        let fluid = match fluid {
++            "minecraft:water" => "minecraft:water",
++            "minecraft:lava" => "minecraft:lava",
++            _ => return None,
++        };
++        write_tank(&mut nbt, fluid, amount - BUCKET_VOLUME);
++        self.dirty.store(true, Ordering::Relaxed);
++        Some(fluid)
++    }
++
++    pub fn signal(&self) -> u8 {
++        let nbt = self.nbt.lock().unwrap_or_else(PoisonError::into_inner);
++        tank_contents(&nbt).map_or(0, |(_, amount)| {
++            (14 * amount / CAPACITY + i32::from(amount > 0)) as u8
++        })
++    }
++}
++
++fn tank_contents(nbt: &NbtCompound) -> Option<(&str, i32)> {
++    let boiler = nbt.get_compound("Boiler")?;
++    if nbt
++        .get("Controller")
++        .is_some_and(|controller| !matches!(controller, NbtTag::IntArray(root) if root.is_empty()))
++        || nbt.get_int("Size") != Some(1)
++        || nbt.get_int("Height") != Some(1)
++        || boiler.get_int("Engines") != Some(0)
++        || boiler.get_int("Whistles") != Some(0)
++    {
++        return None;
++    }
++    let content = nbt.get_compound("TankContent")?;
++    if content.child_tags.is_empty() {
++        return Some(("minecraft:water", 0));
++    }
++    let fluid = content.get_compound("Fluid")?;
++    let id = fluid.get_string("id")?;
++    let amount = fluid.get_int("amount")?;
++    (matches!(id, "minecraft:water" | "minecraft:lava")
++        && (1..=CAPACITY).contains(&amount)
++        && content.child_tags.len() == 1
++        && fluid.child_tags.len() == 2)
++        .then_some((id, amount))
++}
++
++fn write_tank(nbt: &mut NbtCompound, id: &str, amount: i32) {
++    let mut content = NbtCompound::new();
++    if amount > 0 {
++        let mut fluid = NbtCompound::new();
++        fluid.put_string("id", id.into());
++        fluid.put_int("amount", amount);
++        content.put_compound("Fluid", fluid);
++    }
++    nbt.put_compound("TankContent", content);
++}
++
++impl BlockEntity for CreateFluidTank {
++    fn resource_location(&self) -> &'static str {
++        ID
++    }
++
++    fn get_position(&self) -> BlockPos {
++        self.position
++    }
++
++    fn from_nbt(nbt: &NbtCompound, position: BlockPos) -> Self {
++        let mut nbt = nbt.clone();
++        for key in ["id", "x", "y", "z"] {
++            nbt.child_tags.remove(key);
++        }
++        Self {
++            position,
++            nbt: Mutex::new(nbt),
++            dirty: AtomicBool::new(false),
++        }
++    }
++
++    fn write_nbt(&self, nbt: &mut NbtCompound) {
++        let current = self.nbt.lock().unwrap_or_else(PoisonError::into_inner);
++        nbt.child_tags.extend(current.child_tags.clone());
++    }
++
++    fn chunk_data_nbt(&self) -> Option<NbtCompound> {
++        let mut tag = self
++            .nbt
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .clone();
++        tag.put_int("create_horizon_tank_capacity", CAPACITY);
++        if !tag.child_tags.contains_key("Controller") {
++            tag.put("Controller", NbtTag::IntArray(Vec::new()));
++        }
++        Some(tag)
++    }
++
++    fn is_dirty(&self) -> bool {
++        self.dirty.load(Ordering::Relaxed)
++    }
++
++    fn clear_dirty(&self) {
++        self.dirty.store(false, Ordering::Relaxed);
++    }
++
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn bucket_transfers_conserve_fluid_across_saved_nbt() {
++        let position = BlockPos::new(0, 0, 0);
++        let tank = CreateFluidTank::new(position);
++        assert!(tank.pour("minecraft:water", 1000));
++        assert!(tank.pour("minecraft:water", 1000));
++
++        let update = tank.chunk_data_nbt().unwrap();
++        assert_eq!(
++            update.get_int("create_horizon_tank_capacity"),
++            Some(CAPACITY)
++        );
++        assert!(
++            matches!(update.child_tags.get("Controller"), Some(NbtTag::IntArray(root)) if root.is_empty())
++        );
++        let mut saved = NbtCompound::new();
++        tank.write_nbt(&mut saved);
++        let tank = CreateFluidTank::from_nbt(&saved, position);
++        assert_eq!(tank.take_bucket(), Some("minecraft:water"));
++        assert_eq!(tank.take_bucket(), Some("minecraft:water"));
++        assert_eq!(tank.take_bucket(), None);
++        assert_eq!(
++            tank_contents(&tank.nbt.lock().unwrap()),
++            Some(("minecraft:water", 0))
++        );
++    }
++
++    #[test]
++    fn capacity_and_fluid_identity_reject_overflow_and_mixing() {
++        let tank = CreateFluidTank::new(BlockPos::new(0, 0, 0));
++        for _ in 0..8 {
++            assert!(tank.pour("minecraft:lava", 1000));
++        }
++
++        assert!(!tank.pour("minecraft:lava", 1));
++        assert!(!tank.pour("minecraft:water", 1000));
++        assert_eq!(tank.signal(), 15);
++        assert_eq!(
++            tank_contents(&tank.nbt.lock().unwrap()),
++            Some(("minecraft:lava", 8000))
++        );
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/registry.rs b/crates/pumpkin-core/src/block/registry.rs
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -257,6 +257,7 @@
+     manager.register(crate::block::blocks::create_chain::AdjustableChainGearshift);
+     manager.register(crate::block::blocks::create_depot::CreateDepotBlock);
+     manager.register(crate::block::blocks::create_drain::ItemDrain);
++    manager.register(crate::block::blocks::create_fluid_tank::FluidTank);
+     manager.register(crate::block::blocks::create_sail::CreateSail);
+     manager.register(crate::block::blocks::create_gauge::CreateSpeedometer);
+     manager.register(crate::block::blocks::create_gauge::CreateStressometer);
+diff --git a/crates/pumpkin-core/src/net/java/play/use_item.rs b/crates/pumpkin-core/src/net/java/play/use_item.rs
+--- a/crates/pumpkin-core/src/net/java/play/use_item.rs
++++ b/crates/pumpkin-core/src/net/java/play/use_item.rs
+@@ -48,6 +48,21 @@
+             pumpkin_world::clip::ClipBlock::Outline,
+             pumpkin_world::clip::ClipFluid::None,
+         ));
++
++        // The tank handles buckets through UseItemOn. Horizon can follow with UseItem
++        // when it doesn't predict a tank interaction (e.g. Survival); don't place that fluid.
++        if !hit.is_miss
++            && !player.get_entity().is_sneaking()
++            && matches!(
++                player.gamemode.load(),
++                GameMode::Survival | GameMode::Creative | GameMode::Adventure
++            )
++            && crate::block::blocks::create_fluid_tank::handles_container(&item_in_hand)
++            && player.world().get_block(&hit.block_pos).name
++                == crate::block::entities::create_fluid_tank::ID
++        {
++            return;
++        }
+ 
+         let event = if hit.is_miss {
+             PlayerInteractEvent::new(player, InteractAction::RightClickAir, &Block::AIR, None)

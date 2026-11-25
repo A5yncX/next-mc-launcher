@@ -1,0 +1,106 @@
+diff --git a/crates/pumpkin-world/src/chunk/mod.rs b/crates/pumpkin-world/src/chunk/mod.rs
+--- a/crates/pumpkin-world/src/chunk/mod.rs
++++ b/crates/pumpkin-world/src/chunk/mod.rs
+@@ -706,6 +706,36 @@
+         &self,
+         updates: impl IntoIterator<Item = (usize, i32, usize, BlockStateId)>,
+     ) -> Vec<(usize, i32, usize, BlockStateId)> {
++        self.set_blocks_batch_checked(updates, &[])
++            .expect("unchecked batch")
++    }
++
++    /// Compare every preimage under the same palette write lock before changing any block.
++    /// Only covers one chunk's blocks; moving-structure records need a separate storage transaction.
++    pub fn compare_set_blocks(
++        &self,
++        edits: &[(usize, i32, usize, BlockStateId, BlockStateId)],
++    ) -> Option<Vec<(usize, i32, usize, BlockStateId)>> {
++        let mut unique = FxHashSet::default();
++        if !edits
++            .iter()
++            .all(|&(x, y, z, _, _)| unique.insert((x, y, z)))
++        {
++            return None;
++        }
++        let expected: Vec<_> = edits
++            .iter()
++            .map(|&(x, y, z, before, _)| (x, y, z, before))
++            .collect();
++        let updates = edits.iter().map(|&(x, y, z, _, after)| (x, y, z, after));
++        self.set_blocks_batch_checked(updates, &expected)
++    }
++
++    fn set_blocks_batch_checked(
++        &self,
++        updates: impl IntoIterator<Item = (usize, i32, usize, BlockStateId)>,
++        expected: &[(usize, i32, usize, BlockStateId)],
++    ) -> Option<Vec<(usize, i32, usize, BlockStateId)>> {
+         let min_y = self.section.min_y;
+         let mut results = Vec::new();
+ 
+@@ -714,6 +744,16 @@
+             .block_sections
+             .write()
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
++        for &(x, y, z, before) in expected {
++            if x >= BlockPalette::SIZE || z >= BlockPalette::SIZE {
++                return None;
++            }
++            let y = usize::try_from(y.checked_sub(min_y)?).ok()?;
++            let section = sections.get(y / BlockPalette::SIZE)?;
++            if section.get(x, y % BlockPalette::SIZE, z) != before {
++                return None;
++            }
++        }
+         let mut random_tick_sections_guard = self
+             .section
+             .random_tick_sections
+@@ -804,7 +844,7 @@
+             }
+         }
+ 
+-        results
++        Some(results)
+     }
+ 
+     fn update_heightmap(
+@@ -1074,6 +1114,39 @@
+     }
+ 
+     #[test]
++    fn guarded_batch_changes_every_block_or_none() {
++        let chunk = super::ChunkData::empty(0, 0);
++        let air = Block::AIR.default_state.id;
++        let stone = Block::STONE.default_state.id;
++        let dirt = Block::DIRT.default_state.id;
++        chunk.set_block_absolute_y(1, 0, 1, stone);
++        let edits = [(1, 0, 1, stone, air), (1, 16, 1, air, stone)];
++        assert!(
++            chunk
++                .compare_set_blocks(&[edits[0], (1, 16, 1, dirt, stone)])
++                .is_none()
++        );
++        assert!(
++            chunk
++                .compare_set_blocks(&[edits[0], (16, 16, 1, air, stone)])
++                .is_none()
++        );
++        assert!(
++            chunk
++                .compare_set_blocks(&[edits[0], (1, i32::MIN, 1, air, stone)])
++                .is_none()
++        );
++        assert!(chunk.compare_set_blocks(&[edits[0], edits[0]]).is_none());
++        assert_eq!(
++            chunk.compare_set_blocks(&edits).unwrap(),
++            [(1, 0, 1, stone), (1, 16, 1, air)]
++        );
++        assert!(chunk.compare_set_blocks(&edits).is_none());
++        assert_eq!(chunk.section.get_block_absolute_y(1, 0, 1), Some(air));
++        assert_eq!(chunk.section.get_block_absolute_y(1, 16, 1), Some(stone));
++    }
++
++    #[test]
+     fn chunk_custom_data() {
+         use pumpkin_nbt::tag::NbtTag;
+ 

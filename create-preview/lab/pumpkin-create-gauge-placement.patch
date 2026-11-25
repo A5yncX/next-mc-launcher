@@ -1,0 +1,22 @@
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -1057,13 +1057,18 @@
+             );
+         }
+         if let PlacementMode::Create(assist) = mode {
++            // The gauge helper looks for the support opposite the actual hit face.
++            let create_face = match placed_block.name {
++                "create:speedometer" | "create:stressometer" => face,
++                _ => final_face,
++            };
+             new_state = self.create_placement_state(
+                 placed_block,
+                 new_state,
+                 player,
+                 &world,
+                 final_block_pos,
+-                final_face,
++                create_face,
+                 assist,
+             );
+             use crate::block::{

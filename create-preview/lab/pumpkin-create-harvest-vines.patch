@@ -1,0 +1,145 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_harvester.rs b/crates/pumpkin-core/src/block/entities/create_harvester.rs
+--- a/crates/pumpkin-core/src/block/entities/create_harvester.rs
++++ b/crates/pumpkin-core/src/block/entities/create_harvester.rs
+@@ -191,7 +191,7 @@
+         leaves,
+         ..Default::default()
+     };
+-    if block == &Block::SUGAR_CANE {
++    let age = |mature_value| {
+         let props = block.properties(state)?.to_props();
+         let value = props
+             .iter()
+@@ -199,26 +199,45 @@
+             .value_str()
+             .parse()
+             .ok()?;
+-        input.generic_age = Some(Age {
++        Some(Age {
+             value,
+-            mature_value: 15,
+-        });
+-        input.plant = Plant::SugarCane;
+-        input.sugar_cane_variant = true;
+-        input.collision_empty = true;
+-    } else if matches!(
+-        block.name,
+-        "dandelion" | "poppy" | "oak_sapling" | "birch_sapling"
+-    ) {
+-        input.plant = Plant::BushOrSpecialPlantable;
+-        input.collision_empty = true;
+-    } else if !leaves {
+-        return None;
+-    }
+-    Some((
+-        harvester::plan(input, Rules::default())?,
+-        Item::from_registry_key(block.name)?,
+-    ))
++            mature_value,
++        })
++    };
++    let seed = match block.name {
++        "sugar_cane" => {
++            input.generic_age = age(15);
++            input.plant = Plant::SugarCane;
++            input.sugar_cane_variant = true;
++            &Item::SUGAR_CANE
++        }
++        "dandelion" | "poppy" | "oak_sapling" | "birch_sapling" => {
++            input.plant = Plant::BushOrSpecialPlantable;
++            Item::from_registry_key(block.name)?
++        }
++        _ if leaves => Item::from_registry_key(block.name)?,
++        name => {
++            input.generic_age = age(25);
++            input.plant = Plant::GrowingPlant;
++            match name {
++                "kelp" | "kelp_plant" => &Item::KELP,
++                "twisting_vines" | "twisting_vines_plant" => &Item::TWISTING_VINES,
++                "weeping_vines" | "weeping_vines_plant" => &Item::WEEPING_VINES,
++                "cave_vines" | "cave_vines_plant" => &Item::GLOW_BERRIES,
++                _ => return None,
++            }
++        }
++    };
++    input.collision_empty = !leaves;
++    Some((harvester::plan(input, Rules::default())?, seed))
++}
++
++fn cut_replacement(state: BlockStateId) -> BlockStateId {
++    if state.is_waterlogged() || matches!(state.to_block().name, "kelp" | "kelp_plant") {
++        Block::WATER.default_state.id
++    } else {
++        Block::AIR.default_state.id
++    }
+ }
+ 
+ pub(super) fn harvest_crop(world: &Arc<World>, pos: BlockPos) {
+@@ -232,15 +251,10 @@
+         return;
+     };
+     if harvest.replacement == Replacement::FluidOrAir {
+-        let replacement = if original_state.is_waterlogged() {
+-            &Block::WATER
+-        } else {
+-            &Block::AIR
+-        };
+         if world
+             .set_block_state_if(
+                 &pos,
+-                replacement.default_state.id,
++                cut_replacement(original_state),
+                 BlockFlags::NOTIFY_ALL,
+                 |current| current == original_state,
+             )
+@@ -436,6 +450,50 @@
+             .reserve_seed
+         );
+         assert!(crop(Block::CACTUS.default_state.id).is_none());
++    }
++
++    #[test]
++    fn growing_plants_resolve_body_items_and_leave_their_fluid() {
++        for (head, body, seed, wet) in [
++            (&Block::KELP, &Block::KELP_PLANT, &Item::KELP, true),
++            (
++                &Block::WEEPING_VINES,
++                &Block::WEEPING_VINES_PLANT,
++                &Item::WEEPING_VINES,
++                false,
++            ),
++            (
++                &Block::TWISTING_VINES,
++                &Block::TWISTING_VINES_PLANT,
++                &Item::TWISTING_VINES,
++                false,
++            ),
++            (
++                &Block::CAVE_VINES,
++                &Block::CAVE_VINES_PLANT,
++                &Item::GLOW_BERRIES,
++                false,
++            ),
++        ] {
++            for block in [head, body] {
++                let state = block.default_state.id;
++                let (cut, item) = crop(state).unwrap();
++                assert_eq!(item.id, seed.id);
++                assert_eq!(cut.replacement, Replacement::FluidOrAir);
++                assert_eq!(
++                    cut_replacement(state),
++                    if wet { &Block::WATER } else { &Block::AIR }
++                        .default_state
++                        .id
++                );
++            }
++            assert!(
++                crop(with_property(head.default_state.id, "age", "25"))
++                    .unwrap()
++                    .0
++                    .reserve_seed
++            );
++        }
+     }
+ 
+     #[test]

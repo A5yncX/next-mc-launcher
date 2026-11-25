@@ -1,0 +1,159 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_harvester.rs b/crates/pumpkin-core/src/block/entities/create_harvester.rs
+--- a/crates/pumpkin-core/src/block/entities/create_harvester.rs
++++ b/crates/pumpkin-core/src/block/entities/create_harvester.rs
+@@ -6,7 +6,9 @@
+         Rotation,
+         actors::{
+             MotionState, MotionTracker, Sample, Tool,
+-            harvester::{self, Age, Block as HarvesterBlock, Harvest, Plant, Replacement, Rules},
++            harvester::{
++                self, Age, Block as HarvesterBlock, Harvest, LootTool, Plant, Replacement, Rules,
++            },
+         },
+     },
+     kinetics::{Axis, Pos},
+@@ -21,6 +23,7 @@
+ };
+ use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
+ use pumpkin_util::math::position::BlockPos;
++use pumpkin_world::world::BlockFlags;
+ 
+ use crate::{
+     block::blocks::{
+@@ -151,7 +154,7 @@
+         "nether_wart" => (3, &Item::NETHER_WART),
+         "sweet_berry_bush" => (3, &Item::SWEET_BERRIES),
+         "cocoa" => (2, &Item::COCOA_BEANS),
+-        _ => return None,
++        _ => return plant_cut(state),
+     };
+     let value = match mature_value {
+         MAX_AGE => WheatLikeProperties::from_state_id(state).age,
+@@ -181,6 +184,43 @@
+     Some((harvester::plan(input, Rules::default())?, seed))
+ }
+ 
++fn plant_cut(state: BlockStateId) -> Option<(Harvest, &'static Item)> {
++    let block = state.to_block();
++    let leaves = block.has_tag(&tag::Block::MINECRAFT_LEAVES);
++    let mut input = HarvesterBlock {
++        leaves,
++        ..Default::default()
++    };
++    if block == &Block::SUGAR_CANE {
++        let props = block.properties(state)?.to_props();
++        let value = props
++            .iter()
++            .find(|p| p.key().to_str() == "age")?
++            .value_str()
++            .parse()
++            .ok()?;
++        input.generic_age = Some(Age {
++            value,
++            mature_value: 15,
++        });
++        input.plant = Plant::SugarCane;
++        input.sugar_cane_variant = true;
++        input.collision_empty = true;
++    } else if matches!(
++        block.name,
++        "dandelion" | "poppy" | "oak_sapling" | "birch_sapling"
++    ) {
++        input.plant = Plant::BushOrSpecialPlantable;
++        input.collision_empty = true;
++    } else if !leaves {
++        return None;
++    }
++    Some((
++        harvester::plan(input, Rules::default())?,
++        Item::from_registry_key(block.name)?,
++    ))
++}
++
+ pub(super) fn harvest_crop(world: &Arc<World>, pos: BlockPos) {
+     if !world.is_in_build_limit(pos) || world.spawn_protects_position(&pos) {
+         return;
+@@ -191,6 +231,25 @@
+     let Some((mut harvest, seed)) = crop(original_state) else {
+         return;
+     };
++    if harvest.replacement == Replacement::FluidOrAir {
++        let replacement = if original_state.is_waterlogged() {
++            &Block::WATER
++        } else {
++            &Block::AIR
++        };
++        if world
++            .set_block_state_if(
++                &pos,
++                replacement.default_state.id,
++                BlockFlags::NOTIFY_ALL,
++                |current| current == original_state,
++            )
++            .is_some()
++        {
++            release_loot(world, pos, original_state, &mut harvest, seed);
++        }
++        return;
++    }
+     let block = original_state.to_block();
+     let support_pos = if block == &Block::COCOA {
+         pos.offset(
+@@ -262,9 +321,13 @@
+     let Some(loot_table) = block.loot_table.and_then(|key| world.get_loot_table(key)) else {
+         return;
+     };
++    let tool = match harvest.loot_tool {
++        LootTool::Shears => ItemStack::new(1, &Item::SHEARS),
++        LootTool::EmptyHand => ItemStack::EMPTY.clone(),
++    };
+     let params = LootContextParameters {
+         world: Some(world),
+-        tool: Some(ItemStack::EMPTY.clone()),
++        tool: Some(tool),
+         block_state: Some(original_state.to_state()),
+         position: Some(pos.to_f64()),
+         killed_by_player: Some(false),
+@@ -336,6 +399,42 @@
+             assert_eq!(drops.item_count, 2);
+         }
+         assert!(crop(Block::STONE.default_state.id).is_none());
++    }
++
++    #[test]
++    fn plant_cut_preserves_pinned_tool_and_seed_rules() {
++        let (cut, item) = crop(Block::OAK_LEAVES.default_state.id).unwrap();
++        assert_eq!(item.id, Item::OAK_LEAVES.id);
++        assert_eq!(cut.loot_tool, LootTool::Shears);
++        assert_eq!(cut.replacement, Replacement::FluidOrAir);
++        assert!(!cut.reserve_seed);
++        for block in [
++            &Block::DANDELION,
++            &Block::POPPY,
++            &Block::OAK_SAPLING,
++            &Block::BIRCH_SAPLING,
++        ] {
++            let (cut, _) = crop(block.default_state.id).unwrap();
++            assert_eq!(cut.loot_tool, LootTool::EmptyHand);
++            assert!(!cut.reserve_seed);
++        }
++        assert!(
++            !crop(Block::SUGAR_CANE.default_state.id)
++                .unwrap()
++                .0
++                .reserve_seed
++        );
++        assert!(
++            crop(with_property(
++                Block::SUGAR_CANE.default_state.id,
++                "age",
++                "15"
++            ))
++            .unwrap()
++            .0
++            .reserve_seed
++        );
++        assert!(crop(Block::CACTUS.default_state.id).is_none());
+     }
+ 
+     #[test]

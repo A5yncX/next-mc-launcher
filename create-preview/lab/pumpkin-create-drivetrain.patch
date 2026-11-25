@@ -1,0 +1,372 @@
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -1,12 +1,15 @@
+ use std::{
+     any::Any,
+     sync::{
+-        Arc,
+-        atomic::{AtomicI32, AtomicU32, Ordering},
++        Arc, Mutex,
++        atomic::{AtomicI32, Ordering},
+     },
+ };
+ 
+-use create_engine::kinetics::{Axis, Kind, Node, Pos, solve};
++use create_engine::{
++    kinetics::{Axis, Kind, Node, Pos, solve},
++    placement::Direction,
++};
+ use pumpkin_data::{Block, BlockStateId};
+ use pumpkin_nbt::compound::NbtCompound;
+ use pumpkin_util::{GameMode, math::position::BlockPos};
+@@ -20,6 +23,32 @@
+ pub(super) const MOTOR: &str = "create:creative_motor";
+ pub(super) const SHAFT: &str = "create:shaft";
+ pub(super) const COG: &str = "create:cogwheel";
++const GEARBOX: &str = "create:gearbox";
++const KINETIC_IDS: &[&str] = &[
++    MOTOR,
++    SHAFT,
++    COG,
++    GEARBOX,
++    "create:large_cogwheel",
++    "create:flywheel",
++    "create:andesite_encased_shaft",
++    "create:brass_encased_shaft",
++    "create:andesite_encased_cogwheel",
++    "create:brass_encased_cogwheel",
++    "create:andesite_encased_large_cogwheel",
++    "create:brass_encased_large_cogwheel",
++];
++
++pub(super) fn kinetic_id(name: &str) -> Option<&'static str> {
++    KINETIC_IDS.iter().copied().find(|id| *id == name)
++}
++
++pub(super) fn kinetic_id_from_path(path: &str) -> Option<&'static str> {
++    KINETIC_IDS
++        .iter()
++        .copied()
++        .find(|id| id.strip_prefix("create:") == Some(path))
++}
+ const DEFAULT_MOTOR_SETTING: i32 = 32;
+ pub(crate) const MOD_NET_CHANNEL: &str = "horizon:mod_net";
+ 
+@@ -74,16 +103,28 @@
+ pub(super) struct CreateKinetic {
+     id: &'static str,
+     position: BlockPos,
+-    rpm: AtomicU32,
++    readings: Mutex<Readings>,
+     setting: AtomicI32,
+ }
+ 
++#[derive(Default, PartialEq)]
++struct Readings {
++    rpm: f32,
++    ports: [f32; 6],
++}
++
++fn nbt_speed(tag: &NbtCompound, key: &str) -> f32 {
++    tag.get_float(key)
++        .filter(|rpm| rpm.is_finite())
++        .unwrap_or(0.0)
++}
++
+ impl CreateKinetic {
+     pub(super) fn new(id: &'static str, position: BlockPos) -> Self {
+         Self {
+             id,
+             position,
+-            rpm: AtomicU32::new(0),
++            readings: Mutex::new(Readings::default()),
+             setting: AtomicI32::new(DEFAULT_MOTOR_SETTING),
+         }
+     }
+@@ -91,24 +132,22 @@
+ 
+ pub(super) fn node(state: BlockStateId, pos: Pos) -> Option<Node> {
+     let block = Block::from_state_id(state);
+-    let property = match block.name {
+-        MOTOR => "facing",
+-        SHAFT | COG => "axis",
+-        _ => return None,
++    let id = kinetic_id(block.name)?;
++    let properties = block.properties(state)?.to_props();
++    let get = |key| {
++        properties
++            .iter()
++            .find(|p| p.key_str() == key)
++            .map(|p| p.value_str())
+     };
+-    let value = block
+-        .properties(state)?
+-        .to_props()
+-        .into_iter()
+-        .find(|entry| entry.key_str() == property)?
+-        .value_str();
++    let value = get(if id == MOTOR { "facing" } else { "axis" })?;
+     let axis = match value {
+         "x" | "east" | "west" => Axis::X,
+         "y" | "up" | "down" => Axis::Y,
+         "z" | "south" | "north" => Axis::Z,
+         _ => return None,
+     };
+-    let kind = match block.name {
++    let kind = match id {
+         MOTOR => {
+             let mut facing = [0; 3];
+             facing[axis.index()] = if matches!(value, "west" | "down" | "north") {
+@@ -122,26 +161,38 @@
+                 capacity: 1024.0,
+             }
+         }
+-        SHAFT => Kind::Shaft,
+-        _ => Kind::Cog { large: false },
++        SHAFT
++        | "create:flywheel"
++        | "create:andesite_encased_shaft"
++        | "create:brass_encased_shaft" => Kind::Shaft,
++        COG => Kind::Cog { large: false },
++        "create:large_cogwheel" => Kind::Cog { large: true },
++        GEARBOX => Kind::Gearbox,
++        _ => Kind::EncasedCog {
++            large: id.ends_with("_large_cogwheel"),
++            top_shaft: get("top_shaft") == Some("true"),
++            bottom_shaft: get("bottom_shaft") == Some("true"),
++        },
+     };
+     Some(Node { pos, axis, kind })
+ }
+ 
+ impl BlockEntity for CreateKinetic {
+     fn from_nbt(nbt: &NbtCompound, position: BlockPos) -> Self {
+-        let id = match nbt.get_string("id") {
+-            Some(MOTOR) => MOTOR,
+-            Some(SHAFT) => SHAFT,
+-            _ => COG,
+-        };
+-        // This is a derived value. The next tick recalculates it from loaded blocks.
+-        let entity = Self::new(id, position);
+-        let rpm = nbt
+-            .get_float("Speed")
+-            .filter(|rpm| rpm.is_finite())
+-            .unwrap_or(0.0);
+-        entity.rpm.store(rpm.to_bits(), Ordering::Relaxed);
++        let id = nbt.get_string("id").and_then(kinetic_id).unwrap_or(COG);
++        // The next tick recalculates the readings once the neighborhood is loaded.
++        let mut entity = Self::new(id, position);
++        let readings = entity
++            .readings
++            .get_mut()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        readings.rpm = nbt_speed(nbt, "Speed");
++        if let Some(ports) = nbt
++            .get_compound("create_horizon")
++            .and_then(|tag| tag.get_compound("Ports"))
++        {
++            readings.ports = Direction::ALL.map(|dir| nbt_speed(ports, dir.name()));
++        }
+         if id == MOTOR
+             && let Some(setting) = nbt
+                 .get_int("ScrollValue")
+@@ -153,7 +204,20 @@
+     }
+ 
+     fn write_nbt(&self, tag: &mut NbtCompound) {
+-        tag.put_float("Speed", f32::from_bits(self.rpm.load(Ordering::Relaxed)));
++        let readings = self
++            .readings
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        tag.put_float("Speed", readings.rpm);
++        if self.id == GEARBOX {
++            let mut ports = NbtCompound::new();
++            for (dir, rpm) in Direction::ALL.into_iter().zip(readings.ports) {
++                ports.put_float(dir.name(), rpm);
++            }
++            let mut group = NbtCompound::new();
++            group.put_compound("Ports", ports);
++            tag.put_compound("create_horizon", group);
++        }
+         if self.id == MOTOR {
+             tag.put_int("ScrollValue", self.setting.load(Ordering::Relaxed));
+         }
+@@ -189,7 +253,7 @@
+         };
+         let pos = [self.position.0.x, self.position.0.y, self.position.0.z];
+         let Some(start) = read(pos) else { return };
+-        // shortcut: independent loaded-neighborhood solves for the three-block lab; cache connected components before scaling up.
++        // shortcut: solve separately per block with a read cap, cache components before big builds.
+         let mut exhausted = false;
+         let mut budget = 512usize;
+         let network = solve(start, |pos| {
+@@ -200,8 +264,28 @@
+             budget = left;
+             read(pos)
+         });
+-        let rpm = if exhausted { 0.0 } else { network.speed(pos) };
+-        if self.rpm.swap(rpm.to_bits(), Ordering::Relaxed) != rpm.to_bits()
++        let next = if exhausted {
++            Readings::default()
++        } else {
++            Readings {
++                rpm: network.speed(pos),
++                ports: if matches!(start.kind, Kind::Gearbox) {
++                    Direction::ALL.map(|dir| network.port_speed(pos, dir.vector()))
++                } else {
++                    [0.0; 6]
++                },
++            }
++        };
++        let changed = {
++            let mut readings = self
++                .readings
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++            let changed = *readings != next;
++            *readings = next;
++            changed
++        };
++        if changed
+             && let Some(entity) = world.get_block_entity(&self.position)
+             && entity
+                 .as_any()
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -30,10 +30,7 @@
+ }
+ 
+ pub(crate) fn is_create_kinetic_block(block: &Block) -> bool {
+-    matches!(
+-        block.name,
+-        create_kinetic::MOTOR | create_kinetic::SHAFT | create_kinetic::COG
+-    )
++    create_kinetic::kinetic_id(block.name).is_some()
+ }
+ pub mod daylight_detector;
+ pub mod dropper;
+@@ -198,10 +195,10 @@
+     let y = nbt.get_int("y")?;
+     let z = nbt.get_int("z")?;
+     let pos = BlockPos::new(x, y, z);
++    if create_kinetic::kinetic_id(id).is_some() {
++        return Some(Arc::new(create_kinetic::CreateKinetic::from_nbt(nbt, pos)));
++    }
+     match id {
+-        create_kinetic::MOTOR | create_kinetic::SHAFT | create_kinetic::COG => {
+-            Some(Arc::new(create_kinetic::CreateKinetic::from_nbt(nbt, pos)))
+-        }
+         barrel::BarrelBlockEntity::ID => {
+             Some(Arc::new(barrel::BarrelBlockEntity::from_nbt(nbt, pos)))
+         }
+@@ -345,11 +342,7 @@
+ 
+ #[must_use]
+ pub fn has_block_block_entity(block: &Block) -> bool {
+-    BLOCK_ENTITY_TYPES.contains(&block.name)
+-        || matches!(
+-            block.name,
+-            create_kinetic::MOTOR | create_kinetic::SHAFT | create_kinetic::COG
+-        )
++    BLOCK_ENTITY_TYPES.contains(&block.name) || is_create_kinetic_block(block)
+ }
+ 
+ #[must_use]
+@@ -363,19 +356,10 @@
+         return None;
+     }
+     let name = BLOCK_ENTITY_TYPES.get(block_entity_type_id as usize)?;
++    if let Some(id) = create_kinetic::kinetic_id_from_path(name) {
++        return Some(Arc::new(create_kinetic::CreateKinetic::new(id, position)));
++    }
+     match *name {
+-        "creative_motor" => Some(Arc::new(create_kinetic::CreateKinetic::new(
+-            create_kinetic::MOTOR,
+-            position,
+-        ))),
+-        "shaft" => Some(Arc::new(create_kinetic::CreateKinetic::new(
+-            create_kinetic::SHAFT,
+-            position,
+-        ))),
+-        "cogwheel" => Some(Arc::new(create_kinetic::CreateKinetic::new(
+-            create_kinetic::COG,
+-            position,
+-        ))),
+         "furnace" => Some(Arc::new(furnace::FurnaceBlockEntity::new(position))),
+         "chest" => Some(Arc::new(chest::ChestBlockEntity::new(position))),
+         "trapped_chest" => Some(Arc::new(trapped_chest::TrappedChestBlockEntity::new(
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -1116,19 +1116,27 @@
+         let sneaking = player.get_entity().is_sneaking();
+ 
+         match placed_block.name {
+-            "create:shaft" => {
++            "create:shaft"
++            | "create:flywheel"
++            | "create:andesite_encased_shaft"
++            | "create:brass_encased_shaft" => {
+                 let axis = assist.map_or_else(
+                     || placement::shaft(look, clicked, sneaking, ports),
+                     |assist| assist.axis,
+                 );
+                 Self::set_create_axis(placed_block, state_id, axis)
+             }
+-            "create:cogwheel" => {
++            "create:cogwheel"
++            | "create:large_cogwheel"
++            | "create:andesite_encased_cogwheel"
++            | "create:brass_encased_cogwheel"
++            | "create:andesite_encased_large_cogwheel"
++            | "create:brass_encased_large_cogwheel" => {
+                 let delta = clicked.vector();
+                 let against = BlockPos::new(
+-                    position.0.x + delta[0],
+-                    position.0.y + delta[1],
+-                    position.0.z + delta[2],
++                    position.0.x - delta[0],
++                    position.0.y - delta[1],
++                    position.0.z - delta[2],
+                 );
+                 let against_small = world
+                     .get_block_state_id_if_loaded(&against)
+@@ -1142,13 +1150,19 @@
+                         matches!(
+                             node.kind,
+                             create_engine::kinetics::Kind::Cog { large: false }
++                                | create_engine::kinetics::Kind::EncasedCog { large: false, .. }
+                         )
+                         .then_some(node.axis)
+                     });
+-                let axis = assist.map_or_else(
+-                    || placement::cog(clicked, sneaking, ports, against_small),
+-                    |assist| assist.axis,
+-                );
++                let axis = if placed_block.name.contains("_encased_") {
++                    against_small
++                        .unwrap_or_else(|| placement::shaft(look, clicked, sneaking, ports))
++                } else {
++                    assist.map_or_else(
++                        || placement::cog(clicked, sneaking, ports, against_small),
++                        |assist| assist.axis,
++                    )
++                };
+                 Self::set_create_axis(placed_block, state_id, axis)
+             }
+             "create:creative_motor" => {
+--- a/crates/pumpkin-core/src/net/java/play/use_item_on.rs
++++ b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+@@ -385,6 +385,12 @@
+         }
+ 
+         let target_state = world.get_block_state_id_if_loaded(&position)?;
++        if !matches!(
++            Block::from_state_id(target_state).name,
++            "create:shaft" | "create:cogwheel"
++        ) {
++            return None;
++        }
+         let target = create_kinetic_node(target_state, [position.0.x, position.0.y, position.0.z])?;
+         let border = world.worldborder.lock().ok()?;
+         let small_cog_in_hand = placed_block.name == "create:cogwheel";

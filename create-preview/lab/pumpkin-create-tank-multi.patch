@@ -1,0 +1,653 @@
+--- a/crates/pumpkin-core/src/block/entities/create_fluid_tank.rs
++++ b/crates/pumpkin-core/src/block/entities/create_fluid_tank.rs
+@@ -1,20 +1,83 @@
+ use std::{
+     any::Any,
+     sync::{
+-        Mutex, PoisonError,
++        Arc, Mutex, MutexGuard, PoisonError,
+         atomic::{AtomicBool, Ordering},
+     },
+ };
+ 
++use create_engine::fluid_tank::{DEFAULT_MAX_HEIGHT, Tank, largest};
++use pumpkin_data::Property;
+ use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
+ use pumpkin_util::math::position::BlockPos;
++use pumpkin_world::world::BlockFlags;
+ 
+ use super::BlockEntity;
++use crate::world::World;
+ 
+ pub(crate) const ID: &str = "create:fluid_tank";
+-// shortcut: single-block/manual only; add network aggregation with Create pipe integration.
+ const CAPACITY: i32 = create_engine::fluid_tank::BLOCK_CAPACITY as i32;
+ const BUCKET_VOLUME: i32 = 1000;
++static TOPOLOGY: Mutex<()> = Mutex::new(());
++
++pub(crate) fn topology() -> MutexGuard<'static, ()> {
++    TOPOLOGY.lock().unwrap_or_else(PoisonError::into_inner)
++}
++
++fn coords(pos: BlockPos) -> [i32; 3] {
++    [pos.0.x, pos.0.y, pos.0.z]
++}
++fn pos([x, y, z]: [i32; 3]) -> BlockPos {
++    BlockPos::new(x, y, z)
++}
++
++#[derive(Clone, Copy)]
++struct Contents {
++    tank: Tank,
++    fluid: &'static str,
++    amount: i32,
++    window: bool,
++}
++
++impl Contents {
++    fn luminosity(self, at: [i32; 3]) -> i32 {
++        if self.amount == 0 || self.fluid != "minecraft:lava" {
++            return 0;
++        }
++        let layers =
++            self.amount as f32 / self.tank.capacity() as f32 * self.tank.height() as f32 + 1.0;
++        if at[1] - self.tank.root[1] < layers as i32 {
++            12
++        } else {
++            1
++        }
++    }
++}
++
++fn entity(world: &World, at: BlockPos) -> Option<Arc<dyn BlockEntity>> {
++    let block = world.get_block_state_id_if_loaded(&at)?.to_block();
++    (block.name == ID)
++        .then(|| world.get_block_entity(&at))
++        .flatten()
++        .filter(|be| be.as_any().is::<CreateFluidTank>())
++}
++
++pub(crate) fn controller(world: &World, at: BlockPos) -> Option<Arc<dyn BlockEntity>> {
++    let part = entity(world, at)?;
++    let root = part.as_any().downcast_ref::<CreateFluidTank>()?.root()?;
++    let root_entity = if root == at {
++        part
++    } else {
++        entity(world, root)?
++    };
++    root_entity
++        .as_any()
++        .downcast_ref::<CreateFluidTank>()?
++        .contents()?
++        .tank
++        .contains(coords(at))
++        .then_some(root_entity)
++}
+ 
+ pub(crate) struct CreateFluidTank {
+     position: BlockPos,
+@@ -49,7 +112,7 @@
+         };
+         if !matches!(id, "minecraft:water" | "minecraft:lava")
+             || amount <= 0
+-            || amount > CAPACITY - old_amount
++            || amount > tank_capacity(&nbt).unwrap_or(0) - old_amount
+             || (old_amount > 0 && old_fluid != id)
+         {
+             return false;
+@@ -98,7 +161,9 @@
+         if filled > 0 && fluid != existing {
+             return 0;
+         }
+-        let volume = limit.min(stocked).min(CAPACITY - filled);
++        let volume = limit
++            .min(stocked)
++            .min(tank_capacity(&to).unwrap_or(0) - filled);
+         if volume > 0 {
+             let fluid = if fluid == "minecraft:lava" {
+                 "minecraft:lava"
+@@ -119,23 +184,87 @@
+     }
+ 
+     pub fn signal(&self) -> u8 {
+-        let amount = self.amount();
+-        (14 * amount / CAPACITY as u32 + u32::from(amount > 0)) as u8
++        self.contents().map_or(0, |record| {
++            let amount = record.amount as u32;
++            (14 * amount / record.tank.capacity() + u32::from(amount > 0)) as u8
++        })
++    }
++
++    fn root(&self) -> Option<BlockPos> {
++        let nbt = self.nbt.lock().unwrap_or_else(PoisonError::into_inner);
++        if !ordinary(&nbt) {
++            return None;
++        }
++        match nbt.get("Controller") {
++            None => Some(self.position),
++            Some(NbtTag::IntArray(root)) if root.is_empty() => Some(self.position),
++            Some(NbtTag::IntArray(root))
++                if ["Size", "Height", "Window", "TankContent"]
++                    .iter()
++                    .all(|k| nbt.get(k).is_none()) =>
++            {
++                Some(pos(root.as_slice().try_into().ok()?)).filter(|root| *root != self.position)
++            }
++            _ => None,
++        }
++    }
++
++    fn contents(&self) -> Option<Contents> {
++        let nbt = self.nbt.lock().unwrap_or_else(PoisonError::into_inner);
++        let (fluid, amount) = tank_contents(&nbt)?;
++        Some(Contents {
++            tank: Tank::new(
++                coords(self.position),
++                nbt.get_int("Size")?,
++                nbt.get_int("Height")?,
++            )?,
++            fluid: if fluid == "minecraft:lava" {
++                "minecraft:lava"
++            } else {
++                "minecraft:water"
++            },
++            amount,
++            window: nbt.get_byte("Window")? != 0,
++        })
++    }
++
++    fn write_part(&self, record: Contents) {
++        let mut nbt = self.nbt.lock().unwrap_or_else(PoisonError::into_inner);
++        if record.tank.root == coords(self.position) {
++            nbt.child_tags.remove("Controller");
++            nbt.put_int("Size", record.tank.width());
++            nbt.put_int("Height", record.tank.height());
++            nbt.put_byte("Window", i8::from(record.window));
++            write_tank(&mut nbt, record.fluid, record.amount);
++        } else {
++            for key in ["Size", "Height", "Window", "TankContent"] {
++                nbt.child_tags.remove(key);
++            }
++            nbt.put("Controller", NbtTag::IntArray(record.tank.root.to_vec()));
++        }
++        self.dirty.store(true, Ordering::Relaxed);
+     }
+ }
+ 
+-fn tank_contents(nbt: &NbtCompound) -> Option<(&str, i32)> {
+-    let boiler = nbt.get_compound("Boiler")?;
+-    if nbt
+-        .get("Controller")
+-        .is_some_and(|controller| !matches!(controller, NbtTag::IntArray(root) if root.is_empty()))
+-        || nbt.get_int("Size") != Some(1)
+-        || nbt.get_int("Height") != Some(1)
+-        || boiler.get_int("Engines") != Some(0)
+-        || boiler.get_int("Whistles") != Some(0)
++fn ordinary(nbt: &NbtCompound) -> bool {
++    nbt.get_compound("Boiler").is_some_and(|boiler| {
++        boiler.get_int("Engines") == Some(0) && boiler.get_int("Whistles") == Some(0)
++    })
++}
++
++fn tank_capacity(nbt: &NbtCompound) -> Option<i32> {
++    if !ordinary(nbt)
++        || nbt.get("Controller").is_some_and(
++            |controller| !matches!(controller, NbtTag::IntArray(root) if root.is_empty()),
++        )
+     {
+         return None;
+     }
++    Some(Tank::new([0; 3], nbt.get_int("Size")?, nbt.get_int("Height")?)?.capacity() as i32)
++}
++
++fn tank_contents(nbt: &NbtCompound) -> Option<(&str, i32)> {
++    let capacity = tank_capacity(nbt)?;
+     let content = nbt.get_compound("TankContent")?;
+     if content.child_tags.is_empty() {
+         return Some(("minecraft:water", 0));
+@@ -144,12 +273,265 @@
+     let id = fluid.get_string("id")?;
+     let amount = fluid.get_int("amount")?;
+     (matches!(id, "minecraft:water" | "minecraft:lava")
+-        && (1..=CAPACITY).contains(&amount)
++        && (1..=capacity).contains(&amount)
+         && content.child_tags.len() == 1
+         && fluid.child_tags.len() == 2)
+         .then_some((id, amount))
+ }
+ 
++fn part_layout(world: &Arc<World>, at: BlockPos, record: Contents) {
++    let Some(state) = world.get_block_state_id_if_loaded(&at) else {
++        return;
++    };
++    let block = state.to_block();
++    if block.name != ID {
++        return;
++    }
++    let Some(props) = block.properties(state) else {
++        return;
++    };
++    let mut props = props.to_props();
++    let p = coords(at);
++    let mask = record.tank.horizontal_mask(p).to_string();
++    for prop in &mut props {
++        let value = match prop.key_str() {
++            "bottom" => {
++                if record.tank.bottom(p) {
++                    "true"
++                } else {
++                    "false"
++                }
++            }
++            "top" => {
++                if record.tank.top(p) {
++                    "true"
++                } else {
++                    "false"
++                }
++            }
++            "shape" => record.tank.shape(p, record.window),
++            "create_connections" => &mask,
++            "create_light" => match (record.window, record.luminosity(p)) {
++                (true, 12) => "12",
++                (true, 1) => "1",
++                _ => "0",
++            },
++            _ => continue,
++        };
++        if let Some(new) = Property::from_str_pair(prop.key_str(), value) {
++            *prop = new;
++        }
++    }
++    if let Some(next) = block
++        .state_from_properties(&props)
++        .filter(|next| next.id != state)
++    {
++        world.set_block_state_if(
++            &at,
++            next.id,
++            BlockFlags::NOTIFY_LISTENERS | BlockFlags::UPDATE_KNOWN_SHAPE,
++            |current| current == state,
++        );
++    }
++}
++
++fn merge(world: &Arc<World>, at: BlockPos) -> Vec<Arc<dyn BlockEntity>> {
++    let _guard = topology();
++    let Some(base) = controller(world, at).filter(|entity| entity.get_position() == at) else {
++        return Vec::new();
++    };
++    let Some(record) = base
++        .as_any()
++        .downcast_ref::<CreateFluidTank>()
++        .and_then(CreateFluidTank::contents)
++    else {
++        return Vec::new();
++    };
++    let mut seen = std::collections::HashMap::new();
++    let Some(geometry) = largest(record.tank.root, DEFAULT_MAX_HEIGHT, |p| {
++        let point = pos(p);
++        // shortcut: keep every member in one chunk until cross-chunk teardown is durable.
++        if point.chunk_position() != at.chunk_position() {
++            return None;
++        }
++        let root = controller(world, point)?;
++        let root_pos = root.get_position();
++        let contents = *seen.entry(root_pos).or_insert(
++            root.as_any()
++                .downcast_ref::<CreateFluidTank>()?
++                .contents()?,
++        );
++        Some((
++            contents.tank,
++            (contents.amount > 0).then_some(contents.fluid),
++        ))
++    })
++    .filter(|geometry| *geometry != record.tank) else {
++        return Vec::new();
++    };
++    let Some(parts) = geometry
++        .parts()
++        .map(|p| entity(world, pos(p)))
++        .collect::<Option<Vec<_>>>()
++    else {
++        return Vec::new();
++    };
++    let mut assembled = Contents {
++        tank: geometry,
++        amount: 0,
++        ..record
++    };
++    for source in seen
++        .values()
++        .filter(|source| geometry.contains(source.tank.root))
++    {
++        if source.amount > 0 {
++            if assembled.amount > 0 && source.fluid != assembled.fluid {
++                return Vec::new();
++            }
++            assembled.fluid = source.fluid;
++            assembled.amount += source.amount;
++        }
++    }
++    if assembled.amount > assembled.tank.capacity() as i32 {
++        return Vec::new();
++    }
++    for part in &parts {
++        if let Some(tank) = part.as_any().downcast_ref::<CreateFluidTank>() {
++            tank.write_part(assembled);
++        }
++        part_layout(world, part.get_position(), assembled);
++    }
++    parts
++}
++
++fn split(world: &Arc<World>, removed: &CreateFluidTank) -> Vec<Arc<dyn BlockEntity>> {
++    let _guard = topology();
++    let Some(at) = removed.root() else {
++        return Vec::new();
++    };
++    let root_entity = if at == removed.position {
++        None
++    } else {
++        entity(world, at)
++    };
++    let root = if at == removed.position {
++        removed
++    } else if let Some(root) = root_entity
++        .as_ref()
++        .and_then(|be| be.as_any().downcast_ref::<CreateFluidTank>())
++    {
++        root
++    } else {
++        return Vec::new();
++    };
++    let Some(record) = root.contents().filter(|record| {
++        record.tank.volume() > 1 && record.tank.contains(coords(removed.position))
++    }) else {
++        return Vec::new();
++    };
++    let mut parts = std::collections::HashMap::new();
++    let amounts = record
++        .tank
++        .split(record.amount as u32, CAPACITY as u32, |p| {
++            let point = pos(p);
++            if point == removed.position {
++                return false;
++            }
++            let Some(part) = entity(world, point) else {
++                return false;
++            };
++            if part
++                .as_any()
++                .downcast_ref::<CreateFluidTank>()
++                .and_then(CreateFluidTank::root)
++                != Some(at)
++            {
++                return false;
++            }
++            parts.insert(point, part);
++            true
++        });
++    let mut changed = Vec::with_capacity(parts.len());
++    for (p, amount) in amounts {
++        let Some(part) = parts.remove(&pos(p)) else {
++            continue;
++        };
++        let single = Contents {
++            tank: Tank::single(p),
++            amount: amount as i32,
++            ..record
++        };
++        if let Some(tank) = part.as_any().downcast_ref::<CreateFluidTank>() {
++            tank.write_part(single);
++        }
++        part_layout(world, pos(p), single);
++        changed.push(part);
++    }
++    changed
++}
++
++pub(crate) fn toggle_window(tank: &CreateFluidTank) {
++    let mut nbt = tank.nbt.lock().unwrap_or_else(PoisonError::into_inner);
++    if let Some(value @ (0 | 1)) = nbt.get_byte("Window") {
++        nbt.put_byte("Window", 1 - value);
++        tank.dirty.store(true, Ordering::Relaxed);
++    }
++}
++
++pub(crate) fn sync(world: &Arc<World>, be: &Arc<dyn BlockEntity>, comparator: bool) {
++    let guard = topology();
++    let mut signals = Vec::new();
++    if !entity(world, be.get_position()).is_some_and(|live| Arc::ptr_eq(be, &live)) {
++        return;
++    }
++    if let Some(record) = be
++        .as_any()
++        .downcast_ref::<CreateFluidTank>()
++        .and_then(CreateFluidTank::contents)
++    {
++        for point in record.tank.parts() {
++            let at = pos(point);
++            let Some(part) = entity(world, at) else {
++                continue;
++            };
++            let Some(tank) = part.as_any().downcast_ref::<CreateFluidTank>() else {
++                continue;
++            };
++            if tank.root() != Some(be.get_position()) {
++                continue;
++            }
++            let changed = {
++                let mut nbt = tank.nbt.lock().unwrap_or_else(PoisonError::into_inner);
++                let luminosity = record.luminosity(point);
++                let changed = nbt.get_int("Luminosity") != Some(luminosity);
++                if changed {
++                    nbt.put_int("Luminosity", luminosity);
++                }
++                changed
++            };
++            if changed || comparator {
++                part_layout(world, at, record);
++            }
++            if changed || at == be.get_position() {
++                world.update_block_entity(&part);
++            }
++            if comparator {
++                signals.push(at);
++            }
++        }
++    } else {
++        world.update_block_entity(be);
++    }
++    drop(guard);
++    for at in signals {
++        let block = world.get_block(&at);
++        if block.name == ID {
++            world.update_neighbour_for_output_signal(&at, block);
++        }
++    }
++}
++
+ fn write_tank(nbt: &mut NbtCompound, id: &str, amount: i32) {
+     let mut content = NbtCompound::new();
+     if amount > 0 {
+@@ -200,6 +582,22 @@
+         Some(tag)
+     }
+ 
++    fn tick(&self, world: &Arc<World>) {
++        let [x, _, z] = coords(self.position);
++        if world.get_world_age().rem_euclid(20) != i64::from((x + z).rem_euclid(20)) {
++            return;
++        }
++        for part in merge(world, self.position) {
++            sync(world, &part, true);
++        }
++    }
++
++    fn on_block_replaced(self: Arc<Self>, world: &Arc<World>, _position: &BlockPos) {
++        for part in split(world, &self) {
++            sync(world, &part, true);
++        }
++    }
++
+     fn is_dirty(&self) -> bool {
+         self.dirty.load(Ordering::Relaxed)
+     }
+--- a/crates/pumpkin-core/src/block/blocks/create_fluid_tank.rs
++++ b/crates/pumpkin-core/src/block/blocks/create_fluid_tank.rs
+@@ -8,7 +8,7 @@
+ use crate::{
+     block::{
+         BlockActionResult, BlockBehaviour, GetComparatorOutputArgs, PlacedArgs, UseWithItemArgs,
+-        entities::create_fluid_tank::CreateFluidTank,
++        entities::create_fluid_tank::{self as tanks, CreateFluidTank},
+     },
+     entity::EntityBase,
+ };
+@@ -32,8 +32,7 @@
+ 
+     fn get_comparator_output(&self, args: GetComparatorOutputArgs<'_>) -> Option<u8> {
+         Some(
+-            args.world
+-                .get_block_entity(args.position)
++            tanks::controller(args.world, *args.position)
+                 .as_ref()
+                 .and_then(|entity| entity.as_any().downcast_ref::<CreateFluidTank>())
+                 .map_or(0, CreateFluidTank::signal),
+@@ -53,17 +52,28 @@
+         {
+             return BlockActionResult::PassToDefaultBlockAction;
+         }
+-        if !handles_container(args.item_stack) {
++        let wrench = args.item_stack.get_item().registry_key == "create:wrench";
++        if (!handles_container(args.item_stack) && !wrench)
++            || (wrench && mode == GameMode::Adventure)
++        {
+             return BlockActionResult::PassToDefaultBlockAction;
+         }
+         let item_id = args.item_stack.get_item().id;
+-        let Some(entity) = args.world.get_block_entity(args.position) else {
++        let topology = tanks::topology();
++        let Some(entity) = tanks::controller(args.world, *args.position) else {
+             return BlockActionResult::SuccessServer;
+         };
+         let Some(tank) = entity.as_any().downcast_ref::<CreateFluidTank>() else {
+             return BlockActionResult::SuccessServer;
+         };
+ 
++        if wrench {
++            tanks::toggle_window(tank);
++            drop(topology);
++            tanks::sync(args.world, &entity, true);
++            return BlockActionResult::SuccessServer;
++        }
++        let before = tank.signal();
+         let output = match item_id {
+             id if id == Item::WATER_BUCKET.id => {
+                 tank.pour("minecraft:water", 1000).then_some(&Item::BUCKET)
+@@ -83,6 +93,8 @@
+         let Some(output) = output else {
+             return BlockActionResult::SuccessServer;
+         };
++        let comparator = before != tank.signal();
++        drop(topology);
+ 
+         if mode != GameMode::Creative {
+             let mut container = ItemStack::new(1, output);
+@@ -107,9 +119,7 @@
+                 .set_stack_in_hand(hand, args.item_stack.clone());
+             args.player.sync_inventory_to_client();
+         }
+-        args.world.update_block_entity(&entity);
+-        args.world
+-            .update_neighbour_for_output_signal(args.position, args.block);
++        tanks::sync(args.world, &entity, comparator);
+         BlockActionResult::SuccessServer
+     }
+ }
+--- a/crates/pumpkin-core/src/block/blocks/create_pump.rs
++++ b/crates/pumpkin-core/src/block/blocks/create_pump.rs
+@@ -12,7 +12,8 @@
+ use crate::{
+     block::{
+         BlockActionResult, BlockBehaviour, UseWithItemArgs,
+-        entities::create_fluid_tank::CreateFluidTank, registry::BlockRegistry,
++        entities::create_fluid_tank::{self as tanks, CreateFluidTank},
++        registry::BlockRegistry,
+     },
+     world::World,
+ };
+@@ -79,45 +80,56 @@
+     if sources.is_empty() || targets.is_empty() || !suction.is_disjoint(&output) {
+         return;
+     }
+-    let targets: Vec<_> = targets
++    let topology = tanks::topology();
++    let controllers = |positions: Vec<BlockPos>| {
++        let mut seen = std::collections::HashSet::new();
++        positions
++            .into_iter()
++            .filter_map(|at| tanks::controller(world, at))
++            .filter(|be| seen.insert(be.get_position()))
++            .collect::<Vec<_>>()
++    };
++    let sources = controllers(sources);
++    let targets: Vec<_> = controllers(targets)
+         .into_iter()
+-        .filter_map(|at| world.get_block_entity(&at).map(|be| (at, be)))
++        .filter(|target| {
++            !sources
++                .iter()
++                .any(|source| source.get_position() == target.get_position())
++        })
+         .collect();
++    let mut changed = Vec::new();
+     let mut rate = fluid_transport::transfer_rate(rpm.abs()) as u32;
+-    for at in sources {
+-        let Some(source) = world.get_block_entity(&at) else {
+-            continue;
+-        };
++    for source in sources {
+         let Some(a) = source.as_any().downcast_ref::<CreateFluidTank>() else {
+             continue;
+         };
+         let before = a.signal();
+         let moved = fluid_transport::distribute(rate.min(a.amount()), targets.len(), |i, quota| {
+-            let (at, target) = &targets[i];
++            let target = &targets[i];
+             let Some(b) = target.as_any().downcast_ref::<CreateFluidTank>() else {
+                 return 0;
+             };
+             let before = b.signal();
+             let count = a.transfer_to(b, quota as i32);
+             if count > 0 {
+-                world.update_block_entity(target);
+-                if before != b.signal() {
+-                    world.update_neighbour_for_output_signal(at, world.get_block(at));
+-                }
++                changed.push((target.clone(), before != b.signal()));
+             }
+             count as u32
+         });
+         if moved > 0 {
+-            world.update_block_entity(&source);
+-            if before != a.signal() {
+-                world.update_neighbour_for_output_signal(&at, world.get_block(&at));
+-            }
++            let comparator = before != a.signal();
++            changed.push((source, comparator));
+             rate -= moved;
+             if rate == 0 {
+                 break;
+             }
+         }
+     }
++    drop(topology);
++    for (be, comparator) in changed {
++        tanks::sync(world, &be, comparator);
++    }
+ }
+ 
+ #[pumpkin_block("create:mechanical_pump")]

@@ -1,0 +1,972 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -18,7 +18,8 @@
+ 
+ use super::{
+     BlockEntity, create_crusher as crusher, create_drill as drill, create_fan_airflow as fan,
+-    create_millstone as millstone, create_press as press, create_saw_tree as saw,
++    create_millstone as millstone, create_press as press, create_saw_processing::SawProcessing,
++    create_saw_tree as saw,
+ };
+ use crate::{
+     block::blocks::{
+@@ -142,6 +143,7 @@
+     material: AtomicU16,
+     structure_ready: AtomicBool,
+     drill: Option<Box<drill::Drill>>,
++    saw_processing: Option<Box<Mutex<SawProcessing>>>,
+ }
+ 
+ pub(crate) fn set_create_wheel_material(world: &World, pos: &BlockPos, item: &Item) -> bool {
+@@ -317,6 +319,7 @@
+             material: AtomicU16::new(Item::SPRUCE_PLANKS.id),
+             structure_ready: AtomicBool::new(false),
+             drill: matches!(id, drill::ID | saw::ID).then(|| Box::new(drill::Drill::new())),
++            saw_processing: (id == saw::ID).then(|| Box::new(Mutex::new(SawProcessing::default()))),
+         }
+     }
+ 
+@@ -500,6 +503,9 @@
+         if let Some(drill) = &mut entity.drill {
+             **drill = drill::Drill::from_nbt(nbt);
+         }
++        if let Some(saw) = &mut entity.saw_processing {
++            **saw = Mutex::new(SawProcessing::from_nbt(nbt));
++        }
+         let readings = entity
+             .readings
+             .get_mut()
+@@ -578,6 +584,11 @@
+         if let Some(drill) = &self.drill {
+             drill.write_nbt(tag);
+         }
++        if let Some(saw) = &self.saw_processing {
++            saw.lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .write_nbt(tag);
++        }
+         if self.id == fan::ID {
+             tag.put(
+                 fan::TAG,
+@@ -667,6 +678,11 @@
+     fn on_block_replaced(self: Arc<Self>, world: &Arc<World>, _: &BlockPos) {
+         if let Some(drill) = &self.drill {
+             drill.remove(world);
++        }
++        if let Some(saw) = &self.saw_processing {
++            saw.lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .drop_items(world, &self.position);
+         }
+     }
+ 
+@@ -877,6 +893,11 @@
+             .drill
+             .as_ref()
+             .is_some_and(|drill| drill.tick(world, self.position, next.rpm));
++        let processed = self.saw_processing.as_ref().is_some_and(|saw| {
++            saw.lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .tick_world(world, self.position, state, next.rpm)
++        });
+         let (changed, changed_signal) = {
+             let mut readings = self
+                 .readings
+@@ -900,7 +921,7 @@
+             *readings = next;
+             (changed || press_changed, changed_signal)
+         };
+-        if (changed || built || worked)
++        if (changed || built || worked || processed)
+             && let Some(entity) = world.get_block_entity(&self.position)
+             && entity
+                 .as_any()
+diff --git a/crates/pumpkin-core/src/block/entities/create_millstone.rs b/crates/pumpkin-core/src/block/entities/create_millstone.rs
+--- a/crates/pumpkin-core/src/block/entities/create_millstone.rs
++++ b/crates/pumpkin-core/src/block/entities/create_millstone.rs
+@@ -308,7 +308,7 @@
+     ingredients: Vec<String>,
+     #[serde(rename = "processing_time")]
+     pub(super) duration: i32,
+-    results: Vec<Output>,
++    pub(super) results: Vec<Output>,
+ }
+ 
+ impl MillingRecipe {
+@@ -348,12 +348,12 @@
+ }
+ 
+ #[derive(Deserialize)]
+-struct Output {
+-    id: String,
++pub(super) struct Output {
++    pub(super) id: String,
+     #[serde(default = "one")]
+-    count: u8,
++    pub(super) count: u8,
+     #[serde(default = "guaranteed")]
+-    chance: f32,
++    pub(super) chance: f32,
+ }
+ 
+ const fn one() -> u8 {
+diff --git a/crates/pumpkin-core/src/block/entities/mod.rs b/crates/pumpkin-core/src/block/entities/mod.rs
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -31,6 +31,7 @@
+ pub(crate) mod create_kinetic;
+ pub(crate) mod create_millstone;
+ pub(crate) mod create_press;
++mod create_saw_processing;
+ mod create_saw_tree;
+ pub(crate) use create_kinetic::set_create_wheel_material;
+ pub(crate) fn create_kinetic_node(
+diff --git a/crates/pumpkin-core/src/entity/item.rs b/crates/pumpkin-core/src/entity/item.rs
+--- a/crates/pumpkin-core/src/entity/item.rs
++++ b/crates/pumpkin-core/src/entity/item.rs
+@@ -404,7 +404,7 @@
+ 
+     /// Resends the stack after its count changed. Bedrock item actors ignore the `ITEM`
+     /// metadata, so they get the count as `UpdateStackSize`
+-    fn on_count_changed(&self) {
++    pub(crate) fn on_count_changed(&self) {
+         self.init_data_tracker();
+ 
+         let count = self
+diff --git a/crates/pumpkin-core/src/block/entities/create_saw_processing.rs b/crates/pumpkin-core/src/block/entities/create_saw_processing.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_saw_processing.rs
+@@ -0,0 +1,831 @@
++use std::{
++    collections::BTreeMap,
++    sync::{Arc, OnceLock, PoisonError, atomic::Ordering},
++};
++
++use create_engine::{
++    milling::roll_count,
++    saw_processing::{Action, CuttingCycle, automated_recipe, item_motion, source_recipe_order},
++};
++use pumpkin_data::{BlockStateId, entity::EntityType, item::Item, item_stack::ItemStack};
++use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
++use pumpkin_util::math::{boundingbox::BoundingBox, position::BlockPos, vector3::Vector3};
++use rand::RngExt;
++
++use crate::{
++    block::blocks::create_pipe::property,
++    entity::{Entity, item::ItemEntity},
++    world::World,
++};
++
++use super::create_millstone::MillingRecipe;
++
++const SLOTS: usize = 32;
++const INVENTORY_KEY: &str = "Inventory";
++const RECIPE_INDEX_KEY: &str = "RecipeIndex";
++const FILTER_FIELDS: [&str; 3] = ["Filter", "FilterAmount", "UpTo"];
++const INVENTORY_FIELDS: [&str; 5] = [
++    "Size",
++    "Items",
++    "ProcessingTime",
++    "RecipeTime",
++    "AppliedRecipe",
++];
++
++pub(crate) struct SawOutput {
++    pub(crate) stack: ItemStack,
++    pub(crate) chance: f32,
++}
++
++/// Input-matched, source-ordered recipes are resolved by the host's recipe registry adapter.
++pub(crate) struct SawRecipe {
++    pub(crate) duration: u32,
++    pub(crate) outputs: Vec<SawOutput>,
++    pub(crate) remainder: Option<ItemStack>,
++}
++
++/// Processing state embedded by the host in the existing mechanical-saw kinetic entity.
++pub(crate) struct SawProcessing {
++    pub(crate) items: [ItemStack; SLOTS],
++    pub(crate) cycle: CuttingCycle,
++    opaque_inventory: Option<NbtTag>,
++    opaque_recipe_index: Option<NbtTag>,
++    inventory_extra: NbtCompound,
++    filter_data: NbtCompound,
++    filter_item: Option<ItemStack>,
++    filter_valid: bool,
++}
++
++impl Default for SawProcessing {
++    fn default() -> Self {
++        Self {
++            items: empty_items(),
++            cycle: CuttingCycle::default(),
++            opaque_inventory: None,
++            opaque_recipe_index: None,
++            inventory_extra: NbtCompound::new(),
++            filter_data: NbtCompound::new(),
++            filter_item: None,
++            filter_valid: true,
++        }
++    }
++}
++
++impl SawProcessing {
++    pub(crate) fn from_nbt(nbt: &NbtCompound) -> Self {
++        let recipe_index = nbt.get_int(RECIPE_INDEX_KEY).unwrap_or(0).max(0) as usize;
++        let filter_data = read_filter_data(nbt);
++        let (filter_valid, filter_item) = read_filter(nbt);
++        let Some(saved) = nbt.get(INVENTORY_KEY) else {
++            return Self {
++                cycle: CuttingCycle {
++                    recipe_index,
++                    ..CuttingCycle::default()
++                },
++                filter_data,
++                filter_item,
++                filter_valid,
++                ..Self::default()
++            };
++        };
++        match read_inventory(saved, recipe_index) {
++            Some((items, cycle, inventory_extra)) => Self {
++                items,
++                cycle,
++                opaque_inventory: None,
++                opaque_recipe_index: None,
++                inventory_extra,
++                filter_data,
++                filter_item,
++                filter_valid,
++            },
++            None => Self {
++                opaque_inventory: Some(saved.clone()),
++                opaque_recipe_index: nbt.get(RECIPE_INDEX_KEY).cloned(),
++                filter_data,
++                filter_item,
++                filter_valid,
++                ..Self::default()
++            },
++        }
++    }
++
++    pub(crate) fn is_supported(&self) -> bool {
++        self.opaque_inventory.is_none() && self.filter_valid
++    }
++
++    #[cfg(test)]
++    fn filter_nbt(&self) -> Option<&NbtTag> {
++        self.filter_data.get("Filter")
++    }
++
++    fn eligible_recipes<'a>(&self, recipes: &'a [SawRecipe]) -> Vec<&'a SawRecipe> {
++        recipes
++            .iter()
++            .filter(|recipe| {
++                (1..=4).contains(&recipe.outputs.len())
++                    && recipe.outputs.iter().all(|output| {
++                        !output.stack.is_empty()
++                            && output.chance.is_finite()
++                            && (0.0..=1.0).contains(&output.chance)
++                    })
++                    && self.filter_item.as_ref().is_none_or(|filter| {
++                        recipe
++                            .outputs
++                            .first()
++                            .is_some_and(|output| output.stack.get_item() == filter.get_item())
++                    })
++            })
++            .collect()
++    }
++
++    /// Writes this adapter's keys without replacing unrelated block-entity data.
++    pub(crate) fn write_nbt(&self, nbt: &mut NbtCompound) {
++        for (key, value) in &self.filter_data.child_tags {
++            nbt.put(key, value.clone());
++        }
++        if let Some(inventory) = &self.opaque_inventory {
++            nbt.put(INVENTORY_KEY, inventory.clone());
++            if let Some(index) = &self.opaque_recipe_index {
++                nbt.put(RECIPE_INDEX_KEY, index.clone());
++            }
++            return;
++        }
++
++        let mut inventory = self.inventory_extra.clone();
++        inventory.put_int("Size", SLOTS as i32);
++        inventory.put(
++            "Items",
++            NbtTag::List(
++                self.items
++                    .iter()
++                    .enumerate()
++                    .filter(|(_, stack)| !stack.is_empty())
++                    .map(|(slot, stack)| {
++                        let mut item = NbtCompound::new();
++                        stack.write_item_stack(&mut item);
++                        item.put_int("Slot", slot as i32);
++                        NbtTag::Compound(item)
++                    })
++                    .collect(),
++            ),
++        );
++        inventory.put_float("ProcessingTime", self.cycle.remaining);
++        inventory.put_float("RecipeTime", self.cycle.duration);
++        inventory.put_byte("AppliedRecipe", i8::from(self.cycle.applied));
++        nbt.put_compound(INVENTORY_KEY, inventory);
++        nbt.put_int(
++            RECIPE_INDEX_KEY,
++            self.cycle.recipe_index.min(i32::MAX as usize) as i32,
++        );
++    }
++
++    pub(super) fn tick_world(
++        &mut self,
++        world: &Arc<World>,
++        pos: BlockPos,
++        state: BlockStateId,
++        rpm: f32,
++    ) -> bool {
++        if property(state, "facing") != Some("up") || rpm == 0.0 || !self.is_supported() {
++            return false;
++        }
++        let [x, y, z] = [pos.0.x, pos.0.y, pos.0.z].map(f64::from);
++        if self.items.iter().all(ItemStack::is_empty) {
++            let bounds = BoundingBox::new_array([x, y, z], [x + 1., y + 1.25, z + 1.]);
++            for entity in world.get_entities_at_box(&bounds) {
++                let Some(item) = entity.get_item_entity() else {
++                    continue;
++                };
++                let base = entity.get_entity();
++                let point = base.pos.load();
++                if base.removed.load(Ordering::Acquire)
++                    || !base.on_ground.load(Ordering::Relaxed)
++                    || !state
++                        .to_state()
++                        .get_block_collision_shapes_at(&pos)
++                        .any(|s| {
++                            (x + s.min.x..x + s.max.x).contains(&point.x)
++                                && (z + s.min.z..z + s.max.z).contains(&point.z)
++                                && (point.y - y - s.max.y).abs() < 0.05
++                        })
++                {
++                    continue;
++                }
++                let mut stack = item
++                    .get_item_stack()
++                    .lock()
++                    .unwrap_or_else(PoisonError::into_inner);
++                let recipes = recipes_for(&stack);
++                if self.insert_dropped_item(&mut stack, rpm, true, false, &recipes) != 0 {
++                    let empty = stack.is_empty();
++                    drop(stack);
++                    if empty {
++                        base.remove();
++                    } else {
++                        item.on_count_changed();
++                    }
++                    return true;
++                }
++            }
++            return false;
++        }
++
++        let recipes = if self.cycle.applied {
++            Vec::new()
++        } else {
++            recipes_for(&self.items[0])
++        };
++        let [dx, _, dz] = item_motion(property(state, "axis_along_first") == Some("true"), rpm);
++        let front = BlockPos::new(pos.0.x + dx, pos.0.y, pos.0.z + dz);
++        let clear = world
++            .get_block_state_id_if_loaded(&front)
++            .is_some_and(|state| {
++                state
++                    .to_state()
++                    .get_block_collision_shapes_at(&front)
++                    .next()
++                    .is_none()
++            });
++        let [dx, dz] = [f64::from(dx), f64::from(dz)];
++        let mut random = rand::rng();
++        self.tick(
++            true,
++            rpm,
++            &recipes,
++            || random.random(),
++            |stack| {
++                if !clear {
++                    return 0;
++                }
++                let at = Vector3::new(x + 0.5 + dx * 0.5, y + 1., z + 0.5 + dz * 0.5);
++                let entity = Entity::new(world.clone(), at, &EntityType::ITEM);
++                let drop = ItemEntity::new_with_velocity(
++                    entity,
++                    stack.clone(),
++                    Vector3::new(dx * 0.0625, 0.125, dz * 0.0625),
++                    10,
++                );
++                if world.spawn_entity(Arc::new(drop)) {
++                    stack.item_count
++                } else {
++                    0
++                }
++            },
++        )
++    }
++
++    pub(super) fn drop_items(&mut self, world: &Arc<World>, pos: &BlockPos) {
++        for stack in self.items.iter_mut().filter(|stack| !stack.is_empty()) {
++            world.drop_stack(pos, std::mem::replace(stack, ItemStack::EMPTY.clone()));
++        }
++    }
++
++    /// Call only for a dropped item that physically landed on this upward-facing saw.
++    /// Returns and subtracts the number accepted (0 or 1).
++    /// shortcut: accepts one item per drop; wire Create's bulk-cutting setting when needed.
++    pub(crate) fn insert_dropped_item(
++        &mut self,
++        dropped: &mut ItemStack,
++        rpm: f32,
++        facing_up: bool,
++        time_frozen: bool,
++        recipes: &[SawRecipe],
++    ) -> u8 {
++        if !self.is_supported()
++            || !facing_up
++            || time_frozen
++            || rpm == 0.0
++            || !rpm.is_finite()
++            || dropped.is_empty()
++            || self.cycle.remaining != -1.0
++            || self.cycle.applied
++            || self.items.iter().any(|item| !item.is_empty())
++        {
++            return 0;
++        }
++
++        let mut input = dropped.clone();
++        input.item_count = 1;
++        self.items[0] = input;
++        let eligible = self.eligible_recipes(recipes);
++        self.cycle.start(
++            1,
++            &eligible
++                .iter()
++                .map(|recipe| recipe.duration)
++                .collect::<Vec<_>>(),
++        );
++        dropped.item_count -= 1;
++        1
++    }
++
++    /// Advances one powered step and returns whether persisted state changed.
++    /// `export` reports the count successfully moved from a stack.
++    pub(crate) fn tick(
++        &mut self,
++        facing_up: bool,
++        rpm: f32,
++        recipes: &[SawRecipe],
++        mut draw: impl FnMut() -> f32,
++        mut export: impl FnMut(&ItemStack) -> u8,
++    ) -> bool {
++        if !self.is_supported() || !facing_up {
++            return false;
++        }
++
++        let eligible = self.eligible_recipes(recipes);
++        let previous_cycle = self.cycle;
++        let mut items_changed = false;
++        match self.cycle.tick(rpm, !self.items[0].is_empty()) {
++            Action::Idle => return false,
++            Action::Start => self.cycle.start(
++                u32::from(self.items[0].item_count),
++                &eligible
++                    .iter()
++                    .map(|recipe| recipe.duration)
++                    .collect::<Vec<_>>(),
++            ),
++            Action::Advance => {}
++            Action::Apply => {
++                if let Some(index) = self.cycle.select_current(eligible.len()) {
++                    if !apply_recipe(&mut self.items, eligible[index], &mut draw) {
++                        // Keep retries in the valid range of the pinned ProcessingTime NBT.
++                        self.cycle.remaining = 1.0;
++                        return self.cycle != previous_cycle;
++                    }
++                    items_changed = true;
++                }
++                self.cycle.finish_application();
++            }
++            Action::Export => {
++                for item in &mut self.items {
++                    if item.is_empty() {
++                        continue;
++                    }
++                    let moved = export(item).min(item.item_count);
++                    if moved > 0 {
++                        item.item_count -= moved;
++                        if item.is_empty() {
++                            *item = ItemStack::EMPTY.clone();
++                        }
++                        items_changed = true;
++                    }
++                }
++                if self.items.iter().all(ItemStack::is_empty) {
++                    self.cycle.finish_export();
++                }
++            }
++        }
++        items_changed || self.cycle != previous_cycle
++    }
++}
++
++fn recipes_for(input: &ItemStack) -> Vec<SawRecipe> {
++    static RECIPES: OnceLock<Vec<(String, MillingRecipe)>> = OnceLock::new();
++    RECIPES
++        .get_or_init(|| {
++            let book: BTreeMap<String, MillingRecipe> =
++                serde_json::from_str(include_str!(concat!(
++                    env!("CARGO_MANIFEST_DIR"),
++                    "/../../assets/nextmc-create-cutting.json"
++                )))
++                .expect("pinned Create cutting recipes");
++            let mut recipes: Vec<_> = book
++                .into_iter()
++                .filter(|(id, _)| automated_recipe(id))
++                .collect();
++            recipes.sort_by(|(a, _), (b, _)| source_recipe_order(a).cmp(&source_recipe_order(b)));
++            recipes
++        })
++        .iter()
++        .filter(|(_, recipe)| recipe.matches(input))
++        .filter_map(|(_, recipe)| {
++            Some(SawRecipe {
++                duration: recipe.duration.try_into().ok()?,
++                outputs: recipe
++                    .results
++                    .iter()
++                    .map(|row| {
++                        Some(SawOutput {
++                            stack: ItemStack::new(row.count, Item::from_registry_key(&row.id)?),
++                            chance: row.chance,
++                        })
++                    })
++                    .collect::<Option<_>>()?,
++                remainder: None,
++            })
++        })
++        .collect()
++}
++
++fn read_filter_data(nbt: &NbtCompound) -> NbtCompound {
++    let mut filter_data = NbtCompound::new();
++    for key in FILTER_FIELDS {
++        if let Some(value) = nbt.get(key) {
++            filter_data.put(key, value.clone());
++        }
++    }
++    filter_data
++}
++
++fn read_filter(nbt: &NbtCompound) -> (bool, Option<ItemStack>) {
++    match nbt.get("Filter") {
++        None => (true, None),
++        Some(NbtTag::Compound(filter)) if filter.is_empty() => (true, None),
++        Some(NbtTag::Compound(filter)) => match ItemStack::read_item_stack(filter) {
++            Some(item)
++                if !item.is_empty()
++                    && !matches!(
++                        item.get_item().registry_key,
++                        "create:filter" | "create:attribute_filter" | "create:package_filter"
++                    ) =>
++            {
++                (true, Some(item))
++            }
++            _ => (false, None),
++        },
++        Some(_) => (false, None),
++    }
++}
++
++fn empty_items() -> [ItemStack; SLOTS] {
++    std::array::from_fn(|_| ItemStack::EMPTY.clone())
++}
++
++fn read_inventory(
++    saved: &NbtTag,
++    recipe_index: usize,
++) -> Option<([ItemStack; SLOTS], CuttingCycle, NbtCompound)> {
++    let NbtTag::Compound(inventory) = saved else {
++        return None;
++    };
++    if inventory.get_int("Size")? != SLOTS as i32 {
++        return None;
++    }
++    let remaining = inventory.get_float("ProcessingTime")?;
++    let duration = inventory.get_float("RecipeTime")?;
++    let applied = match inventory.get("AppliedRecipe") {
++        None => false,
++        Some(NbtTag::Byte(value)) => *value != 0,
++        Some(NbtTag::Int(value)) => *value != 0,
++        _ => return None,
++    };
++    if !remaining.is_finite() || remaining < -1.0 || !duration.is_finite() || duration < 0.0 {
++        return None;
++    }
++
++    let NbtTag::List(list) = inventory.get("Items")? else {
++        return None;
++    };
++    if list.len() > SLOTS {
++        return None;
++    }
++    let mut items = empty_items();
++    for entry in list {
++        let entry = entry.extract_compound()?;
++        let slot = entry
++            .get_int("Slot")
++            .or_else(|| entry.get_byte("Slot").map(i32::from))?;
++        let item = ItemStack::read_item_stack(entry)?;
++        let target = items.get_mut(usize::try_from(slot).ok()?)?;
++        if !target.is_empty() || item.is_empty() || item.item_count > item.get_max_stack_size() {
++            return None;
++        }
++        *target = item;
++    }
++    if remaining > 0.0 && !applied && items[0].is_empty() {
++        return None;
++    }
++
++    let mut extra = inventory.clone();
++    for key in INVENTORY_FIELDS {
++        extra.child_tags.remove(key);
++    }
++    Some((
++        items,
++        CuttingCycle {
++            remaining,
++            duration,
++            applied,
++            recipe_index,
++        },
++        extra,
++    ))
++}
++
++fn apply_recipe(
++    items: &mut [ItemStack; SLOTS],
++    recipe: &SawRecipe,
++    draw: &mut impl FnMut() -> f32,
++) -> bool {
++    let input_count = u32::from(items[0].item_count);
++    if input_count == 0
++        || recipe.outputs.is_empty()
++        || recipe.outputs.iter().any(|output| {
++            output.stack.is_empty()
++                || !output.chance.is_finite()
++                || !(0.0..=1.0).contains(&output.chance)
++        })
++    {
++        return false;
++    }
++
++    let mut maximum = items[1..].to_vec();
++    for output in &recipe.outputs {
++        let count = u32::from(output.stack.item_count).saturating_mul(input_count);
++        if !add_stack_count(&mut maximum, &output.stack, count) {
++            return false;
++        }
++    }
++    if let Some(remainder) = &recipe.remainder
++        && !remainder.is_empty()
++        && !add_stack_count(&mut maximum, remainder, input_count)
++    {
++        return false;
++    }
++
++    let mut results = items[1..].to_vec();
++    for _ in 0..input_count {
++        for output in &recipe.outputs {
++            let count = roll_count(
++                u32::from(output.stack.item_count),
++                output.chance,
++                &mut *draw,
++            );
++            if !add_stack_count(&mut results, &output.stack, count) {
++                return false;
++            }
++        }
++        if let Some(remainder) = &recipe.remainder
++            && !remainder.is_empty()
++            && !add_stack_count(&mut results, remainder, 1)
++        {
++            return false;
++        }
++    }
++    items[1..].clone_from_slice(&results);
++    items[0] = ItemStack::EMPTY.clone();
++    true
++}
++
++fn add_stack_count(slots: &mut [ItemStack], template: &ItemStack, count: u32) -> bool {
++    let mut remaining = count;
++    for slot in slots.iter_mut().filter(|slot| !slot.is_empty()) {
++        if !slot.are_items_and_components_equal(template) {
++            continue;
++        }
++        let room = u32::from(slot.get_max_stack_size().saturating_sub(slot.item_count));
++        let moved = remaining.min(room);
++        slot.item_count += moved as u8;
++        remaining -= moved;
++        if remaining == 0 {
++            return true;
++        }
++    }
++
++    let maximum = u32::from(template.get_max_stack_size());
++    if maximum == 0 && remaining > 0 {
++        return false;
++    }
++    for slot in slots.iter_mut().filter(|slot| slot.is_empty()) {
++        if remaining == 0 {
++            break;
++        }
++        let moved = remaining.min(maximum) as u8;
++        let mut added = template.clone();
++        added.item_count = moved;
++        *slot = added;
++        remaining -= u32::from(moved);
++    }
++    remaining == 0
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{SawOutput, SawProcessing, SawRecipe};
++    use pumpkin_data::{item::Item, item_stack::ItemStack};
++    use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
++
++    fn stack(item: &str, count: u8) -> ItemStack {
++        ItemStack::new(
++            count,
++            Item::from_registry_key(item).expect("test item is registered"),
++        )
++    }
++
++    fn recipe(output: ItemStack, duration: u32) -> SawRecipe {
++        SawRecipe {
++            duration,
++            outputs: vec![SawOutput {
++                stack: output,
++                chance: 1.0,
++            }],
++            remainder: None,
++        }
++    }
++
++    #[test]
++    fn dropped_intake_requires_power_and_upward_facing_and_takes_one() {
++        let recipes = [recipe(stack("minecraft:oak_planks", 1), 50)];
++        let mut saw = SawProcessing::default();
++        let mut dropped = stack("minecraft:oak_log", 2);
++
++        assert_eq!(
++            saw.insert_dropped_item(&mut dropped, 0.0, true, false, &recipes),
++            0
++        );
++        assert_eq!(
++            saw.insert_dropped_item(&mut dropped, 64.0, false, false, &recipes),
++            0
++        );
++        assert_eq!(
++            saw.insert_dropped_item(&mut dropped, 64.0, true, true, &recipes),
++            0
++        );
++        assert_eq!(
++            saw.insert_dropped_item(&mut dropped, 64.0, true, false, &recipes),
++            1
++        );
++        assert_eq!(dropped.item_count, 1);
++        assert_eq!(saw.items[0].item_count, 1);
++        assert_eq!(saw.cycle.remaining, 50.0);
++    }
++
++    #[test]
++    fn filter_selects_first_output_and_invalid_filter_disables_intake() {
++        let mut nbt = NbtCompound::new();
++        let mut filter = NbtCompound::new();
++        stack("minecraft:oak_planks", 1).write_item_stack(&mut filter);
++        nbt.put_compound("Filter", filter);
++        let mut saw = SawProcessing::from_nbt(&nbt);
++        let recipes = [
++            recipe(stack("minecraft:diamond", 1), 1),
++            recipe(stack("minecraft:oak_planks", 1), 50),
++        ];
++        let mut dropped = stack("minecraft:oak_log", 1);
++        assert_eq!(
++            saw.insert_dropped_item(&mut dropped, 64.0, true, false, &recipes),
++            1
++        );
++        assert_eq!(saw.cycle.duration, 50.0);
++
++        let mut invalid_nbt = NbtCompound::new();
++        invalid_nbt.put_int("Filter", 1);
++        let mut disabled = SawProcessing::from_nbt(&invalid_nbt);
++        let mut dropped = stack("minecraft:stone", 1);
++        assert_eq!(
++            disabled.insert_dropped_item(&mut dropped, 64.0, true, false, &recipes),
++            0
++        );
++    }
++
++    #[test]
++    fn powered_cycle_pauses_without_rpm_then_cuts_and_exports() {
++        let recipes = [recipe(stack("minecraft:oak_planks", 1), 1)];
++        let mut saw = SawProcessing::default();
++        let mut dropped = stack("minecraft:oak_log", 1);
++        assert_eq!(
++            saw.insert_dropped_item(&mut dropped, 64.0, true, false, &recipes),
++            1
++        );
++        let before = saw.cycle;
++
++        assert!(!saw.tick(
++            true,
++            0.0,
++            &recipes,
++            || panic!("unpowered saw rolled"),
++            |_| 0
++        ));
++        assert_eq!(saw.cycle, before);
++        assert!(saw.tick(true, 128.0, &recipes, || 0.5, |_| 0));
++        assert!(saw.items[0].is_empty());
++        assert_eq!(
++            saw.items[1].get_item(),
++            Item::from_registry_key("minecraft:oak_planks").unwrap()
++        );
++        assert!(saw.cycle.applied);
++
++        for _ in 0..3 {
++            assert!(saw.tick(true, 128.0, &recipes, || 0.5, |_| 0));
++        }
++        let mut exported = 0;
++        assert!(saw.tick(
++            true,
++            128.0,
++            &recipes,
++            || 0.5,
++            |item| {
++                exported += u32::from(item.item_count);
++                item.item_count
++            }
++        ));
++        assert_eq!(exported, 1);
++        assert!(saw.items.iter().all(ItemStack::is_empty));
++        assert_eq!(saw.cycle.remaining, -1.0);
++    }
++
++    #[test]
++    fn outputs_larger_than_one_stack_are_split_without_loss() {
++        let recipes = [recipe(stack("minecraft:diamond", u8::MAX), 1)];
++        let mut saw = SawProcessing::default();
++        let mut dropped = stack("minecraft:stone", 1);
++        saw.insert_dropped_item(&mut dropped, 64.0, true, false, &recipes);
++
++        assert!(saw.tick(true, 128.0, &recipes, || 0.5, |_| 0));
++        let outputs = &saw.items[1..];
++        assert_eq!(
++            outputs
++                .iter()
++                .map(|item| u32::from(item.item_count))
++                .sum::<u32>(),
++            255
++        );
++        assert!(
++            outputs
++                .iter()
++                .filter(|item| !item.is_empty())
++                .all(|item| { item.item_count <= item.get_max_stack_size() })
++        );
++        assert_eq!(outputs.iter().filter(|item| !item.is_empty()).count(), 4);
++    }
++
++    #[test]
++    fn full_incompatible_outputs_keep_the_input_for_a_later_retry() {
++        let recipes = [recipe(stack("minecraft:diamond", 1), 1)];
++        let mut saw = SawProcessing::default();
++        let mut dropped = stack("minecraft:stone", 1);
++        saw.insert_dropped_item(&mut dropped, 64.0, true, false, &recipes);
++        saw.items[1..].fill(stack("minecraft:stone", 64));
++
++        assert!(!saw.tick(
++            true,
++            128.0,
++            &recipes,
++            || panic!("blocked output rolled"),
++            |_| 0
++        ));
++        assert_eq!(saw.cycle.remaining, 1.0);
++        assert_eq!(saw.items[0].item_count, 1);
++        assert!(!saw.cycle.applied);
++        assert!(saw.items[1..].iter().all(|item| item.item_count == 64));
++    }
++
++    #[test]
++    fn nbt_round_trip_keeps_create_keys_and_unowned_fields() {
++        let recipes = [recipe(stack("minecraft:oak_planks", 1), 50)];
++        let mut saw = SawProcessing::default();
++        let mut dropped = stack("minecraft:oak_log", 1);
++        saw.insert_dropped_item(&mut dropped, 64.0, true, false, &recipes);
++
++        let mut nbt = NbtCompound::new();
++        nbt.put("Filter", NbtTag::Compound(NbtCompound::new()));
++        nbt.put_int("FilterAmount", 64);
++        nbt.put_byte("UpTo", 1);
++        nbt.put_string("ForeignKey", "keep-me".to_owned());
++        saw.write_nbt(&mut nbt);
++
++        let restored = SawProcessing::from_nbt(&nbt);
++        let mut rewritten = nbt.clone();
++        restored.write_nbt(&mut rewritten);
++        assert_eq!(rewritten.get_int("RecipeIndex"), Some(0));
++        assert_eq!(rewritten.get_int("FilterAmount"), Some(64));
++        assert_eq!(rewritten.get_byte("UpTo"), Some(1));
++        assert_eq!(rewritten.get_string("ForeignKey"), Some("keep-me"));
++        assert_eq!(rewritten.get("Filter"), nbt.get("Filter"));
++        assert_eq!(restored.filter_nbt(), nbt.get("Filter"));
++        let mut serialized = NbtCompound::new();
++        restored.write_nbt(&mut serialized);
++        assert_eq!(serialized.get("Filter"), nbt.get("Filter"));
++        assert_eq!(serialized.get_int("FilterAmount"), Some(64));
++        assert_eq!(serialized.get_byte("UpTo"), Some(1));
++        let inventory = serialized.get_compound("Inventory").unwrap();
++        assert_eq!(inventory.get_int("Size"), Some(32));
++        assert_eq!(inventory.get_float("ProcessingTime"), Some(50.0));
++        assert_eq!(inventory.get_float("RecipeTime"), Some(50.0));
++        assert_eq!(inventory.get_byte("AppliedRecipe"), Some(0));
++        let NbtTag::List(items) = inventory.get("Items").unwrap() else {
++            panic!("saw inventory items must be a list");
++        };
++        assert_eq!(items.len(), 1);
++        assert_eq!(
++            items[0].extract_compound().unwrap().get_int("Slot"),
++            Some(0)
++        );
++    }
++
++    #[test]
++    fn malformed_inventory_is_preserved_and_disabled() {
++        let mut malformed = NbtCompound::new();
++        let mut inventory = NbtCompound::new();
++        inventory.put_int("Size", 31);
++        malformed.put_compound("Inventory", inventory);
++        let saw = SawProcessing::from_nbt(&malformed);
++        assert!(!saw.is_supported());
++
++        let mut rewritten = NbtCompound::new();
++        saw.write_nbt(&mut rewritten);
++        assert_eq!(rewritten.get("Inventory"), malformed.get("Inventory"));
++    }
++}

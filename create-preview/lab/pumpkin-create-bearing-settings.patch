@@ -1,0 +1,306 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_bearing.rs b/crates/pumpkin-core/src/block/entities/create_bearing.rs
+--- a/crates/pumpkin-core/src/block/entities/create_bearing.rs
++++ b/crates/pumpkin-core/src/block/entities/create_bearing.rs
+@@ -3,7 +3,7 @@
+ use create_engine::{
+     contraption::{
+         Adhesion, Assembly, BlockRules, CaptureView, Cell, QuarterTurn, Rotation,
+-        bearing::{Bearing, Mode},
++        bearing::{Bearing, Mode, TickAction},
+         clockwork::{self, Angles, ClockTime, Mode as ClockMode},
+         plan_landing,
+         windmill::{Config, RESTORE_ANGLE, RotationDirection, Windmill},
+@@ -427,6 +427,7 @@
+     rpm: f32,
+     generated_rpm: f32,
+     setting: i32,
++    powered_down: bool,
+     running: &std::sync::atomic::AtomicBool,
+ ) -> bool {
+     use std::sync::atomic::Ordering::Relaxed;
+@@ -437,8 +438,7 @@
+         let active = tick_clockwork(world, controller, state, rpm, setting);
+         return running.swap(active, Relaxed) != active;
+     }
+-    let (_, previous, motion) = read(world, controller, state).unwrap_or_default();
+-    let Some(mut motion) = motion else {
++    let Some((_, previous, Some(mut motion))) = read(world, controller, state) else {
+         return running.swap(false, Relaxed);
+     };
+     let changed = !running.swap(true, Relaxed);
+@@ -458,7 +458,24 @@
+         motion.angle = windmill.angle();
+     } else {
+         let mut bearing = Bearing::resume(angle);
+-        bearing.tick(rpm, rpm, Mode::Place, motion.stalled, || false);
++        let last = previous_speed.unwrap_or(0.0);
++        if powered_down || last * rpm < 0.0 {
++            bearing.speed_changed(last, rpm, motion.stalled, None);
++        }
++        let mode = match setting {
++            1 => Mode::PlaceReturned,
++            2 => Mode::NeverPlace,
++            _ => Mode::Place,
++        };
++        if bearing.tick(rpm, rpm, mode, motion.stalled, || false) == TickAction::Disassemble {
++            motion.angle = bearing.angle();
++            if land(world, controller, state, &previous, motion, |p| {
++                within_landing_scope(world, controller, p) && !world.spawn_protects_position(&p)
++            }) {
++                return running.swap(false, Relaxed) || changed;
++            }
++            return changed;
++        }
+         motion.angle = bearing.angle();
+     }
+     if (motion.angle != angle || previous_speed != Some(speed))
+@@ -741,6 +758,74 @@
+     Some(())
+ }
+ 
++fn within_landing_scope(world: &World, controller: BlockPos, p: BlockPos) -> bool {
++    p != controller
++        && p.chunk_and_chunk_relative_position().0
++            == controller.chunk_and_chunk_relative_position().0
++        && world.is_in_build_limit(p)
++        && world.worldborder.lock().is_ok_and(|b| {
++            b.is_within_bounds(f64::from(p.0.x), f64::from(p.0.z), 0.0)
++                && b.is_within_bounds(f64::from(p.0.x) + 0.99999, f64::from(p.0.z) + 0.99999, 0.0)
++        })
++}
++
++fn land(
++    world: &Arc<World>,
++    controller: BlockPos,
++    state: BlockStateId,
++    old: &NbtCompound,
++    mut motion: Motion,
++    in_scope: impl Fn(BlockPos) -> bool,
++) -> bool {
++    let Some(current) = generation(old) else {
++        return false;
++    };
++    let air = Block::AIR.default_state.id;
++    let land_angle = if motion.windmill {
++        RESTORE_ANGLE
++    } else {
++        motion.angle
++    };
++    let Some(axis) = facing(state).map(|d| d.axis()) else {
++        return false;
++    };
++    let turn = Rotation::new(motion.anchor, axis, land_angle)
++        .expect("validated angle")
++        .snapped();
++    let plan = plan_landing(
++        &motion.blocks,
++        motion.anchor,
++        turn,
++        |id, turn| transformed(*id, turn),
++        |p, id| {
++            let p = pos(p);
++            in_scope(p)
++                && world.get_block_state_id_if_loaded(&p) == Some(air)
++                && id
++                    .to_state()
++                    .get_block_collision_shapes_at(&p)
++                    .all(|shape| {
++                        !BlockRegistry::has_blocking_entity_in_box(world, &shape.at_pos(p))
++                    })
++        },
++    );
++    if let Ok(plan) = plan
++        && let Some(cleared) = current
++            .checked_add(1)
++            .and_then(|next| scene(old, motion.controller, next, []))
++    {
++        let edits: Vec<_> = plan.into_iter().map(|(p, id)| (pos(p), air, id)).collect();
++        if commit(world, controller, state, Some(old.clone()), cleared, &edits) {
++            return true;
++        }
++    }
++    motion.stalled = true;
++    if let Some(stalled) = motion.write(old, current, motion.angle, 0.0) {
++        commit(world, controller, state, Some(old.clone()), stalled, &[]);
++    }
++    false
++}
++
+ pub(crate) fn interact(world: &Arc<World>, player: &Player, controller: BlockPos) -> bool {
+     let Some(state) = world.get_block_state_id_if_loaded(&controller) else {
+         return false;
+@@ -771,62 +856,14 @@
+     let anchor = plus(coords(controller), facing.vector());
+     let axis = facing.axis();
+     let in_scope = |p: BlockPos| {
+-        p != controller
+-            && p.chunk_and_chunk_relative_position().0
+-                == controller.chunk_and_chunk_relative_position().0
+-            && world.is_in_build_limit(p)
+-            && !world.is_in_spawn_protection(player, &p)
+-            && world.worldborder.lock().is_ok_and(|b| {
+-                b.is_within_bounds(f64::from(p.0.x), f64::from(p.0.z), 0.0)
+-                    && b.is_within_bounds(
+-                        f64::from(p.0.x) + 0.99999,
+-                        f64::from(p.0.z) + 0.99999,
+-                        0.0,
+-                    )
+-            })
++        within_landing_scope(world, controller, p) && !world.is_in_spawn_protection(player, &p)
+     };
+     if state.to_block().name == CLOCKWORK {
+         interact_clockwork(world, controller, state, facing, previous, old, in_scope);
+         return true;
+     }
+-    if let Some(mut motion) = motion {
+-        let land_angle = if windmill {
+-            RESTORE_ANGLE
+-        } else {
+-            motion.angle
+-        };
+-        let turn = Rotation::new(anchor, axis, land_angle)
+-            .expect("validated angle")
+-            .snapped();
+-        let plan = plan_landing(
+-            &motion.blocks,
+-            anchor,
+-            turn,
+-            |id, turn| transformed(*id, turn),
+-            |p, id| {
+-                let p = pos(p);
+-                in_scope(p)
+-                    && world.get_block_state_id_if_loaded(&p) == Some(air)
+-                    && id
+-                        .to_state()
+-                        .get_block_collision_shapes_at(&p)
+-                        .all(|shape| {
+-                            !BlockRegistry::has_blocking_entity_in_box(world, &shape.at_pos(p))
+-                        })
+-            },
+-        );
+-        if let Ok(plan) = plan
+-            && let Some(cleared) = scene(&old, motion.controller, next_generation, [])
+-        {
+-            let edits: Vec<_> = plan.into_iter().map(|(p, id)| (pos(p), air, id)).collect();
+-            if commit(world, controller, state, Some(old.clone()), cleared, &edits) {
+-                return true;
+-            }
+-        }
+-        motion.stalled = true;
+-        if let Some(stalled) = motion.write(&old, current_generation, motion.angle, 0.0) {
+-            commit(world, controller, state, Some(old), stalled, &[]);
+-        }
++    if let Some(motion) = motion {
++        land(world, controller, state, &old, motion, in_scope);
+     } else if (previous.is_none()
+         || (current_generation > 0
+             && [GEOMETRY, POSES].into_iter().all(|key| {
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -128,6 +128,7 @@
+     };
+     let [x, y, z, mode, value] = [*x, *y, *z, *mode, *value].map(i32::from_be_bytes);
+     let id = match mode {
++        0 if (0..=2).contains(&value) => super::create_bearing::ID,
+         1 if (0..=1).contains(&value) => super::create_bearing::WINDMILL,
+         2 if (0..=2).contains(&value) => super::create_bearing::CLOCKWORK,
+         _ => return None,
+@@ -177,6 +178,7 @@
+     material: AtomicU16,
+     structure_ready: AtomicBool,
+     bearing_running: AtomicBool,
++    bearing_powered: AtomicBool,
+     windmill_generated: AtomicI32,
+     drill: Option<Box<drill::Drill>>,
+     saw_processing: Option<Box<Mutex<SawProcessing>>>,
+@@ -457,6 +459,7 @@
+             material: AtomicU16::new(Item::SPRUCE_PLANKS.id),
+             structure_ready: AtomicBool::new(false),
+             bearing_running: AtomicBool::new(false),
++            bearing_powered: AtomicBool::new(false),
+             windmill_generated: AtomicI32::new(0),
+             drill: matches!(id, drill::ID | saw::ID).then(|| Box::new(drill::Drill::new())),
+             saw_processing: (id == saw::ID).then(|| Box::new(Mutex::new(SawProcessing::default()))),
+@@ -791,7 +794,7 @@
+         if let Some(setting) = nbt.get_int("ScrollValue").filter(|n| match id {
+             MOTOR => *n != 0 && (-256..=256).contains(n),
+             super::create_bearing::WINDMILL => (0..=1).contains(n),
+-            super::create_bearing::CLOCKWORK => (0..=2).contains(n),
++            super::create_bearing::ID | super::create_bearing::CLOCKWORK => (0..=2).contains(n),
+             _ => false,
+         }) {
+             entity.setting.store(setting, Ordering::Relaxed);
+@@ -1249,7 +1252,19 @@
+             *readings = next;
+             (changed || press_changed, changed_signal)
+         };
+-        let bearing = super::create_bearing::is_bearing(self.id)
++        let is_bearing = super::create_bearing::is_bearing(self.id);
++        // Overstress keeps theoretical drive even when the effective RPM is zero.
++        let powered_down = is_bearing
++            && !exhausted
++            && match network.status {
++                Status::Idle => self.bearing_powered.swap(false, Ordering::Relaxed),
++                Status::Running | Status::Overstressed => {
++                    self.bearing_powered.store(true, Ordering::Relaxed);
++                    false
++                }
++                _ => false,
++            };
++        let bearing = is_bearing
+             && super::create_bearing::tick(
+                 world,
+                 self.position,
+@@ -1257,6 +1272,7 @@
+                 bearing_rpm,
+                 self.windmill_generated.load(Ordering::Relaxed) as f32,
+                 self.setting.load(Ordering::Relaxed),
++                powered_down,
+                 &self.bearing_running,
+             );
+         let bearing = bearing || windmill_changed;
+@@ -1338,7 +1354,7 @@
+ 
+     #[test]
+     fn motion_settings_validate_and_persist() {
+-        use super::super::create_bearing::{CLOCKWORK, WINDMILL};
++        use super::super::create_bearing::{CLOCKWORK, ID, WINDMILL};
+         let mut payload = b"\x16create:motion_settings\x14".to_vec();
+         payload.extend([2i32, 3, -4, 1, 1].into_iter().flat_map(i32::to_be_bytes));
+         let pos = BlockPos::new(2, 3, -4);
+@@ -1346,12 +1362,14 @@
+         let end = payload.len() - 1;
+         payload[end] = 2;
+         assert!(motion_setting(&payload).is_none());
++        payload[end - 4] = 0;
++        assert_eq!(motion_setting(&payload), Some((ID, (pos, 2))));
+         payload[end - 4] = 2;
+         assert_eq!(motion_setting(&payload), Some((CLOCKWORK, (pos, 2))));
+         payload[end] = 3;
+         assert!(motion_setting(&payload).is_none());
+         let mut nbt = NbtCompound::new();
+-        for (id, max) in [(WINDMILL, 1), (CLOCKWORK, 2)] {
++        for (id, max) in [(ID, 2), (WINDMILL, 1), (CLOCKWORK, 2)] {
+             nbt.put_string("id", id.into());
+             for (stored, expected) in [(max, max), (0, 0), (-1, 0), (42, 0)] {
+                 nbt.put_int("ScrollValue", stored);
+diff --git a/crates/pumpkin-core/src/world/mod.rs b/crates/pumpkin-core/src/world/mod.rs
+--- a/crates/pumpkin-core/src/world/mod.rs
++++ b/crates/pumpkin-core/src/world/mod.rs
+@@ -603,10 +603,11 @@
+ 
+     #[must_use]
+     pub fn is_in_spawn_protection(&self, player: &Player, position: &BlockPos) -> bool {
+-        if player.permission_lvl.load() == pumpkin_util::permission::PermissionLvl::Four {
+-            return false;
+-        }
+-
++        player.permission_lvl.load() != pumpkin_util::permission::PermissionLvl::Four
++            && self.spawn_protects_position(position)
++    }
++
++    pub(crate) fn spawn_protects_position(&self, position: &BlockPos) -> bool {
+         let Some(server) = self.server.upgrade() else {
+             return false;
+         };

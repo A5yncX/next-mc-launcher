@@ -1,0 +1,70 @@
+--- a/crates/pumpkin-core/src/data/datapack/recipe_loader.rs
++++ b/crates/pumpkin-core/src/data/datapack/recipe_loader.rs
+@@ -56,7 +56,11 @@
+ 
+ fn parse_ingredient(value: &Value) -> Option<OwnedRecipeIngredient> {
+     match value {
+-        Value::String(s) => Some(OwnedRecipeIngredient::Simple(normalize_id(s))),
++        Value::String(s) => Some(if let Some(tag) = s.strip_prefix('#') {
++            OwnedRecipeIngredient::Tagged(normalize_id(tag))
++        } else {
++            OwnedRecipeIngredient::Simple(normalize_id(s))
++        }),
+         Value::Object(map) => map
+             .get("tag")
+             .and_then(Value::as_str)
+@@ -379,6 +383,31 @@
+     use super::*;
+ 
+     #[test]
++    fn nextmc_create_namespaced_ingredients() {
++        use pumpkin_data::item::Item;
++        let member = Item::from_registry_key("create:cut_andesite").unwrap();
++        let DynamicRecipe::Stonecutting(recipe) = parse_recipe(
++            "create",
++            "polished_cut_andesite",
++            r##"{
++            "type":"minecraft:stonecutting",
++            "ingredient":"#create:stone_types/andesite",
++            "result":{"id":"create:polished_cut_andesite","count":1}
++        }"##,
++        )
++        .unwrap() else {
++            panic!("expected stonecutting recipe");
++        };
++        assert!(recipe.ingredient.match_item(member));
++        assert!(recipe.ingredient.match_item(&Item::ANDESITE));
++        assert!(!recipe.ingredient.match_item(&Item::DIORITE));
++        assert_eq!(recipe.result.item_id, "create:polished_cut_andesite");
++        let simple = parse_ingredient(&Value::String("create:cut_andesite".into())).unwrap();
++        assert!(simple.match_item(member));
++        assert!(!simple.match_item(&Item::ANDESITE));
++    }
++
++    #[test]
+     fn parse_shaped_recipe() {
+         let json = r##"{
+             "type": "minecraft:crafting_shaped",
+--- a/crates/pumpkin-protocol/src/codec/recipe.rs
++++ b/crates/pumpkin-protocol/src/codec/recipe.rs
+@@ -13,16 +13,12 @@
+ impl OwnedRecipeIngredient {
+     #[must_use]
+     pub fn match_item(&self, item: &Item) -> bool {
++        let matches_id =
++            |id: &str| Item::from_registry_key(id).is_some_and(|entry| entry.id == item.id);
+         match self {
+-            Self::Simple(id) => {
+-                let name = format!("minecraft:{}", item.registry_key);
+-                name == *id
+-            }
++            Self::Simple(id) => matches_id(id),
+             Self::Tagged(tag) => item.is_tagged_with(tag).unwrap_or(false),
+-            Self::OneOf(ids) => {
+-                let name = format!("minecraft:{}", item.registry_key);
+-                ids.contains(&name)
+-            }
++            Self::OneOf(ids) => ids.iter().any(|id| matches_id(id)),
+         }
+     }
+ }

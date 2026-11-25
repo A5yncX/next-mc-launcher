@@ -1,0 +1,462 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_bearing.rs b/crates/pumpkin-core/src/block/entities/create_bearing.rs
+--- a/crates/pumpkin-core/src/block/entities/create_bearing.rs
++++ b/crates/pumpkin-core/src/block/entities/create_bearing.rs
+@@ -26,6 +26,8 @@
+     world::World,
+ };
+ 
++use super::create_harvester as harvester;
++
+ pub(crate) const ID: &str = "create:mechanical_bearing";
+ pub(crate) const WINDMILL: &str = "create:windmill_bearing";
+ pub(crate) const CLOCKWORK: &str = "create:clockwork_bearing";
+@@ -81,15 +83,23 @@
+ fn transformed(id: BlockStateId, turn: QuarterTurn) -> Option<BlockStateId> {
+     Some(if let Some(sail) = create_sail::read(id) {
+         with_property(id, "facing", turn.facing(sail.facing).name())
++    } else if let Some(face) = harvester::facing(id) {
++        harvester::state(turn.facing(face).name())?
+     } else {
+         id
+     })
+ }
+ 
+-fn decode_state(state: &NbtCompound, windmill: bool) -> Option<BlockStateId> {
++fn decode_state(state: &NbtCompound, windmill: bool, actors: bool) -> Option<BlockStateId> {
+     let name = state.get_string("id")?;
+     if let Some((_, block, _)) = PAYLOAD.iter().find(|(id, _, _)| *id == name) {
+         return Some(block.default_state.id);
++    }
++    if actors && name == harvester::ID {
++        let props = state.get_compound("properties")?;
++        return (props.get_string("waterlogged")? == "false")
++            .then(|| harvester::state(props.get_string("facing")?))
++            .flatten();
+     }
+     if !windmill {
+         return None;
+@@ -135,6 +145,18 @@
+                 return Cell::Block(BlockRules::default());
+             }
+         }
++        if harvester::facing(id).is_some()
++            && self
++                .0
++                .get_block_state_id_if_loaded(&self.1)
++                .is_some_and(|controller| {
++                    controller.to_block().name == ID
++                        && facing(controller).is_some_and(|d| d.axis().index() == 1)
++                })
++            && self.0.get_block_entity(&p).is_none()
++        {
++            return Cell::Block(BlockRules::default());
++        }
+         let Some((_, adhesion)) = payload(id) else {
+             return Cell::Block(BlockRules {
+                 movable: false,
+@@ -275,7 +297,10 @@
+             {
+                 return None;
+             }
+-            blocks.push((local, decode_state(block.get_compound("State")?, windmill)?));
++            blocks.push((
++                local,
++                decode_state(block.get_compound("State")?, windmill, !home && axis == 1)?,
++            ));
+         }
+         if !blocks.iter().any(|(p, _)| *p == [0; 3])
+             || (windmill && geo.get_int("WindmillSails") != Some(sail_count(&blocks) as i32))
+@@ -334,6 +359,11 @@
+                     if let Some(sail) = create_sail::read(id) {
+                         let mut props = NbtCompound::new();
+                         props.put_string("facing", sail.facing.name().into());
++                        state.put_compound("properties", props);
++                    } else if let Some(face) = harvester::facing(id) {
++                        let mut props = NbtCompound::new();
++                        props.put_string("facing", face.name().into());
++                        props.put_string("waterlogged", "false".into());
+                         state.put_compound("properties", props);
+                     }
+                     let mut block = NbtCompound::new();
+@@ -444,8 +474,8 @@
+     let changed = !running.swap(true, Relaxed);
+     let angle = motion.angle;
+     let rpm = if motion.stalled { 0.0 } else { rpm };
+-    let previous_speed =
+-        owned_entry(&previous, POSES, coords(controller)).and_then(|pose| pose.get_float("Speed"));
++    let previous_pose = owned_entry(&previous, POSES, coords(controller));
++    let previous_speed = previous_pose.and_then(|pose| pose.get_float("Speed"));
+     let speed = if motion.windmill && rpm != 0.0 {
+         generated_rpm
+     } else {
+@@ -478,10 +508,34 @@
+         }
+         motion.angle = bearing.angle();
+     }
+-    if (motion.angle != angle || previous_speed != Some(speed))
+-        && let Some(new) = motion.write(&previous, generation(&previous).unwrap(), angle, speed)
+-    {
+-        commit(world, controller, state, Some(previous), new, &[]);
++    if motion.angle != angle || previous_speed != Some(speed) {
++        let (geo, mut pose) = motion.entries(angle, speed);
++        let visits = if !motion.windmill && motion.axis == 1 && !motion.stalled && speed != 0.0 {
++            harvester::sample(
++                &motion.blocks,
++                motion.anchor,
++                motion.angle,
++                previous_pose,
++                &mut pose,
++            )
++        } else {
++            harvester::preserve_trackers(previous_pose, &mut pose);
++            Vec::new()
++        };
++        if let Some(new) = scene(
++            &previous,
++            motion.controller,
++            generation(&previous).unwrap(),
++            [(geo, pose)],
++        ) && commit(world, controller, state, Some(previous), new, &[])
++        {
++            drop(_guard);
++            for target in visits.into_iter().map(pos) {
++                if within_landing_scope(world, controller, target) {
++                    harvester::harvest_wheat(world, target);
++                }
++            }
++        }
+     }
+     changed
+ }
+@@ -820,7 +874,9 @@
+         }
+     }
+     motion.stalled = true;
+-    if let Some(stalled) = motion.write(old, current, motion.angle, 0.0) {
++    let (geo, mut pose) = motion.entries(motion.angle, 0.0);
++    harvester::preserve_trackers(owned_entry(old, POSES, motion.controller), &mut pose);
++    if let Some(stalled) = scene(old, motion.controller, current, [(geo, pose)]) {
+         commit(world, controller, state, Some(old.clone()), stalled, &[]);
+     }
+     false
+diff --git a/crates/pumpkin-core/src/block/entities/mod.rs b/crates/pumpkin-core/src/block/entities/mod.rs
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -23,6 +23,7 @@
+ pub mod comparator;
+ pub(crate) mod create_basin;
+ pub(crate) mod create_bearing;
++mod create_harvester;
+ pub(crate) mod create_chute;
+ pub(crate) mod create_crusher;
+ pub(crate) mod create_deployer;
+diff --git a/crates/pumpkin-core/src/block/entities/create_harvester.rs b/crates/pumpkin-core/src/block/entities/create_harvester.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_harvester.rs
+@@ -0,0 +1,305 @@
++use std::sync::Arc;
++
++use create_engine::{
++    contraption::{
++        Rotation,
++        actors::{
++            MotionState, MotionTracker, Sample, Tool,
++            harvester::{self, Age, Block as HarvesterBlock, Harvest, Plant, Replacement, Rules},
++        },
++    },
++    kinetics::{Axis, Pos},
++    placement::Direction,
++};
++use pumpkin_data::{
++    Block, BlockStateId,
++    block_properties::WheatLikeProperties,
++    item::Item,
++    item_stack::ItemStack,
++    tag::{self, Taggable},
++};
++use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
++use pumpkin_util::math::position::BlockPos;
++use pumpkin_world::world::BlockFlags;
++
++use crate::{
++    block::blocks::{
++        create_pipe::with_property,
++        plant::crop::{MAX_AGE, has_sufficient_light},
++    },
++    world::{World, loot::LootContextParameters},
++};
++
++pub(super) const ID: &str = "create:mechanical_harvester";
++const TRACKERS: &str = "NextMcHarvesters";
++
++pub(super) fn facing(id: BlockStateId) -> Option<Direction> {
++    let block = id.to_block();
++    if block.name != ID {
++        return None;
++    }
++    let props = block.properties(id)?.to_props();
++    if !props
++        .iter()
++        .any(|p| p.key().to_str() == "waterlogged" && p.value_str() == "false")
++    {
++        return None;
++    }
++    let face = props
++        .iter()
++        .find(|p| p.key().to_str() == "facing")?
++        .value_str();
++    Direction::ALL
++        .into_iter()
++        .find(|d| d.axis() != Axis::Y && d.name() == face)
++}
++
++pub(super) fn state(face: &str) -> Option<BlockStateId> {
++    let block = Block::from_registry_key(ID)?;
++    let id = with_property(
++        with_property(block.default_state.id, "waterlogged", "false"),
++        "facing",
++        face,
++    );
++    (facing(id)?.name() == face).then_some(id)
++}
++
++pub(super) fn sample(
++    blocks: &[(Pos, BlockStateId)],
++    anchor: Pos,
++    angle: f32,
++    previous: Option<&NbtCompound>,
++    next: &mut NbtCompound,
++) -> Vec<Pos> {
++    let rotation = Rotation::new(anchor, Axis::Y, angle).expect("validated pose");
++    let inverse = Rotation::new([0; 3], Axis::Y, -angle).expect("validated pose");
++    let mut saved = Vec::new();
++    let mut visits = Vec::new();
++    let entries = previous
++        .and_then(|p| p.get_list(TRACKERS))
++        .unwrap_or_default();
++    for &(local, id) in blocks {
++        let Some(face) = facing(id) else { continue };
++        let state = entries.iter().find_map(|entry| {
++            let NbtTag::Compound(entry) = entry else {
++                return None;
++            };
++            if entry.get_int_array("Pos")? != local {
++                return None;
++            }
++            let xyz = |key| match entry.get_list(key)? {
++                [NbtTag::Double(x), NbtTag::Double(y), NbtTag::Double(z)] => Some([*x, *y, *z]),
++                _ => None,
++            };
++            MotionTracker::restore(MotionState {
++                position: Some(xyz("Position")?),
++                motion: xyz("Motion")?,
++                relative_motion: xyz("RelativeMotion")?,
++                first_movement: entry.get_bool("First")?,
++            })
++        });
++        let mut tracker = state.unwrap_or_default();
++        let result = tracker.sample(
++            Sample {
++                position: rotation.to_world(Tool::Harvester.active_point(local, face)),
++                facing: face,
++                stalled: false,
++                disabled: false,
++                allow_stationary_first_visit: false,
++            },
++            |motion| motion,
++            |motion| inverse.rotate_vector(motion),
++        );
++        visits.extend(result.visit);
++        let state = tracker.state();
++        let mut entry = NbtCompound::new();
++        entry.put("Pos", NbtTag::IntArray(local.into()));
++        for (key, values) in [
++            ("Position", state.position.expect("sampled")),
++            ("Motion", state.motion),
++            ("RelativeMotion", state.relative_motion),
++        ] {
++            entry.put_list(key, values.into_iter().map(NbtTag::Double).collect());
++        }
++        entry.put_bool("First", state.first_movement);
++        saved.push(NbtTag::Compound(entry));
++    }
++    if !saved.is_empty() {
++        next.put_list(TRACKERS, saved);
++    }
++    visits
++}
++
++pub(super) fn preserve_trackers(previous: Option<&NbtCompound>, next: &mut NbtCompound) {
++    if let Some(saved) = previous.and_then(|p| p.get_list(TRACKERS)) {
++        next.put_list(TRACKERS, saved.to_vec());
++    }
++}
++
++pub(super) fn harvest_wheat(world: &Arc<World>, pos: BlockPos) {
++    if !world.is_in_build_limit(pos) || world.spawn_protects_position(&pos) {
++        return;
++    }
++    let Some(original_state) = world.get_block_state_id_if_loaded(&pos) else {
++        return;
++    };
++    if original_state.to_block() != &Block::WHEAT {
++        return;
++    }
++    let properties = WheatLikeProperties::from_state_id(original_state);
++    if properties.age != MAX_AGE {
++        return;
++    }
++
++    let soil_pos = pos.down();
++    if !world.is_in_build_limit(soil_pos) {
++        return;
++    }
++    let Some(soil_state) = world.get_block_state_id_if_loaded(&soil_pos) else {
++        return;
++    };
++    let Some(mut harvest) = harvester::plan(
++        HarvesterBlock {
++            plant: Plant::Crop {
++                age: Age {
++                    value: u32::from(properties.age),
++                    mature_value: u32::from(MAX_AGE),
++                },
++                matches_default_zero_state: original_state == Block::WHEAT.default_state.id,
++            },
++            collision_empty: true,
++            ..Default::default()
++        },
++        Rules::default(),
++    ) else {
++        return;
++    };
++    if harvest.replacement != Replacement::ResetCropAge {
++        return;
++    }
++
++    let mut replanted_properties = properties;
++    replanted_properties.age = 0;
++    let replanted_state = if soil_state
++        .to_block()
++        .has_tag(&tag::Block::MINECRAFT_SUPPORTS_CROPS)
++        && has_sufficient_light(world, &pos)
++    {
++        replanted_properties.to_state_id(&Block::WHEAT)
++    } else {
++        Block::AIR.default_state.id
++    };
++    // This exact CAS gates all loot release so concurrent harvest attempts cannot duplicate drops.
++    if world
++        .set_block_state_if(&pos, replanted_state, BlockFlags::NOTIFY_ALL, |current| {
++            current == original_state
++        })
++        .is_none()
++    {
++        return;
++    }
++
++    release_loot(world, pos, original_state, &mut harvest);
++}
++
++fn withhold_replant_seed(harvest: &mut Harvest, stack: &mut ItemStack) {
++    stack.item_count = harvest.accept_drop(
++        stack.item == &Item::WHEAT_SEEDS,
++        u32::from(stack.item_count),
++    ) as u8;
++}
++
++fn release_loot(
++    world: &Arc<World>,
++    pos: BlockPos,
++    original_state: pumpkin_data::BlockStateId,
++    harvest: &mut Harvest,
++) {
++    let block = original_state.to_block();
++    let Some(loot_table) = block.loot_table.and_then(|key| world.get_loot_table(key)) else {
++        return;
++    };
++    let params = LootContextParameters {
++        world: Some(world),
++        tool: Some(ItemStack::EMPTY.clone()),
++        block_state: Some(original_state.to_state()),
++        position: Some(pos.to_f64()),
++        killed_by_player: Some(false),
++        world_time: u64::try_from(world.get_time_of_day()).unwrap_or_default(),
++        ..Default::default()
++    };
++    let mut items = loot_table.generate_loot_with_context(rand::random(), &params);
++    for stack in &mut items {
++        withhold_replant_seed(harvest, stack);
++    }
++    items.retain(|stack| !stack.is_empty());
++    if items.is_empty() {
++        return;
++    }
++
++    let mut event = crate::plugin::block::block_drop_item::BlockDropItemEvent {
++        block_pos: pos,
++        world: world.clone(),
++        player: None,
++        items,
++        cancelled: false,
++    };
++    if let Some(server) = world.server.upgrade() {
++        server.plugin_manager.fire_blocking(&server, &mut event);
++    }
++    if !event.cancelled {
++        for stack in event.items {
++            world.drop_stack(&pos, stack);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn saved_tracker_crosses_the_expected_crop_cell() {
++        let anchor = [-266, 80, -108];
++        let tool = [([3, 0, 0], state("north").unwrap())];
++        let mut first = NbtCompound::new();
++        assert!(sample(&tool, anchor, 9.6, None, &mut first).is_empty());
++        let mut second = NbtCompound::new();
++        assert_eq!(
++            sample(&tool, anchor, 19.2, Some(&first), &mut second),
++            [[-263, 80, -109]]
++        );
++        let mut duplicate = NbtCompound::new();
++        assert!(sample(&tool, anchor, 19.2, Some(&second), &mut duplicate).is_empty());
++    }
++
++    #[test]
++    fn withholds_only_the_first_wheat_seed_drop() {
++        let mut harvest = harvester::plan(
++            HarvesterBlock {
++                plant: Plant::Crop {
++                    age: Age {
++                        value: 7,
++                        mature_value: 7,
++                    },
++                    matches_default_zero_state: false,
++                },
++                collision_empty: true,
++                ..Default::default()
++            },
++            Rules::default(),
++        )
++        .unwrap();
++        let mut wheat = ItemStack::new(1, &Item::WHEAT);
++        let mut first_seed = ItemStack::new(1, &Item::WHEAT_SEEDS);
++        let mut next_seed = ItemStack::new(2, &Item::WHEAT_SEEDS);
++
++        withhold_replant_seed(&mut harvest, &mut wheat);
++        withhold_replant_seed(&mut harvest, &mut first_seed);
++        withhold_replant_seed(&mut harvest, &mut next_seed);
++
++        assert_eq!(wheat.item_count, 1);
++        assert_eq!(first_seed.item_count, 0);
++        assert_eq!(next_seed.item_count, 2);
++    }
++}

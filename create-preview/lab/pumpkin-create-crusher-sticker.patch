@@ -1,0 +1,1449 @@
+diff --git a/crates/pumpkin-core/src/block/blocks/mod.rs b/crates/pumpkin-core/src/block/blocks/mod.rs
+--- a/crates/pumpkin-core/src/block/blocks/mod.rs
++++ b/crates/pumpkin-core/src/block/blocks/mod.rs
+@@ -129,6 +129,7 @@
+ pub(crate) mod create_pipe;
+ pub(crate) mod create_pump;
+ pub(crate) mod create_sail;
++pub(crate) mod create_sticker;
+ pub(crate) mod create_water_wheel;
+ pub mod dried_ghast;
+ pub mod frogspawn;
+diff --git a/crates/pumpkin-core/src/block/blocks/create_sticker.rs b/crates/pumpkin-core/src/block/blocks/create_sticker.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/blocks/create_sticker.rs
+@@ -0,0 +1,136 @@
++use std::sync::Arc;
++
++use create_engine::{contraption::sticker::State, placement::Direction};
++use pumpkin_data::BlockStateId;
++use pumpkin_macros::pumpkin_block;
++use pumpkin_util::math::position::BlockPos;
++use pumpkin_world::world::BlockFlags;
++
++use crate::{
++    block::{
++        BlockBehaviour, OnNeighborUpdateArgs, PlacedArgs,
++        blocks::{
++            create_pipe::{boolean, property, with_property},
++            redstone::block_receives_redstone_power,
++        },
++    },
++    world::World,
++};
++
++pub(crate) const ID: &str = "create:sticker";
++
++fn read_state(state: BlockStateId) -> Option<State> {
++    if state.to_block().name != ID {
++        return None;
++    }
++    let read_bool = |key| match property(state, key)? {
++        "true" => Some(true),
++        "false" => Some(false),
++        _ => None,
++    };
++    let facing = property(state, "facing")?;
++    Some(State {
++        facing: Direction::ALL
++            .into_iter()
++            .find(|dir| dir.name() == facing)?,
++        powered: read_bool("powered")?,
++        extended: read_bool("extended")?,
++    })
++}
++
++fn update(current: State, powered: bool, placement: bool) -> State {
++    if placement {
++        State {
++            powered,
++            extended: false,
++            ..current
++        }
++    } else {
++        current.with_signal(powered)
++    }
++}
++
++pub(crate) fn placed_state(
++    world: &World,
++    position: &BlockPos,
++    state: BlockStateId,
++) -> BlockStateId {
++    write_signal(world, position, state, true)
++}
++
++fn write_signal(
++    world: &World,
++    position: &BlockPos,
++    state: BlockStateId,
++    placement: bool,
++) -> BlockStateId {
++    let Some(current) = read_state(state) else {
++        return state;
++    };
++    let next = update(
++        current,
++        block_receives_redstone_power(world, position),
++        placement,
++    );
++    with_property(
++        with_property(state, "powered", boolean(next.powered)),
++        "extended",
++        boolean(next.extended),
++    )
++}
++
++fn update_signal(world: &Arc<World>, position: &BlockPos, state: BlockStateId, placement: bool) {
++    let updated = write_signal(world, position, state, placement);
++    if state != updated {
++        world.set_block_state_if(position, updated, BlockFlags::NOTIFY_ALL, |id| id == state);
++    }
++}
++
++#[pumpkin_block("create:sticker")]
++pub struct CreateStickerBlock;
++
++impl BlockBehaviour for CreateStickerBlock {
++    fn placed(&self, args: PlacedArgs<'_>) {
++        update_signal(args.world, args.position, args.state_id, true);
++    }
++
++    fn on_neighbor_update(&self, args: OnNeighborUpdateArgs<'_>) {
++        if let Some(state) = args.world.get_block_state_id_if_loaded(args.position) {
++            update_signal(args.world, args.position, state, false);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn placement_and_signal_edges_match_create_latching() {
++        let initial = State {
++            facing: Direction::West,
++            powered: false,
++            extended: true,
++        };
++        let mut state = update(initial, true, true);
++        assert_eq!(
++            state,
++            State {
++                powered: true,
++                extended: false,
++                ..initial
++            }
++        );
++        for (signal, extended) in [
++            (true, false),
++            (false, false),
++            (true, true),
++            (true, true),
++            (false, true),
++            (true, false),
++        ] {
++            state = state.with_signal(signal);
++            assert_eq!((state.powered, state.extended), (signal, extended));
++        }
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/entities/create_crusher.rs b/crates/pumpkin-core/src/block/entities/create_crusher.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_crusher.rs
+@@ -0,0 +1,1073 @@
++use std::{
++    any::Any,
++    array::from_fn,
++    sync::{
++        Arc, Mutex, OnceLock, PoisonError, RwLock,
++        atomic::{AtomicBool, Ordering},
++    },
++};
++
++use create_engine::{
++    crushing::{self, Action, Cycle},
++    kinetics::Axis,
++    placement::Direction,
++};
++use pumpkin_data::{Block, BlockStateId, entity::EntityType, item_stack::ItemStack};
++use pumpkin_inventory::{Clearable, Inventory};
++use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
++use pumpkin_util::math::{boundingbox::BoundingBox, position::BlockPos, vector3::Vector3};
++use rand::RngExt;
++
++use crate::{
++    block::blocks::create_pipe,
++    entity::{Entity, item::ItemEntity},
++    world::{BlockFlags, World},
++};
++
++use super::{
++    BlockEntity,
++    create_kinetic::CreateKinetic,
++    create_millstone::{self, MillingRecipe},
++};
++
++pub(super) const WHEEL: &str = "create:crushing_wheel";
++pub(crate) const ID: &str = "create:crushing_wheel_controller";
++const SLOTS: usize = 32;
++const OUTPUT_START: usize = 1;
++const MAX_DURATION: f32 = 1_000_000.0;
++const MAX_INPUT_COUNT: u8 = create_engine::milling::SLOT_LIMIT as u8;
++const GAPS: [Direction; 2] = [Direction::East, Direction::South];
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct WheelPair {
++    /// Direction from the controller to the positive-side wheel.
++    pub(crate) side: Direction,
++    pub(crate) axis: Axis,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct ControllerState {
++    pub(crate) valid: bool,
++    pub(crate) facing: Direction,
++    pub(crate) speed: f32,
++}
++
++impl Default for ControllerState {
++    fn default() -> Self {
++        Self {
++            valid: false,
++            facing: Direction::Down,
++            speed: 0.0,
++        }
++    }
++}
++
++/// Checks only the four cells in the Stage pair search; `wheel_axis_at` must not load chunks.
++pub(crate) fn pair(
++    center: [i32; 3],
++    mut wheel_axis_at: impl FnMut([i32; 3]) -> Option<Axis>,
++) -> Option<WheelPair> {
++    fn offset(position: [i32; 3], direction: Direction) -> Option<[i32; 3]> {
++        let [x, y, z] = direction.vector();
++        Some([
++            position[0].checked_add(x)?,
++            position[1].checked_add(y)?,
++            position[2].checked_add(z)?,
++        ])
++    }
++
++    let mut found = None;
++    for side in GAPS {
++        let (Some(positive), Some(negative)) =
++            (offset(center, side), offset(center, side.opposite()))
++        else {
++            continue;
++        };
++        let (Some(axis), Some(other_axis)) = (wheel_axis_at(positive), wheel_axis_at(negative))
++        else {
++            continue;
++        };
++        if axis != other_axis || !matches!(axis, Axis::X | Axis::Z) || side.axis() == axis {
++            continue;
++        }
++        if found.is_some() {
++            return None;
++        }
++        found = Some(WheelPair { side, axis });
++    }
++    found
++}
++
++fn relative(pos: BlockPos, dir: Direction) -> BlockPos {
++    let [dx, dy, dz] = dir.vector();
++    BlockPos::new(pos.0.x + dx, pos.0.y + dy, pos.0.z + dz)
++}
++
++pub(crate) fn item_collision_empty(state: BlockStateId) -> bool {
++    state.to_block().name == ID
++        && create_pipe::property(state, "valid") == Some("true")
++        && create_pipe::property(state, "facing") == Some("down")
++}
++
++fn loaded_pair(world: &World, center: BlockPos) -> Option<WheelPair> {
++    pair([center.0.x, center.0.y, center.0.z], |[x, y, z]| {
++        let id = world.get_block_state_id_if_loaded(&BlockPos::new(x, y, z))?;
++        if id.to_block().name != WHEEL {
++            return None;
++        }
++        match create_pipe::property(id, "axis")? {
++            "x" => Some(Axis::X),
++            "z" => Some(Axis::Z),
++            _ => None,
++        }
++    })
++}
++
++pub(super) fn form_controller(world: &Arc<World>, wheel: BlockPos, axis: Axis) {
++    let side = match axis {
++        Axis::X => Direction::South,
++        Axis::Z => Direction::East,
++        Axis::Y => return,
++    };
++    let center = relative(wheel, side);
++    let Some(state) = world.get_block_state_id_if_loaded(&center) else {
++        return;
++    };
++    if state.to_block() != &Block::AIR || loaded_pair(world, center).is_none() {
++        return;
++    }
++    let Some(controller) = Block::from_name(ID) else {
++        return;
++    };
++    world.set_block_state_if(
++        &center,
++        controller.default_state.id,
++        BlockFlags::NOTIFY_ALL,
++        |current| current == state,
++    );
++}
++
++fn recipe_for(input: &ItemStack) -> Option<&'static MillingRecipe> {
++    static RECIPES: OnceLock<Vec<MillingRecipe>> = OnceLock::new();
++    RECIPES
++        .get_or_init(|| {
++            serde_json::from_str(include_str!(concat!(
++                env!("CARGO_MANIFEST_DIR"),
++                "/../../assets/nextmc-create-crushing.json"
++            )))
++            .expect("pinned Create crushing recipes")
++        })
++        .iter()
++        .find(|recipe| recipe.matches(input))
++        .or_else(|| create_millstone::recipe_for(input))
++}
++
++pub struct CreateCrushingWheelControllerBlockEntity {
++    pub position: BlockPos,
++    pub items: RwLock<[ItemStack; SLOTS]>,
++    cycle: Mutex<Cycle>,
++    state: RwLock<ControllerState>,
++    dirty: AtomicBool,
++    opaque_inventory: Option<NbtTag>,
++}
++
++impl BlockEntity for CreateCrushingWheelControllerBlockEntity {
++    fn resource_location(&self) -> &'static str {
++        ID
++    }
++
++    fn get_position(&self) -> BlockPos {
++        self.position
++    }
++
++    fn from_nbt(nbt: &NbtCompound, position: BlockPos) -> Self {
++        let (items, cycle, opaque_inventory) = if nbt.get("Inventory").is_some() {
++            match read_inventory(nbt) {
++                Some((items, cycle)) => (items, cycle, None),
++                None => (
++                    empty_items(),
++                    Cycle::default(),
++                    nbt.get("Inventory").cloned(),
++                ),
++            }
++        } else {
++            (empty_items(), Cycle::default(), None)
++        };
++        let speed = nbt
++            .get_float("Speed")
++            .filter(|speed| speed.is_finite() && *speed >= 0.0)
++            .unwrap_or(0.0);
++        Self {
++            position,
++            items: RwLock::new(items),
++            cycle: Mutex::new(cycle),
++            state: RwLock::new(ControllerState {
++                speed,
++                ..ControllerState::default()
++            }),
++            dirty: AtomicBool::new(false),
++            opaque_inventory,
++        }
++    }
++
++    fn write_nbt(&self, nbt: &mut NbtCompound) {
++        if let Some(opaque_inventory) = &self.opaque_inventory {
++            nbt.put("Inventory", opaque_inventory.clone());
++        } else {
++            let cycle = self.cycle.lock().unwrap_or_else(PoisonError::into_inner);
++            let items = self.items.read().unwrap_or_else(PoisonError::into_inner);
++            write_inventory(nbt, &items, *cycle);
++        }
++        let speed = self
++            .state
++            .read()
++            .unwrap_or_else(PoisonError::into_inner)
++            .speed;
++        nbt.put_float(
++            "Speed",
++            if speed.is_finite() && speed >= 0.0 {
++                speed
++            } else {
++                0.0
++            },
++        );
++    }
++
++    fn chunk_data_nbt(&self) -> Option<NbtCompound> {
++        let mut nbt = NbtCompound::new();
++        self.write_nbt(&mut nbt);
++        Some(nbt)
++    }
++
++    fn tick(&self, world: &Arc<World>) {
++        let pos = self.position;
++        let Some(state) = world.get_block_state_id_if_loaded(&pos) else {
++            return;
++        };
++        if state.to_block().name != ID
++            || GAPS.into_iter().any(|side| {
++                [side, side.opposite()].into_iter().any(|dir| {
++                    world
++                        .get_block_state_id_if_loaded(&relative(pos, dir))
++                        .is_none()
++                })
++            })
++        {
++            return;
++        }
++        let Some(pair) = loaded_pair(world, pos) else {
++            if self.is_supported() {
++                world.set_block_state_if(
++                    &pos,
++                    Block::AIR.default_state.id,
++                    BlockFlags::NOTIFY_ALL,
++                    |current| current == state,
++                );
++            }
++            return;
++        };
++        let speed_at = |dir| {
++            world
++                .get_block_entity(&relative(pos, dir))
++                .and_then(|entity| {
++                    entity
++                        .as_any()
++                        .downcast_ref::<CreateKinetic>()
++                        .map(CreateKinetic::rpm)
++                })
++                .unwrap_or_default()
++        };
++        let previous = self.state();
++        let state_now = self.update_drive(
++            Some(pair),
++            speed_at(pair.side.opposite()),
++            speed_at(pair.side),
++        );
++        let updated = create_pipe::with_property(
++            create_pipe::with_property(state, "facing", state_now.facing.name()),
++            "valid",
++            create_pipe::boolean(state_now.valid),
++        );
++        if updated != state {
++            world.set_block_state_if(&pos, updated, BlockFlags::NOTIFY_ALL, |current| {
++                current == state
++            });
++        }
++        let changed = self.process_items(world);
++        if (previous != state_now || changed || self.is_dirty())
++            && let Some(entity) = world.get_block_entity(&pos)
++            && entity
++                .as_any()
++                .downcast_ref::<Self>()
++                .is_some_and(|live| std::ptr::eq(live, self))
++        {
++            world.update_block_entity(&entity);
++        }
++    }
++
++    fn on_block_replaced(self: Arc<Self>, world: &Arc<World>, pos: &BlockPos) {
++        if self.is_supported() {
++            let inventory: Arc<dyn Inventory> = self;
++            world.scatter_inventory(pos, &inventory);
++        }
++    }
++
++    fn is_dirty(&self) -> bool {
++        self.dirty.load(Ordering::Relaxed)
++    }
++
++    fn clear_dirty(&self) {
++        self.dirty.store(false, Ordering::Relaxed);
++    }
++
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++}
++
++impl CreateCrushingWheelControllerBlockEntity {
++    pub const INVENTORY_SIZE: usize = SLOTS;
++
++    fn process_items(&self, world: &Arc<World>) -> bool {
++        if !self.is_supported() || !self.accepting_input() {
++            return false;
++        }
++        if self.is_empty()
++            && !self
++                .cycle
++                .lock()
++                .unwrap_or_else(PoisonError::into_inner)
++                .applied
++        {
++            return self.catch_item(world);
++        }
++        let input = self.get_stack(0);
++        match self.advance_cycle() {
++            Action::Idle => false,
++            Action::Apply => {
++                let mut random = rand::rng();
++                if let Some(outputs) = recipe_for(&input).and_then(|recipe| {
++                    recipe.batch_outputs(input.item_count, || random.random::<f32>())
++                }) {
++                    self.apply_outputs(&outputs)
++                } else {
++                    // A saved recipe may no longer resolve. Retain the original input.
++                    self.cycle
++                        .lock()
++                        .unwrap_or_else(PoisonError::into_inner)
++                        .applied = false;
++                    self.mark_dirty();
++                    true
++                }
++            }
++            Action::Eject => self.eject_items(world),
++        }
++    }
++
++    fn catch_item(&self, world: &World) -> bool {
++        let pos = self.position.0;
++        let [x, y, z] = [pos.x, pos.y, pos.z].map(f64::from);
++        let bounds = BoundingBox::new_array([x, y, z], [x + 1., y + 1., z + 1.]);
++        for entity in world.get_entities_at_box(&bounds) {
++            let Some(item) = entity.get_item_entity() else {
++                continue;
++            };
++            let base = item.get_entity();
++            let item_pos = base.pos.load();
++            if base.removed.load(Ordering::Acquire)
++                || item_pos.y < y
++                || !(x..x + 1.).contains(&item_pos.x)
++                || !(z..z + 1.).contains(&item_pos.z)
++            {
++                continue;
++            }
++            let mut stack = item
++                .get_item_stack()
++                .lock()
++                .unwrap_or_else(PoisonError::into_inner);
++            let Some(recipe) = recipe_for(&stack) else {
++                continue;
++            };
++            if item_pos.y >= y + 0.25 {
++                base.set_velocity(Vector3::new(
++                    (x + 0.5 - item_pos.x) / 2.,
++                    -0.25,
++                    (z + 0.5 - item_pos.z) / 2.,
++                ));
++                item.set_pickup_delay(20);
++                continue;
++            }
++            let moved = self.insert_stack(&stack, recipe.duration, true);
++            if moved == 0
++                || moved != stack.item_count
++                || self.insert_stack(&stack, recipe.duration, false) != moved
++            {
++                continue;
++            }
++            *stack = ItemStack::EMPTY.clone();
++            drop(stack);
++            base.remove();
++            return true;
++        }
++        false
++    }
++
++    fn eject_items(&self, world: &Arc<World>) -> bool {
++        let below = relative(self.position, Direction::Down);
++        if !world
++            .get_block_state_id_if_loaded(&below)
++            .is_some_and(|state| {
++                state
++                    .to_state()
++                    .get_block_collision_shapes_at(&below)
++                    .next()
++                    .is_none()
++            })
++        {
++            return false;
++        }
++        let pos = self.position.0;
++        let location = Vector3::new(
++            f64::from(pos.x) + 0.5,
++            f64::from(pos.y) - 0.10,
++            f64::from(pos.z) + 0.5,
++        );
++        let mut changed = false;
++        for slot in OUTPUT_START..SLOTS {
++            let stack = self.remove_stack(slot);
++            if stack.is_empty() {
++                continue;
++            }
++            let entity = Entity::new(world.clone(), location, &EntityType::ITEM);
++            if world.spawn_entity(Arc::new(ItemEntity::new_with_velocity(
++                entity,
++                stack.clone(),
++                Vector3::new(0., -0.1, 0.),
++                10,
++            ))) {
++                changed = true;
++            } else {
++                self.items.write().unwrap_or_else(PoisonError::into_inner)[slot] = stack;
++            }
++        }
++        self.finish_eject() || changed
++    }
++
++    #[must_use]
++    pub fn new(position: BlockPos) -> Self {
++        Self {
++            position,
++            items: RwLock::new(empty_items()),
++            cycle: Mutex::new(Cycle::default()),
++            state: RwLock::new(ControllerState::default()),
++            dirty: AtomicBool::new(false),
++            opaque_inventory: None,
++        }
++    }
++
++    #[must_use]
++    pub fn is_supported(&self) -> bool {
++        self.opaque_inventory.is_none()
++    }
++
++    #[must_use]
++    pub(crate) fn state(&self) -> ControllerState {
++        *self.state.read().unwrap_or_else(PoisonError::into_inner)
++    }
++
++    /// `pair.side` is the positive wheel side; Stage supplies the opposite-side RPM first.
++    pub(crate) fn update_drive(
++        &self,
++        pair: Option<WheelPair>,
++        opposite_side_rpm: f32,
++        positive_side_rpm: f32,
++    ) -> ControllerState {
++        let next = pair
++            .filter(|_| opposite_side_rpm.is_finite() && positive_side_rpm.is_finite())
++            .and_then(|pair| {
++                let facing = crushing::direction(
++                    pair.axis,
++                    pair.side,
++                    opposite_side_rpm,
++                    positive_side_rpm,
++                )?;
++                Some(ControllerState {
++                    valid: true,
++                    facing,
++                    speed: opposite_side_rpm.abs() / 50.0,
++                })
++            })
++            .unwrap_or_default();
++        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
++        if *state != next {
++            *state = next;
++            self.mark_dirty();
++        }
++        *state
++    }
++
++    /// Inserts one bounded input batch and starts its recipe cycle; recipe lookup is an adapter hook.
++    pub(crate) fn insert_stack(&self, incoming: &ItemStack, duration: i32, simulate: bool) -> u8 {
++        if !self.is_supported()
++            || incoming.is_empty()
++            || duration <= 0
++            || duration as f32 > MAX_DURATION
++            || !self.accepting_input()
++        {
++            return 0;
++        }
++        let count = incoming
++            .item_count
++            .min(incoming.get_max_stack_size())
++            .min(MAX_INPUT_COUNT);
++        if count == 0 {
++            return 0;
++        }
++
++        let mut cycle = self.cycle.lock().unwrap_or_else(PoisonError::into_inner);
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        if cycle.remaining > 0.0 || cycle.applied || items.iter().any(|item| !item.is_empty()) {
++            return 0;
++        }
++        if simulate {
++            return count;
++        }
++        items[0] = incoming.clone();
++        items[0].item_count = count;
++        cycle.start(duration);
++        cycle.recipe_time = duration as f32;
++        self.mark_dirty();
++        count
++    }
++
++    /// Starts an input placed through the generic inventory API after its recipe is resolved.
++    pub(crate) fn start_processing(&self, duration: i32) -> bool {
++        if !self.is_supported()
++            || duration <= 0
++            || duration as f32 > MAX_DURATION
++            || !self.accepting_input()
++        {
++            return false;
++        }
++        let mut cycle = self.cycle.lock().unwrap_or_else(PoisonError::into_inner);
++        let items = self.items.read().unwrap_or_else(PoisonError::into_inner);
++        if items[0].is_empty()
++            || items[0].item_count > items[0].get_max_stack_size().min(MAX_INPUT_COUNT)
++            || items[OUTPUT_START..].iter().any(|item| !item.is_empty())
++            || cycle.remaining > 0.0
++            || cycle.applied
++        {
++            return false;
++        }
++        cycle.start(duration);
++        cycle.recipe_time = duration as f32;
++        self.mark_dirty();
++        true
++    }
++
++    /// Advances at most one bounded engine cycle step; callers handle Apply/Eject immediately.
++    pub(crate) fn advance_cycle(&self) -> Action {
++        if !self.is_supported() {
++            return Action::Idle;
++        }
++        let state = self.state();
++        if !state.valid
++            || state.facing != Direction::Down
++            || !state.speed.is_finite()
++            || state.speed <= 0.0
++        {
++            return Action::Idle;
++        }
++        let mut cycle = self.cycle.lock().unwrap_or_else(PoisonError::into_inner);
++        let items = self.items.read().unwrap_or_else(PoisonError::into_inner);
++        let input = &items[0];
++        if !cycle.applied
++            && (input.is_empty()
++                || input.item_count > input.get_max_stack_size().min(MAX_INPUT_COUNT))
++        {
++            return Action::Idle;
++        }
++        let previous = *cycle;
++        let action = cycle.tick(state.speed, u32::from(input.item_count));
++        if *cycle != previous {
++            self.mark_dirty();
++        }
++        action
++    }
++
++    /// Commits final recipe rolls only if every output fits; otherwise keeps the input for retry.
++    pub(crate) fn apply_outputs(&self, outputs: &[ItemStack]) -> bool {
++        let mut cycle = self.cycle.lock().unwrap_or_else(PoisonError::into_inner);
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        if !cycle.applied || items[0].is_empty() {
++            return false;
++        }
++        let mut trial = items[OUTPUT_START..].to_vec();
++        let fits = outputs.len() < SLOTS
++            && outputs.iter().all(|output| !output.is_empty())
++            && outputs.iter().all(|output| add_output(&mut trial, output));
++        if !fits {
++            cycle.remaining = 1.0;
++            cycle.applied = false;
++            self.mark_dirty();
++            return false;
++        }
++        items[OUTPUT_START..].clone_from_slice(&trial);
++        items[0] = ItemStack::EMPTY.clone();
++        self.mark_dirty();
++        true
++    }
++
++    /// Completes an Eject only after a router or hopper has removed every output.
++    pub(crate) fn finish_eject(&self) -> bool {
++        let mut cycle = self.cycle.lock().unwrap_or_else(PoisonError::into_inner);
++        let items = self.items.read().unwrap_or_else(PoisonError::into_inner);
++        if !cycle.applied || items.iter().any(|item| !item.is_empty()) {
++            return false;
++        }
++        *cycle = Cycle::default();
++        self.mark_dirty();
++        true
++    }
++
++    fn accepting_input(&self) -> bool {
++        let state = self.state();
++        state.valid
++            && state.facing == Direction::Down
++            && state.speed.is_finite()
++            && state.speed > 0.0
++    }
++
++    fn mark_dirty(&self) {
++        self.dirty.store(true, Ordering::Relaxed);
++    }
++}
++
++impl Inventory for CreateCrushingWheelControllerBlockEntity {
++    fn size(&self) -> usize {
++        SLOTS
++    }
++
++    fn is_empty(&self) -> bool {
++        self.items
++            .read()
++            .unwrap_or_else(PoisonError::into_inner)
++            .iter()
++            .all(ItemStack::is_empty)
++    }
++
++    fn get_stack(&self, slot: usize) -> ItemStack {
++        self.items
++            .read()
++            .unwrap_or_else(PoisonError::into_inner)
++            .get(slot)
++            .cloned()
++            .unwrap_or_else(|| ItemStack::EMPTY.clone())
++    }
++
++    fn remove_stack(&self, slot: usize) -> ItemStack {
++        let mut cycle = self.cycle.lock().unwrap_or_else(PoisonError::into_inner);
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        let Some(stack) = items.get_mut(slot) else {
++            return ItemStack::EMPTY.clone();
++        };
++        let removed = std::mem::replace(stack, ItemStack::EMPTY.clone());
++        if !removed.is_empty() {
++            if slot == 0 && (cycle.applied || cycle.remaining > 0.0) {
++                *cycle = Cycle::default();
++            }
++            self.mark_dirty();
++        }
++        removed
++    }
++
++    fn remove_stack_specific(&self, slot: usize, amount: u8) -> ItemStack {
++        let mut cycle = self.cycle.lock().unwrap_or_else(PoisonError::into_inner);
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        let Some(stack) = items.get_mut(slot) else {
++            return ItemStack::EMPTY.clone();
++        };
++        if stack.is_empty() || amount == 0 {
++            return ItemStack::EMPTY.clone();
++        }
++        let removed = stack.split(amount);
++        if slot == 0 && (cycle.applied || (cycle.remaining > 0.0 && stack.is_empty())) {
++            *cycle = Cycle::default();
++        }
++        self.mark_dirty();
++        removed
++    }
++
++    fn set_stack(&self, slot: usize, stack: ItemStack) {
++        if slot != 0 || stack.is_empty() || !self.accepting_input() || !self.is_supported() {
++            return;
++        }
++        let cycle = self.cycle.lock().unwrap_or_else(PoisonError::into_inner);
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        if cycle.remaining == 0.0
++            && !cycle.applied
++            && items.iter().all(ItemStack::is_empty)
++            && stack.item_count <= stack.get_max_stack_size().min(MAX_INPUT_COUNT)
++        {
++            items[0] = stack;
++            self.mark_dirty();
++        }
++    }
++
++    fn get_max_count_per_stack(&self) -> u8 {
++        MAX_INPUT_COUNT
++    }
++
++    fn is_valid_slot_for(&self, slot: usize, stack: &ItemStack) -> bool {
++        if slot != 0
++            || stack.is_empty()
++            || stack.item_count > stack.get_max_stack_size().min(MAX_INPUT_COUNT)
++            || !self.is_supported()
++            || !self.accepting_input()
++        {
++            return false;
++        }
++        let cycle = self.cycle.lock().unwrap_or_else(PoisonError::into_inner);
++        cycle.remaining == 0.0
++            && !cycle.applied
++            && self
++                .items
++                .read()
++                .unwrap_or_else(PoisonError::into_inner)
++                .iter()
++                .all(ItemStack::is_empty)
++    }
++
++    fn can_transfer_to(
++        &self,
++        _hopper_inventory: &dyn Inventory,
++        slot: usize,
++        _stack: &ItemStack,
++    ) -> bool {
++        if slot < OUTPUT_START || slot >= SLOTS || !self.is_supported() {
++            return false;
++        }
++        self.cycle
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .applied
++    }
++
++    fn mark_dirty(&self) {
++        CreateCrushingWheelControllerBlockEntity::mark_dirty(self);
++    }
++
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++}
++
++impl Clearable for CreateCrushingWheelControllerBlockEntity {
++    fn clear(&self) {
++        let mut cycle = self.cycle.lock().unwrap_or_else(PoisonError::into_inner);
++        let mut items = self.items.write().unwrap_or_else(PoisonError::into_inner);
++        items.fill_with(|| ItemStack::EMPTY.clone());
++        *cycle = Cycle::default();
++        self.mark_dirty();
++    }
++}
++
++fn empty_items() -> [ItemStack; SLOTS] {
++    from_fn(|_| ItemStack::EMPTY.clone())
++}
++
++fn add_output(slots: &mut [ItemStack], output: &ItemStack) -> bool {
++    let mut remaining = output.clone();
++    for slot in slots.iter_mut().filter(|slot| !slot.is_empty()) {
++        if slot.are_items_and_components_equal(&remaining) {
++            let moved = remaining
++                .item_count
++                .min(slot.get_max_stack_size().saturating_sub(slot.item_count));
++            slot.item_count += moved;
++            remaining.item_count -= moved;
++            if remaining.is_empty() {
++                return true;
++            }
++        }
++    }
++    for slot in slots.iter_mut().filter(|slot| slot.is_empty()) {
++        if remaining.is_empty() {
++            break;
++        }
++        let moved = remaining.item_count.min(remaining.get_max_stack_size());
++        let mut added = remaining.clone();
++        added.item_count = moved;
++        *slot = added;
++        remaining.item_count -= moved;
++    }
++    remaining.is_empty()
++}
++
++fn write_inventory(nbt: &mut NbtCompound, items: &[ItemStack; SLOTS], cycle: Cycle) {
++    let mut inventory = NbtCompound::new();
++    inventory.put_int("Size", SLOTS as i32);
++    let list = items
++        .iter()
++        .enumerate()
++        .filter(|(_, stack)| !stack.is_empty())
++        .map(|(slot, stack)| {
++            let mut tag = NbtCompound::new();
++            stack.write_item_stack(&mut tag);
++            tag.put_int("Slot", slot as i32);
++            NbtTag::Compound(tag)
++        })
++        .collect();
++    inventory.put("Items", NbtTag::List(list));
++    inventory.put_float("ProcessingTime", cycle.remaining);
++    inventory.put_float("RecipeTime", cycle.recipe_time);
++    inventory.put_byte("AppliedRecipe", i8::from(cycle.applied));
++    nbt.put_compound("Inventory", inventory);
++}
++
++fn read_inventory(nbt: &NbtCompound) -> Option<([ItemStack; SLOTS], Cycle)> {
++    let inventory = nbt.get_compound("Inventory")?;
++    if inventory.get_int("Size")? != SLOTS as i32 {
++        return None;
++    }
++    let remaining = inventory.get_float("ProcessingTime")?;
++    let recipe_time = inventory.get_float("RecipeTime")?;
++    let applied = match inventory.get("AppliedRecipe") {
++        None => false,
++        Some(NbtTag::Byte(value)) => *value != 0,
++        Some(NbtTag::Int(value)) => *value != 0,
++        _ => return None,
++    };
++    if !remaining.is_finite()
++        || !(0.0..=MAX_DURATION).contains(&remaining)
++        || !recipe_time.is_finite()
++        || !(0.0..=MAX_DURATION).contains(&recipe_time)
++        || (applied && remaining > 0.0)
++    {
++        return None;
++    }
++
++    let mut items = empty_items();
++    let NbtTag::List(list) = inventory.get("Items")? else {
++        return None;
++    };
++    if list.len() > SLOTS {
++        return None;
++    }
++    for entry in list {
++        let entry = entry.extract_compound()?;
++        let slot = entry
++            .get_int("Slot")
++            .or_else(|| entry.get_byte("Slot").map(i32::from))?;
++        let stack = ItemStack::read_item_stack(entry)?;
++        let item = items.get_mut(usize::try_from(slot).ok()?)?;
++        if !item.is_empty() || stack.is_empty() || stack.item_count > stack.get_max_stack_size() {
++            return None;
++        }
++        *item = stack;
++    }
++    if remaining > 0.0 && items[0].is_empty() {
++        return None;
++    }
++    Some((
++        items,
++        Cycle {
++            remaining,
++            recipe_time,
++            applied,
++        },
++    ))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pumpkin_data::item::Item;
++
++    fn stone(count: u8) -> ItemStack {
++        ItemStack::new(
++            count,
++            Item::from_registry_key("minecraft:stone").expect("stone is registered"),
++        )
++    }
++
++    fn driven_controller() -> CreateCrushingWheelControllerBlockEntity {
++        let controller = CreateCrushingWheelControllerBlockEntity::new(BlockPos::ZERO);
++        controller.update_drive(
++            Some(WheelPair {
++                side: Direction::East,
++                axis: Axis::Z,
++            }),
++            -64.0,
++            96.0,
++        );
++        controller
++    }
++
++    #[test]
++    fn detects_a_perpendicular_pair_on_candidate_gap() {
++        let center = [0, 64, 0];
++        let pair = pair(center, |position| match position {
++            [1, 64, 0] | [-1, 64, 0] => Some(Axis::Z),
++            _ => None,
++        });
++        assert_eq!(
++            pair,
++            Some(WheelPair {
++                side: Direction::East,
++                axis: Axis::Z
++            })
++        );
++    }
++
++    #[test]
++    fn rejects_parallel_wheels_and_ambiguous_pairs() {
++        let center = [0, 64, 0];
++        assert_eq!(
++            pair(center, |position| match position {
++                [1, 64, 0] | [-1, 64, 0] => Some(Axis::X),
++                _ => None,
++            }),
++            None,
++        );
++        assert_eq!(
++            pair(center, |position| match position {
++                [1, 64, 0] | [-1, 64, 0] => Some(Axis::Z),
++                [0, 64, 1] | [0, 64, -1] => Some(Axis::X),
++                _ => None,
++            }),
++            None,
++        );
++    }
++
++    #[test]
++    fn pair_search_is_bounded_to_four_neighbor_queries() {
++        let mut queries = 0;
++        assert_eq!(
++            pair([0, 64, 0], |_| {
++                queries += 1;
++                None
++            }),
++            None
++        );
++        assert_eq!(queries, 4);
++    }
++
++    #[test]
++    fn drive_uses_engine_direction_and_rejects_non_finite_rpm() {
++        let controller = driven_controller();
++        assert_eq!(controller.state().facing, Direction::Down);
++        assert!(controller.state().valid);
++        assert_eq!(controller.state().speed, 64.0 / 50.0);
++        controller.update_drive(
++            Some(WheelPair {
++                side: Direction::East,
++                axis: Axis::Z,
++            }),
++            f32::NAN,
++            96.0,
++        );
++        assert!(!controller.state().valid);
++        assert_eq!(controller.state().speed, 0.0);
++        assert_eq!(controller.advance_cycle(), Action::Idle);
++    }
++
++    #[test]
++    fn persists_items_cycle_and_speed_and_rejects_malformed_inventory() {
++        let controller = driven_controller();
++        assert_eq!(controller.insert_stack(&stone(3), 100, true), 3);
++        assert!(controller.items.read().unwrap()[0].is_empty());
++        assert_eq!(controller.insert_stack(&stone(3), 100, false), 3);
++        assert_eq!(controller.insert_stack(&stone(1), 100, true), 0);
++        assert_eq!(controller.items.read().unwrap()[0].item_count, 3);
++        let mut nbt = NbtCompound::new();
++        controller.write_nbt(&mut nbt);
++        let restored = CreateCrushingWheelControllerBlockEntity::from_nbt(&nbt, BlockPos::ZERO);
++        assert!(restored.is_supported());
++        assert_eq!(restored.items.read().unwrap()[0].item_count, 3);
++        assert_eq!(restored.cycle.lock().unwrap().remaining, 100.0);
++        assert_eq!(restored.state().speed, 64.0 / 50.0);
++        assert!(!restored.state().valid); // pair orientation is restored from block state by the caller.
++
++        let mut malformed = NbtCompound::new();
++        let mut inventory = NbtCompound::new();
++        inventory.put_int("Size", (SLOTS - 1) as i32);
++        malformed.put_compound("Inventory", inventory);
++        let unsupported =
++            CreateCrushingWheelControllerBlockEntity::from_nbt(&malformed, BlockPos::ZERO);
++        assert!(!unsupported.is_supported());
++        assert_eq!(
++            unsupported
++                .items
++                .read()
++                .unwrap()
++                .iter()
++                .filter(|stack| !stack.is_empty())
++                .count(),
++            0,
++        );
++        let mut saved_again = NbtCompound::new();
++        unsupported.write_nbt(&mut saved_again);
++        assert_eq!(
++            saved_again
++                .get_compound("Inventory")
++                .and_then(|tag| tag.get_int("Size")),
++            Some((SLOTS - 1) as i32),
++        );
++    }
++
++    #[test]
++    fn removing_active_input_cancels_or_updates_the_cycle() {
++        let controller = driven_controller();
++        assert_eq!(controller.insert_stack(&stone(3), 100, false), 3);
++        assert_eq!(
++            Inventory::remove_stack_specific(&controller, 0, 2).item_count,
++            2
++        );
++        assert_eq!(controller.items.read().unwrap()[0].item_count, 1);
++        assert_eq!(controller.cycle.lock().unwrap().remaining, 100.0);
++
++        assert_eq!(Inventory::remove_stack(&controller, 0).item_count, 1);
++        assert_eq!(*controller.cycle.lock().unwrap(), Cycle::default());
++        assert_eq!(controller.insert_stack(&stone(1), 50, false), 1);
++    }
++
++    #[test]
++    fn clearing_resets_inventory_and_cycle_together() {
++        let controller = driven_controller();
++        assert_eq!(controller.insert_stack(&stone(3), 100, false), 3);
++        Clearable::clear(&controller);
++        assert!(
++            controller
++                .items
++                .read()
++                .unwrap()
++                .iter()
++                .all(ItemStack::is_empty)
++        );
++        assert_eq!(*controller.cycle.lock().unwrap(), Cycle::default());
++        assert_eq!(controller.insert_stack(&stone(1), 50, false), 1);
++    }
++
++    #[test]
++    fn blocked_outputs_preserve_input_and_retry_before_ejection() {
++        let controller = driven_controller();
++        assert_eq!(controller.insert_stack(&stone(2), 20, false), 2);
++        assert_eq!(controller.advance_cycle(), Action::Apply);
++        let sword = ItemStack::new(
++            u8::MAX,
++            Item::from_registry_key("minecraft:diamond_sword").expect("sword is registered"),
++        );
++        assert!(!controller.apply_outputs(&[sword]));
++        assert_eq!(controller.items.read().unwrap()[0].item_count, 2);
++        assert_eq!(controller.cycle.lock().unwrap().remaining, 1.0);
++        assert!(!controller.cycle.lock().unwrap().applied);
++
++        assert_eq!(controller.advance_cycle(), Action::Apply);
++        assert!(controller.apply_outputs(&[stone(4)]));
++        assert!(controller.items.read().unwrap()[0].is_empty());
++        assert_eq!(controller.items.read().unwrap()[1].item_count, 4);
++        assert!(!controller.finish_eject());
++        Inventory::remove_stack(&controller, 1);
++        assert!(controller.finish_eject());
++    }
++}
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -17,8 +17,8 @@
+ use pumpkin_world::world::BlockFlags;
+ 
+ use super::{
+-    BlockEntity, create_drill as drill, create_fan_airflow as fan, create_millstone as millstone,
+-    create_press as press, create_saw_tree as saw,
++    BlockEntity, create_crusher as crusher, create_drill as drill, create_fan_airflow as fan,
++    create_millstone as millstone, create_press as press, create_saw_tree as saw,
+ };
+ use crate::{
+     block::blocks::{
+@@ -53,6 +53,7 @@
+     pump::ID,
+     drill::ID,
+     saw::ID,
++    crusher::WHEEL,
+     fan::ID,
+     millstone::ID,
+     pipe::VALVE,
+@@ -459,6 +460,7 @@
+         | "create:brass_encased_shaft" => Kind::Shaft,
+         COG => Kind::Cog { large: false },
+         "create:large_cogwheel" => Kind::Cog { large: true },
++        crusher::WHEEL => Kind::CrushingWheel,
+         GEARBOX => Kind::Gearbox,
+         press::ID => Kind::Press,
+         pump::ID => Kind::Pump,
+@@ -840,6 +842,9 @@
+         if self.id == fan::ID {
+             next.air_current = fan::tick(world, self.position, state, next.rpm);
+         }
++        if self.id == crusher::WHEEL {
++            crusher::form_controller(world, self.position, start.axis);
++        }
+         if self.id == pipe::VALVE {
+             let enabled = pipe::property(state, "enabled") == Some("true");
+             let [mut value, mut target, _] = self
+diff --git a/crates/pumpkin-core/src/block/entities/create_millstone.rs b/crates/pumpkin-core/src/block/entities/create_millstone.rs
+--- a/crates/pumpkin-core/src/block/entities/create_millstone.rs
++++ b/crates/pumpkin-core/src/block/entities/create_millstone.rs
+@@ -304,11 +304,47 @@
+ }
+ 
+ #[derive(Deserialize)]
+-struct MillingRecipe {
+-    ingredients: [String; 1],
++pub(super) struct MillingRecipe {
++    ingredients: Vec<String>,
+     #[serde(rename = "processing_time")]
+-    duration: i32,
++    pub(super) duration: i32,
+     results: Vec<Output>,
++}
++
++impl MillingRecipe {
++    pub(super) fn matches(&self, input: &ItemStack) -> bool {
++        !input.is_empty()
++            && self.ingredients.iter().any(|key| match key.as_str() {
++                "#minecraft:wool" => input
++                    .get_item()
++                    .has_tag(&pumpkin_data::tag::Item::MINECRAFT_WOOL),
++                id => Item::from_registry_key(id) == Some(input.get_item()),
++            })
++    }
++
++    pub(super) fn batch_outputs(
++        &self,
++        count: u8,
++        mut draw: impl FnMut() -> f32,
++    ) -> Option<Vec<ItemStack>> {
++        let mut result = Vec::new();
++        for output in &self.results {
++            let item = Item::from_registry_key(&output.id)?;
++            let mut remaining: u32 = (0..count)
++                .map(|_| roll_count(output.count.into(), output.chance, &mut draw))
++                .sum();
++            let max = u32::from(ItemStack::new(1, item).get_max_stack_size());
++            if max == 0 {
++                return None;
++            }
++            while remaining > 0 {
++                let amount = remaining.min(max);
++                result.push(ItemStack::new(amount as u8, item));
++                remaining -= amount;
++            }
++        }
++        Some(result)
++    }
+ }
+ 
+ #[derive(Deserialize)]
+@@ -341,17 +377,8 @@
+     })
+ }
+ 
+-fn recipe_for(input: &ItemStack) -> Option<&'static MillingRecipe> {
+-    if input.is_empty() {
+-        return None;
+-    }
+-    let item = input.get_item();
+-    recipes()
+-        .iter()
+-        .find(|recipe| match recipe.ingredients[0].as_str() {
+-            "#minecraft:wool" => item.has_tag(&pumpkin_data::tag::Item::MINECRAFT_WOOL),
+-            id => Item::from_registry_key(id) == Some(item),
+-        })
++pub(super) fn recipe_for(input: &ItemStack) -> Option<&'static MillingRecipe> {
++    recipes().iter().find(|recipe| recipe.matches(input))
+ }
+ 
+ fn write_items(nbt: &mut NbtCompound, key: &str, items: &[ItemStack]) {
+diff --git a/crates/pumpkin-core/src/block/entities/mod.rs b/crates/pumpkin-core/src/block/entities/mod.rs
+--- a/crates/pumpkin-core/src/block/entities/mod.rs
++++ b/crates/pumpkin-core/src/block/entities/mod.rs
+@@ -22,6 +22,7 @@
+ pub mod command_block;
+ pub mod comparator;
+ pub(crate) mod create_chute;
++pub(crate) mod create_crusher;
+ pub(crate) mod create_depot;
+ pub(crate) mod create_drain;
+ mod create_drill;
+@@ -223,6 +224,11 @@
+             nbt, pos,
+         )));
+     }
++    if id == create_crusher::ID {
++        return Some(Arc::new(
++            create_crusher::CreateCrushingWheelControllerBlockEntity::from_nbt(nbt, pos),
++        ));
++    }
+     if id == create_millstone::ID {
+         return Some(Arc::new(
+             create_millstone::CreateMillstoneBlockEntity::from_nbt(nbt, pos),
+@@ -380,7 +386,7 @@
+         || block.name == create_drain::ID
+         || matches!(
+             block.name,
+-            create_fluid_tank::ID | create_chute::ID | create_chute::SMART_ID
++            create_fluid_tank::ID | create_chute::ID | create_chute::SMART_ID | create_crusher::ID
+         )
+         || is_create_kinetic_block(block)
+ }
+@@ -416,6 +422,9 @@
+             position,
+         ))),
+         "fluid_tank" => Some(Arc::new(create_fluid_tank::CreateFluidTank::new(position))),
++        "crushing_wheel_controller" => Some(Arc::new(
++            create_crusher::CreateCrushingWheelControllerBlockEntity::new(position),
++        )),
+         "furnace" => Some(Arc::new(furnace::FurnaceBlockEntity::new(position))),
+         "chest" => Some(Arc::new(chest::ChestBlockEntity::new(position))),
+         "trapped_chest" => Some(Arc::new(trapped_chest::TrappedChestBlockEntity::new(
+diff --git a/crates/pumpkin-core/src/block/registry.rs b/crates/pumpkin-core/src/block/registry.rs
+--- a/crates/pumpkin-core/src/block/registry.rs
++++ b/crates/pumpkin-core/src/block/registry.rs
+@@ -264,6 +264,7 @@
+     manager.register(crate::block::blocks::create_pipe::FluidPipe);
+     manager.register(crate::block::blocks::create_pump::MechanicalPump);
+     manager.register(crate::block::blocks::create_sail::CreateSail);
++    manager.register(crate::block::blocks::create_sticker::CreateStickerBlock);
+     manager.register(crate::block::blocks::create_gauge::CreateSpeedometer);
+     manager.register(crate::block::blocks::create_gauge::CreateStressometer);
+     manager.register(crate::block::blocks::create_hand_crank::CreateHandCrank);
+@@ -1203,6 +1204,11 @@
+ 
+         use crate::block::blocks::{create_chain as chain, create_pipe as pipe};
+         match placed_block.name {
++            crate::block::blocks::create_sticker::ID => {
++                let facing = if sneaking { look } else { look.opposite() };
++                let state = Self::set_create_facing(placed_block, state_id, facing);
++                crate::block::blocks::create_sticker::placed_state(world, &position, state)
++            }
+             pipe::PIPE => pipe::shape(world, position, state_id, look, None),
+             pipe::VALVE => {
+                 let yaw = f64::from(player.get_entity().yaw.load());
+@@ -1227,6 +1233,7 @@
+             ),
+             "create:shaft"
+             | "create:flywheel"
++            | "create:crushing_wheel"
+             | "create:clutch"
+             | "create:gearshift"
+             | "create:large_water_wheel"
+diff --git a/crates/pumpkin-core/src/net/java/play/use_item_on.rs b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+--- a/crates/pumpkin-core/src/net/java/play/use_item_on.rs
++++ b/crates/pumpkin-core/src/net/java/play/use_item_on.rs
+@@ -435,8 +435,10 @@
+         assist: Option<Assist>,
+     ) -> Result<bool, BlockPlacingError> {
+         let placement = if is_create_kinetic_block(block)
+-            || block.name == crate::block::blocks::create_pipe::PIPE
+-        {
++            || matches!(
++                block.name,
++                crate::block::blocks::create_pipe::PIPE | crate::block::blocks::create_sticker::ID
++            ) {
+             server.block_registry.place_create_block(
+                 player,
+                 block,
+diff --git a/crates/pumpkin-core/src/world/mod.rs b/crates/pumpkin-core/src/world/mod.rs
+--- a/crates/pumpkin-core/src/world/mod.rs
++++ b/crates/pumpkin-core/src/world/mod.rs
+@@ -2475,6 +2475,12 @@
+                 continue;
+             }
+ 
++            if entity.get_entity().entity_type == &EntityType::ITEM
++                && crate::block::entities::create_crusher::item_collision_empty(state.id)
++            {
++                continue;
++            }
++
+             let block = Block::from_state_id(state.id);
+             let mut collided = false;
+ 

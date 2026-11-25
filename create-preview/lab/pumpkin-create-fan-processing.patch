@@ -1,0 +1,668 @@
+diff --git a/crates/pumpkin-core/src/block/entities/create_fan_airflow.rs b/crates/pumpkin-core/src/block/entities/create_fan_airflow.rs
+--- a/crates/pumpkin-core/src/block/entities/create_fan_airflow.rs
++++ b/crates/pumpkin-core/src/block/entities/create_fan_airflow.rs
+@@ -1,10 +1,24 @@
+ use create_engine::{
+-    fan::{self, Config},
++    fan::{self, Config, Medium, ProcessingType, Segment},
+     fan_entities,
+     placement::Direction,
+ };
+-use pumpkin_data::{Block, BlockStateId};
++use pumpkin_data::{
++    Block, BlockStateId,
++    item::Item,
++    item_stack::ItemStack,
++    recipes::{CookingRecipeKind, get_cooking_recipe_with_ingredient},
++    tag::{Block as BlockTags, Taggable},
++};
+ use pumpkin_util::math::position::BlockPos;
++use std::sync::OnceLock;
++
++use super::create_millstone::MillingRecipe;
++use crate::entity::item::ItemEntity;
++
++#[cfg(test)]
++#[path = "create_fan_airflow_tests.rs"]
++mod tests;
+ 
+ pub(crate) const ID: &str = "create:encased_fan";
+ pub(super) const TAG: &str = "CreateHorizonAirCurrent";
+@@ -21,25 +35,24 @@
+ }
+ 
+ impl Airflow {
+-    fn wire(self) -> [i32; 8] {
++    fn wire(self, segments: &[Segment]) -> Vec<i32> {
+         let direction = Direction::ALL
+             .iter()
+             .position(|dir| *dir == self.facing)
+             .unwrap_or(0);
+-        [
++        let mut data = Vec::with_capacity(6 + 2 * segments.len());
++        data.extend([
+             2,
+             direction as i32,
+             self.rpm.to_bits() as i32,
+             self.reach.to_bits() as i32,
+-            1,
+-            if self.pushing {
+-                self.reach.ceil() as i32
+-            } else {
+-                0
+-            },
+-            0,
+-            0,
+-        ]
++            segments.len() as i32,
++        ]);
++        for segment in segments {
++            data.extend([segment.end, segment.kind.map_or(0, |kind| kind as i32 + 1)]);
++        }
++        data.push(0); // No transport handlers until belt and Depot processing are wired.
++        data
+     }
+ 
+     #[cfg(test)]
+@@ -111,17 +124,134 @@
+     }
+ }
+ 
++fn medium(state: BlockStateId) -> Option<ProcessingType> {
++    use crate::block::blocks::create_pipe::property;
++    use create_engine::burner::Heat;
++    let block = state.to_block();
++    let lit = property(state, "lit").map(|value| value == "true");
++    Medium {
++        fluid: [
++            block == &Block::LAVA,
++            false,
++            false,
++            block == &Block::WATER
++                || block == &Block::BUBBLE_COLUMN
++                || state.to_state().is_waterlogged(),
++        ],
++        block: [
++            block.has_tag(&BlockTags::CREATE_FAN_PROCESSING_CATALYSTS_BLASTING),
++            block.has_tag(&BlockTags::CREATE_FAN_PROCESSING_CATALYSTS_HAUNTING),
++            block.has_tag(&BlockTags::CREATE_FAN_PROCESSING_CATALYSTS_SMOKING),
++            false,
++        ],
++        campfire: block.has_tag(&BlockTags::MINECRAFT_CAMPFIRES),
++        lit,
++        flame_soul: property(state, "flame_type").map(|value| value == "soul"),
++        heat: property(state, "blaze").and_then(|state| {
++            Some(match state {
++                "none" => Heat::None,
++                "smouldering" => Heat::Smouldering,
++                "fading" => Heat::Fading,
++                "kindled" => Heat::Kindled,
++                "seething" => Heat::Seething,
++                _ => return None,
++            })
++        }),
++    }
++    .processing()
++}
++
++fn offset(position: BlockPos, facing: Direction, steps: i32) -> BlockPos {
++    let [x, y, z] = facing.vector().map(|value| value * steps);
++    BlockPos::new(position.0.x + x, position.0.y + y, position.0.z + z)
++}
++
++#[derive(serde::Deserialize)]
++struct FanRecipes {
++    haunting: Vec<MillingRecipe>,
++    splashing: Vec<MillingRecipe>,
++}
++
++enum Conversion {
++    Recipe(&'static MillingRecipe),
++    Cooked(ItemStack),
++}
++
++impl Conversion {
++    fn roll(self, count: u8) -> Option<Vec<ItemStack>> {
++        match self {
++            Self::Recipe(recipe) => recipe.batch_outputs(count, rand::random::<f32>),
++            Self::Cooked(output) => Some(vec![output]),
++        }
++    }
++}
++
++fn conversion(input: &ItemStack, kind: ProcessingType) -> Option<Conversion> {
++    use ProcessingType::{Haunting, Smoking, Splashing};
++    if matches!(kind, Haunting | Splashing) {
++        static RECIPES: OnceLock<Option<FanRecipes>> = OnceLock::new();
++        let recipes = RECIPES
++            .get_or_init(|| {
++                serde_json::from_str(include_str!(concat!(
++                    env!("CARGO_MANIFEST_DIR"),
++                    "/../../assets/nextmc-create-fan.json"
++                )))
++                .map_err(
++                    |error| tracing::error!(%error, "Could not read embedded Create fan recipes"),
++                )
++                .ok()
++            })
++            .as_ref()?;
++        let recipes = if kind == Haunting {
++            &recipes.haunting
++        } else {
++            &recipes.splashing
++        };
++        return recipes
++            .iter()
++            .find(|recipe| recipe.matches(input))
++            .map(Conversion::Recipe);
++    }
++    let cook = |kind| {
++        get_cooking_recipe_with_ingredient(input.get_item(), kind)
++            .filter(|recipe| !recipe.recipe_id.ends_with("_manual_only"))
++    };
++    let smoking = cook(CookingRecipeKind::Smoking);
++    let recipe = if kind == Smoking {
++        smoking?
++    } else {
++        let cooking =
++            cook(CookingRecipeKind::Smelting).or_else(|| cook(CookingRecipeKind::Blasting))?;
++        // shortcut: preserve inputs without a blasting output until fire-resistance and item destruction are wired.
++        if smoking.is_some_and(|recipe| recipe.result.id == cooking.result.id) {
++            return None;
++        }
++        cooking
++    };
++    let item = Item::from_registry_key(recipe.result.id)?;
++    let count =
++        u8::try_from(i32::from(input.item_count).checked_mul(i32::from(recipe.result.count))?)
++            .ok()?;
++    let output = ItemStack::new(count, item);
++    (count != 0 && count <= output.get_max_stack_size()).then_some(Conversion::Cooked(output))
++}
++
+ pub(super) fn tick(
+     world: &crate::world::World,
+     position: BlockPos,
+     state: BlockStateId,
+     rpm: f32,
+-) -> Option<[i32; 8]> {
++) -> Option<Vec<i32>> {
+     use pumpkin_data::entity::EntityType;
+     use pumpkin_util::math::{boundingbox::BoundingBox, vector3::Vector3};
+     let flow = current(position, state, rpm, |pos| {
+         world.get_block_state_id_if_loaded(&pos)
+     })?;
++    let segments = fan::segments(flow.reach, flow.pushing, |steps| {
++        world
++            .get_block_state_id_if_loaded(&offset(position, flow.facing, steps))
++            .and_then(medium)
++    });
+     let [min, max] = flow.bounds();
+     for entity in world.get_entities_at_box(&BoundingBox::new_array(min, max)) {
+         let base = entity.get_entity();
+@@ -131,16 +261,29 @@
+         }
+         let bounds = base.bounding_box.load();
+         let xyz = |vector: Vector3<f64>| [vector.x, vector.y, vector.z];
++        let coords = xyz(base.pos.load());
+         if let Some([x, y, z]) = flow.velocity(
+             [xyz(bounds.min), xyz(bounds.max)],
+-            xyz(base.pos.load()),
++            coords,
+             xyz(base.velocity.load()),
+             base.is_sneaking(),
+         ) {
+             base.set_velocity(Vector3::new(x, y, z));
+-        }
+-    }
+-    Some(flow.wire())
++            let offset = fan::aligned_distance_to_face(
++                [position.0.x, position.0.y, position.0.z],
++                flow.facing,
++                coords,
++            );
++            if let Some(kind) = fan::type_at(flow.reach, flow.pushing, &segments, offset)
++                && let Some(item) = entity.cast_any().downcast_ref::<ItemEntity>()
++            {
++                item.apply_create_fan(kind, |input| {
++                    conversion(input, kind).map(|plan| move |count| plan.roll(count))
++                });
++            }
++        }
++    }
++    Some(flow.wire(&segments))
+ }
+ 
+ pub(crate) fn current(
+@@ -171,17 +314,15 @@
+     let mut reach = nominal_distance;
+ 
+     for offset in 1..=nominal_distance.ceil() as i32 {
+-        let vector = facing.vector();
+-        let cell = BlockPos::new(
+-            position.0.x.checked_add(vector[0].checked_mul(offset)?)?,
+-            position.0.y.checked_add(vector[1].checked_mul(offset)?)?,
+-            position.0.z.checked_add(vector[2].checked_mul(offset)?)?,
+-        );
++        let cell = self::offset(position, facing, offset);
+         let Some(state) = state_at(cell) else {
+             // Do not force a chunk load just to extend the current.
+             reach = reach.min((offset - 1) as f32);
+             break;
+         };
++        if state.to_block().has_tag(&BlockTags::CREATE_FAN_TRANSPARENT) {
++            continue;
++        }
+         let shapes = state
+             .to_state()
+             .get_block_collision_shapes_at(&cell)
+@@ -196,13 +337,14 @@
+                 ]
+             })
+             .collect::<Vec<_>>();
++        if shapes.as_slice() == [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]] {
++            reach = reach.min((offset - 1) as f32);
++            break;
++        }
+         let depth = fan::shape_depth(&shapes, facing);
+         if depth.is_finite() {
+-            let obstruction = (offset - 1) as f32 + depth as f32;
+-            reach = reach.min(obstruction);
+-            if obstruction <= offset as f32 {
+-                break;
+-            }
++            reach = reach.min((f64::from(offset - 1) + depth + 1.0 / 32.0) as f32);
++            break;
+         }
+     }
+ 
+diff --git a/crates/pumpkin-core/src/block/entities/create_fan_airflow_tests.rs b/crates/pumpkin-core/src/block/entities/create_fan_airflow_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/pumpkin-core/src/block/entities/create_fan_airflow_tests.rs
+@@ -0,0 +1,111 @@
++use super as airflow;
++use pumpkin_data::{Block, BlockStateId, Property};
++use pumpkin_util::math::position::BlockPos;
++
++fn state(name: &str, facing: Option<&str>) -> BlockStateId {
++    let block = Block::from_name(name).expect("pinned block registry entry");
++    let mut properties = block
++        .properties(block.default_state.id)
++        .map_or_else(Vec::new, |properties| properties.to_props());
++    if let Some(facing) = facing {
++        let property = properties
++            .iter_mut()
++            .find(|property| property.key_str() == "facing")
++            .expect("facing property");
++        *property = Property::from_str_pair("facing", facing).expect("valid facing");
++    }
++    block
++        .state_from_properties(&properties)
++        .expect("valid block state")
++        .id
++}
++
++#[test]
++fn engine_range_tracks_fan_direction_and_rpm_sign() {
++    let fan = state("create:encased_fan", Some("east"));
++    let air = state("minecraft:air", None);
++    let position = BlockPos::new(0, 80, 0);
++    let current = airflow::current(position, fan, 32.0, |_| Some(air)).expect("running fan");
++    assert_eq!(current.nominal_distance(), 5.125);
++    assert_eq!(current.reach(), 5.125);
++    assert!(current.pushing());
++    assert_eq!(current.flow(), [1, 0, 0]);
++    assert_eq!(current.bounds(), [[1.0, 80.0, 0.0], [6.125, 81.0, 1.0]]);
++
++    let reverse = airflow::current(position, fan, -32.0, |_| Some(air)).expect("reversed fan");
++    assert!(!reverse.pushing());
++    assert_eq!(reverse.flow(), [-1, 0, 0]);
++    assert_eq!(reverse.bounds(), current.bounds());
++
++    let west_facing = state("create:encased_fan", Some("west"));
++    let reversed_axis =
++        airflow::current(position, west_facing, 32.0, |_| Some(air)).expect("west-facing fan");
++    assert!(!reversed_axis.pushing());
++    assert_eq!(reversed_axis.flow(), [1, 0, 0]);
++}
++
++#[test]
++fn collision_shape_truncates_current_and_blocks_entities_beyond_it() {
++    let fan = state("create:encased_fan", Some("east"));
++    let air = state("minecraft:air", None);
++    let stone = state("minecraft:stone", None);
++    let position = BlockPos::new(0, 80, 0);
++    let current = airflow::current(position, fan, 32.0, |cell| {
++        Some(if cell.0.x == 3 { stone } else { air })
++    })
++    .expect("air path before the obstacle");
++
++    assert_eq!(current.reach(), 2.0);
++    let unloaded = airflow::current(position, fan, 32.0, |cell| (cell.0.x < 3).then_some(air))
++        .expect("known cells before an unloaded boundary");
++    assert_eq!(unloaded.reach(), 2.0);
++    assert!(current.affects([[2.0, 80.1, 0.1], [2.5, 80.9, 0.9]]));
++    assert!(!current.affects([[3.1, 80.1, 0.1], [3.5, 80.9, 0.9]]));
++
++    let moved = current
++        .velocity(
++            [[2.0, 80.1, 0.1], [2.5, 80.9, 0.9]],
++            [2.25, 80.0, 0.5],
++            [0.0; 3],
++            false,
++        )
++        .expect("entity inside the unobstructed current");
++    assert!(moved[0] > 0.0);
++    assert_eq!(&moved[1..], &[0.0, 0.0]);
++    assert!(
++        current
++            .velocity(
++                [[3.1, 80.1, 0.1], [3.5, 80.9, 0.9]],
++                [3.25, 80.0, 0.5],
++                [0.0; 3],
++                false,
++            )
++            .is_none()
++    );
++}
++
++#[test]
++fn medium_channels_match_pinned_recipes_and_keep_non_outputs() {
++    use airflow::{Item, ItemStack, ProcessingType::*, conversion, medium};
++    assert_eq!(medium(state("minecraft:water", None)), Some(Splashing));
++    assert_eq!(medium(state("minecraft:soul_fire", None)), Some(Haunting));
++    assert_eq!(medium(state("minecraft:fire", None)), Some(Smoking));
++    assert_eq!(medium(state("minecraft:lava", None)), Some(Blasting));
++    assert_eq!(medium(state("minecraft:stone", None)), None);
++    for (kind, input, expected) in [
++        (Splashing, &Item::ICE, &Item::PACKED_ICE),
++        (Haunting, &Item::COBBLESTONE, &Item::BLACKSTONE),
++        (Smoking, &Item::BEEF, &Item::COOKED_BEEF),
++        (Blasting, &Item::RAW_IRON, &Item::IRON_INGOT),
++    ] {
++        let output = conversion(&ItemStack::new(3, input), kind)
++            .unwrap()
++            .roll(3)
++            .unwrap();
++        assert_eq!(output.len(), 1);
++        assert_eq!(output[0].get_item(), expected);
++        assert_eq!(output[0].item_count, 3);
++    }
++    assert!(conversion(&ItemStack::new(1, &Item::BEEF), Blasting).is_none());
++    assert!(conversion(&ItemStack::new(1, &Item::ICE), Haunting).is_none());
++}
+diff --git a/crates/pumpkin-core/src/block/entities/create_kinetic.rs b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+--- a/crates/pumpkin-core/src/block/entities/create_kinetic.rs
++++ b/crates/pumpkin-core/src/block/entities/create_kinetic.rs
+@@ -174,7 +174,7 @@
+     press: PressCycle,
+     press_finished: bool,
+     valve: Option<[f32; 3]>,
+-    air_current: Option<[i32; 8]>,
++    air_current: Option<Vec<i32>>,
+ }
+ 
+ #[derive(Default, PartialEq)]
+@@ -593,9 +593,7 @@
+             tag.put(
+                 fan::TAG,
+                 pumpkin_nbt::tag::NbtTag::IntArray(
+-                    readings
+-                        .air_current
+-                        .map_or_else(Vec::new, |data| data.to_vec()),
++                    readings.air_current.clone().unwrap_or_default(),
+                 ),
+             );
+         }
+diff --git a/crates/pumpkin-core/src/block/entities/create_millstone.rs b/crates/pumpkin-core/src/block/entities/create_millstone.rs
+--- a/crates/pumpkin-core/src/block/entities/create_millstone.rs
++++ b/crates/pumpkin-core/src/block/entities/create_millstone.rs
+@@ -315,9 +315,7 @@
+     pub(super) fn matches(&self, input: &ItemStack) -> bool {
+         !input.is_empty()
+             && self.ingredients.iter().any(|key| match key.as_str() {
+-                "#minecraft:wool" => input
+-                    .get_item()
+-                    .has_tag(&pumpkin_data::tag::Item::MINECRAFT_WOOL),
++                tag if tag.starts_with('#') => input.get_item().is_tagged_with(tag) == Some(true),
+                 id => Item::from_registry_key(id) == Some(input.get_item()),
+             })
+     }
+diff --git a/crates/pumpkin-core/src/entity/item.rs b/crates/pumpkin-core/src/entity/item.rs
+--- a/crates/pumpkin-core/src/entity/item.rs
++++ b/crates/pumpkin-core/src/entity/item.rs
+@@ -42,6 +42,7 @@
+     // These cannot be atomic values because we mutate their state based on what they are; we run
+     // into the ABA problem
+     item_stack: Mutex<ItemStack>,
++    fan_processing: Mutex<create_engine::fan::Processing>,
+     pickup_delay: AtomicU8,
+     health: AtomicF32,
+     never_despawn: AtomicBool,
+@@ -113,6 +114,7 @@
+             item_stack: Mutex::new(item_stack),
+             item_age: AtomicU32::new(0),
+             thrower: crossbeam::atomic::AtomicCell::new(None),
++            fan_processing: Mutex::default(),
+             pickup_delay: AtomicU8::new(Self::DEFAULT_PICKUP_DELAY),
+             health: AtomicF32::new(5.0),
+             never_despawn: AtomicBool::new(false),
+@@ -136,6 +138,7 @@
+             item_stack: Mutex::new(item_stack),
+             item_age: AtomicU32::new(0),
+             thrower: crossbeam::atomic::AtomicCell::new(None),
++            fan_processing: Mutex::default(),
+             pickup_delay: AtomicU8::new(pickup_delay), // Vanilla pickup delay is 10 ticks
+             health: AtomicF32::new(5.0),
+             never_despawn: AtomicBool::new(false),
+@@ -150,6 +153,7 @@
+         Self {
+             entity,
+             item_stack: Mutex::new(ItemStack::new(1, &pumpkin_data::item::Item::AIR)),
++            fan_processing: Mutex::default(),
+             item_age: AtomicU32::new(0),
+             thrower: crossbeam::atomic::AtomicCell::new(None),
+             pickup_delay: AtomicU8::new(0),
+@@ -162,6 +166,64 @@
+ 
+     pub const fn get_item_stack(&self) -> &Mutex<ItemStack> {
+         &self.item_stack
++    }
++
++    pub(crate) fn apply_create_fan<F>(
++        &self,
++        kind: create_engine::fan::ProcessingType,
++        plan: impl FnOnce(&ItemStack) -> Option<F>,
++    ) where
++        F: FnOnce(u8) -> Option<Vec<ItemStack>>,
++    {
++        let mut input = self
++            .item_stack
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if input.is_empty() || !self.entity.is_alive() {
++            return;
++        }
++        let convert = plan(&input);
++        let mut processing = self
++            .fan_processing
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        let count = input.item_count;
++        if !processing.dropped(
++            kind,
++            count.into(),
++            convert.is_some(),
++            create_engine::fan::Config::DEFAULT.processing_time,
++        ) {
++            return;
++        }
++        let Some(output) = convert.and_then(|convert| convert(count)) else {
++            return;
++        };
++        let mut output = output.into_iter();
++        *input = output.next().unwrap_or_else(|| ItemStack::EMPTY.clone());
++        let empty = input.is_empty();
++        if !empty {
++            Self::update_fire_immune(&self.entity, &input);
++        }
++        drop(processing);
++        drop(input);
++        if empty {
++            self.entity.remove();
++        } else {
++            self.on_count_changed();
++        }
++        let world = self.entity.world.load_full();
++        let position = self.entity.pos.load();
++        let velocity = self.entity.velocity.load();
++        for stack in output {
++            let entity = Entity::new(world.clone(), position, &EntityType::ITEM);
++            world.spawn_entity(Arc::new(Self::new_with_velocity(
++                entity,
++                stack,
++                velocity,
++                Self::DEFAULT_PICKUP_DELAY,
++            )));
++        }
+     }
+ 
+     pub fn set_thrower(&self, uuid: uuid::Uuid) {
+@@ -841,6 +903,20 @@
+         let mut item_compound = NbtCompound::new();
+         item.write_item_stack(&mut item_compound);
+         nbt.put_compound("Item", item_compound);
++        let processing = self
++            .fan_processing
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if let Some(kind) = processing.kind {
++            let mut state = NbtCompound::new();
++            state.put_string("Type", kind.id().into());
++            state.put_int("Time", processing.time);
++            let mut create = NbtCompound::new();
++            create.put_compound("Processing", state);
++            let mut forge = NbtCompound::new();
++            forge.put_compound("CreateData", create);
++            nbt.put_compound("NeoForgeData", forge);
++        }
+ 
+         nbt.put_short("Age", self.item_age.load(Ordering::Relaxed) as i16);
+         nbt.put_short(
+@@ -855,6 +931,22 @@
+ 
+     fn read_custom_nbt(&self, nbt: &NbtCompound) {
+         self.thrower.store(nbt.get_uuid("Thrower"));
++        if let Some(state) = nbt
++            .get_compound("NeoForgeData")
++            .and_then(|tag| tag.get_compound("CreateData"))
++            .and_then(|tag| tag.get_compound("Processing"))
++        {
++            *self
++                .fan_processing
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner) =
++                create_engine::fan::Processing {
++                    kind: state
++                        .get_string("Type")
++                        .and_then(create_engine::fan::ProcessingType::parse),
++                    time: state.get_int("Time").unwrap_or(0),
++                };
++        }
+         // Restore the item stack from the "Item" compound
+         if let Some(item_compound) = nbt.get_compound("Item")
+             && let Some(stack) = ItemStack::read_item_stack(item_compound)
+diff --git a/crates/pumpkin-core/tests/create_fan_airflow.rs b/crates/pumpkin-core/tests/create_fan_airflow.rs
+deleted file mode 100644
+--- a/crates/pumpkin-core/tests/create_fan_airflow.rs
++++ /dev/null
+@@ -1,88 +0,0 @@
+-#[path = "../src/block/entities/create_fan_airflow.rs"]
+-mod airflow;
+-
+-use pumpkin_core::world;
+-use pumpkin_data::{Block, BlockStateId, Property};
+-use pumpkin_util::math::position::BlockPos;
+-
+-fn state(name: &str, facing: Option<&str>) -> BlockStateId {
+-    let block = Block::from_name(name).expect("pinned block registry entry");
+-    let mut properties = block
+-        .properties(block.default_state.id)
+-        .map_or_else(Vec::new, |properties| properties.to_props());
+-    if let Some(facing) = facing {
+-        let property = properties
+-            .iter_mut()
+-            .find(|property| property.key_str() == "facing")
+-            .expect("facing property");
+-        *property = Property::from_str_pair("facing", facing).expect("valid facing");
+-    }
+-    block
+-        .state_from_properties(&properties)
+-        .expect("valid block state")
+-        .id
+-}
+-
+-#[test]
+-fn engine_range_tracks_fan_direction_and_rpm_sign() {
+-    let fan = state("create:encased_fan", Some("east"));
+-    let air = state("minecraft:air", None);
+-    let position = BlockPos::new(0, 80, 0);
+-    let current = airflow::current(position, fan, 32.0, |_| Some(air)).expect("running fan");
+-    assert_eq!(current.nominal_distance(), 5.125);
+-    assert_eq!(current.reach(), 5.125);
+-    assert!(current.pushing());
+-    assert_eq!(current.flow(), [1, 0, 0]);
+-    assert_eq!(current.bounds(), [[1.0, 80.0, 0.0], [6.125, 81.0, 1.0]]);
+-
+-    let reverse = airflow::current(position, fan, -32.0, |_| Some(air)).expect("reversed fan");
+-    assert!(!reverse.pushing());
+-    assert_eq!(reverse.flow(), [-1, 0, 0]);
+-    assert_eq!(reverse.bounds(), current.bounds());
+-
+-    let west_facing = state("create:encased_fan", Some("west"));
+-    let reversed_axis =
+-        airflow::current(position, west_facing, 32.0, |_| Some(air)).expect("west-facing fan");
+-    assert!(!reversed_axis.pushing());
+-    assert_eq!(reversed_axis.flow(), [1, 0, 0]);
+-}
+-
+-#[test]
+-fn collision_shape_truncates_current_and_blocks_entities_beyond_it() {
+-    let fan = state("create:encased_fan", Some("east"));
+-    let air = state("minecraft:air", None);
+-    let stone = state("minecraft:stone", None);
+-    let position = BlockPos::new(0, 80, 0);
+-    let current = airflow::current(position, fan, 32.0, |cell| {
+-        Some(if cell.0.x == 3 { stone } else { air })
+-    })
+-    .expect("air path before the obstacle");
+-
+-    assert_eq!(current.reach(), 2.0);
+-    let unloaded = airflow::current(position, fan, 32.0, |cell| (cell.0.x < 3).then_some(air))
+-        .expect("known cells before an unloaded boundary");
+-    assert_eq!(unloaded.reach(), 2.0);
+-    assert!(current.affects([[2.0, 80.1, 0.1], [2.5, 80.9, 0.9]]));
+-    assert!(!current.affects([[3.1, 80.1, 0.1], [3.5, 80.9, 0.9]]));
+-
+-    let moved = current
+-        .velocity(
+-            [[2.0, 80.1, 0.1], [2.5, 80.9, 0.9]],
+-            [2.25, 80.0, 0.5],
+-            [0.0; 3],
+-            false,
+-        )
+-        .expect("entity inside the unobstructed current");
+-    assert!(moved[0] > 0.0);
+-    assert_eq!(&moved[1..], &[0.0, 0.0]);
+-    assert!(
+-        current
+-            .velocity(
+-                [[3.1, 80.1, 0.1], [3.5, 80.9, 0.9]],
+-                [3.25, 80.0, 0.5],
+-                [0.0; 3],
+-                false,
+-            )
+-            .is_none()
+-    );
+-}
